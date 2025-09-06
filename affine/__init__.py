@@ -4,6 +4,8 @@
 #                             Imports                                         #
 # --------------------------------------------------------------------------- #
 from __future__ import annotations
+
+import copy
 import os
 import re
 import sys
@@ -53,7 +55,7 @@ from .logging import *
 # --------------------------------------------------------------------------- #
 load_dotenv(override=True)
 def get_conf(key, default=None) -> Any:
-    v = os.getenv(key); 
+    v = os.getenv(key)
     if not v and default is None:
         raise ValueError(f"{key} not set.\nYou must set env var: {key} in .env")
     return v or default
@@ -100,6 +102,11 @@ class BaseEnv(BaseModel, ABC):
         for _ in range(count):
             out.append(await self.generate())
         return out
+    async def merge_multiscore(self, result: List["Evaluation"]) -> "Evaluation":
+        main, *res = result
+        for r in res:
+            main.score += r.score
+        return main
 
 # --------------------------------------------------------------------------- #
 #                         Models with new (de)serialisation                   #
@@ -109,6 +116,7 @@ class Challenge(BaseModel):
     prompt: str
     extra: Dict[str, Any] = Field(default_factory=dict)
     challenge_id: Optional[str] = None
+    task_sequence: Optional[List[Tuple[str, str]]] = None
     @root_validator(pre=True)
     def set_challenge_id(cls, values):
         if "challenge_id" not in values or values["challenge_id"] is None:
@@ -129,8 +137,16 @@ class Challenge(BaseModel):
         arbitrary_types_allowed = True
         json_encoders = {BaseEnv: lambda v: v.name}
     def json(self, **kw): return json.dumps(self.dict(**kw))
-    async def evaluate(self, resp: "Response") -> "Evaluation":
-        return await self.env.evaluate(self, resp)
+    async def evaluate(self, miner: "Miner") -> "Evaluation":
+        task_sequence = ((self.prompt, self.extra),) if self.task_sequence is None else self.task_sequence
+        chal = copy.copy(self)
+        outputs = []
+        for prompt, extra in task_sequence:
+            chal.extra = extra
+            response = await miner.run(prompt)
+            outputs.append(await self.env.evaluate(chal, response))
+        return await self.env.merge_multiscore(outputs)
+
     def __repr__(self):
         return f"<Challenge env={self.env.name!r} prompt={_truncate(self.prompt)!r}>"
     __str__ = __repr__
@@ -171,7 +187,16 @@ class Miner(BaseModel):
     revision: Optional[str] = None; block: Optional[int] = None
     chute: Optional[Dict[str, Any]] = None
     slug: Optional[str] = None
-    
+    async def run(self, prompt: Union[str, List[Dict[str, str]]], timeout: int = 150, retries: int = 0, backoff: int = 1):
+        if not self.model:
+            raise ValueError("No model provided")
+
+        if await check_model_gated(self.model, self.revision):
+            raise ValueError("Model is gated")
+
+        # Normal processing for non-gated models
+        return await query(prompt, self.model, self.slug, timeout, retries, backoff)
+
 
 class Result(BaseModel):
     version: str = __version__
