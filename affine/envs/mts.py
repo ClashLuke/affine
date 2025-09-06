@@ -30,7 +30,7 @@ static = ("In the following, we will test your ability to understand and execute
 
 
 def _generate_lists(target_length: int, turns: int, ops_per_turn: int, max_digits: int, seed: Optional[int] = None) -> \
-        Tuple[List[List[int]], List[str]]:
+        Tuple[List[str], List[str]]:
     rng = random.Random(time.time_ns() if seed is None else seed)  # can't use "or" syntax as we may want a seed of 0
     lists = [[rng.randint(0, 10 ** max_digits - 1) for _ in range(target_length)]]
     ops = [f'>>> x = {lists[0]}']
@@ -48,10 +48,9 @@ def _generate_lists(target_length: int, turns: int, ops_per_turn: int, max_digit
                 op.append(f"x.insert({idx}, {val})")
                 current.insert(idx, val)
         lists.append(sorted(current))
-        op.append('print(sorted(x))')
         ops.append('\n'.join(f'>>> {x}' for x in op))
 
-    return lists, ops
+    return [str(x) + '\n>>> print(sorted(x))' for x in lists], ops
 
 
 class MTS(af.BaseEnv):
@@ -81,6 +80,9 @@ class MTS(af.BaseEnv):
         if not matches:
             return af.Evaluation(env=self, score=0.0)
         match = list(matches)[0].strip()
+        state: af.ChallengeEvaluationState = challenge.extra["state"]
         target = challenge.extra["target"].strip()
         ok = float(target == match)
+        if not ok:
+            state.early_exit = True
         return af.Evaluation(env=self, score=float(ok))

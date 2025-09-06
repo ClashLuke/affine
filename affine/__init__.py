@@ -111,12 +111,18 @@ class BaseEnv(BaseModel, ABC):
 # --------------------------------------------------------------------------- #
 #                         Models with new (de)serialisation                   #
 # --------------------------------------------------------------------------- #
+
+class ChallengeEvaluationState(BaseModel):
+    message_history: List[Dict[str, str]]
+    early_exit: bool = False
+    score: float = 0.0
+
 class Challenge(BaseModel):
     env:  BaseEnv
     prompt: str
     extra: Dict[str, Any] = Field(default_factory=dict)
     challenge_id: Optional[str] = None
-    task_sequence: Optional[List[Tuple[str, str]]] = None
+    task_sequence: Optional[List[Tuple[str, Dict]]] = None
     @root_validator(pre=True)
     def set_challenge_id(cls, values):
         if "challenge_id" not in values or values["challenge_id"] is None:
@@ -141,10 +147,16 @@ class Challenge(BaseModel):
         task_sequence = ((self.prompt, self.extra),) if self.task_sequence is None else self.task_sequence
         chal = copy.copy(self)
         outputs = []
+        state = ChallengeEvaluationState(message_history=[])
         for prompt, extra in task_sequence:
+            state.message_history.append({'role': 'user', 'content': prompt})
+            extra["state"] = state
             chal.extra = extra
-            response = await miner.run(prompt)
+            response = await miner.run(state.message_history)
+            state.message_history.append({'role': 'assistant', 'content': response.response or ''})
             outputs.append(await self.env.evaluate(chal, response))
+            if state.early_exit:
+                break
         return await self.env.merge_multiscore(outputs)
 
     def __repr__(self):
@@ -183,7 +195,9 @@ class Response(BaseModel):
     __str__ = __repr__
 
 class Miner(BaseModel):
-    uid: int; hotkey: str; model: Optional[str] = None
+    uid: int
+    hotkey: str
+    model: Optional[str] = None
     revision: Optional[str] = None; block: Optional[int] = None
     chute: Optional[Dict[str, Any]] = None
     slug: Optional[str] = None

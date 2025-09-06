@@ -121,7 +121,6 @@ def codegen(op_count: int, allowed_ops: list, max_digits: int = 5):
         lst_key = _rand_key('list')
         if lst_key is None or not vars['list'][lst_key]:
             return
-        print(vars['list'][lst_key])
         vars['list'][lst_key].pop()
         code.append(f'{lst_key}.pop()')
 
@@ -191,9 +190,7 @@ def codegen(op_count: int, allowed_ops: list, max_digits: int = 5):
 
     for _ in range(op_count):
         counter += 1
-        op = rng.choice(allowed_ops)
-        print(vars, op)
-        ops[op]()
+        ops[rng.choice(allowed_ops)]()
 
     _print()
     return '\n'.join(f'>>> {x}' for x in code)
@@ -232,9 +229,9 @@ class PYI(af.BaseEnv):
     async def evaluate(self, challenge: af.Challenge, response: af.Response):
         matches = re.findall(r"<ANSWER>(.*?)</ANSWER>", response.response or "", re.IGNORECASE | re.DOTALL)
         if not matches:
+            print('no matches', response.response)
             return af.Evaluation(env=self, score=0.0)
         match = list(matches)[0].strip()
         target = challenge.extra["target"].strip()
         ok = float(target == match)
-        print(target, match)
         return af.Evaluation(env=self, score=float(ok))
