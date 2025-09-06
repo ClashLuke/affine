@@ -81,7 +81,7 @@ def push(model_path: str, existing_repo: str, revision: str, coldkey: str, hotke
     # Required API credentials
     hf_user        = af.get_conf("HF_USER")
     hf_token       = af.get_conf("HF_TOKEN")
-    chutes_api_key = chutes_api_key or af.get_conf("CHUTES_API_KEY")
+    chutes_api_key = af.get_conf("CHUTES_API_KEY", chutes_api_key or None)
     chute_user     = af.get_conf("CHUTE_USER")
     # TODO: validate API creds, exit gracefully if missing
 
@@ -115,7 +115,7 @@ def push(model_path: str, existing_repo: str, revision: str, coldkey: str, hotke
                     files.append(os.path.join(root, fname))
 
         # Upload files with limited concurrency to avoid HF 429 errors
-        SEM = asyncio.Semaphore(int(os.getenv("AFFINE_UPLOAD_CONCURRENCY", "2")))
+        SEM = asyncio.Semaphore(int(af.get_conf("AFFINE_UPLOAD_CONCURRENCY", "2")))
 
         async def _upload(path: str):
             rel = os.path.relpath(path, model_path)
