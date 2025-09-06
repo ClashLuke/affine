@@ -103,8 +103,12 @@ async def _get_client() -> aiohttp.ClientSession:
 
 
 TERMINAL = {400, 404, 410}
-async def query(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm", timeout=150, retries=0, backoff=1) -> af.Response:
-    url = f"https://{slug}.chutes.ai/v1/chat/completions"
+
+
+# openrouter: "https://openrouter.ai/api/v1/chat/completions"
+async def query(prompt: Union[str, List[Dict[str, str]]], model: str = "qwen/qwen3-max", slug: str = "llm", timeout=150,
+                retries=0, backoff=1, provider: Optional[str] = None) -> af.Response:
+    url = f"https://{slug}.chutes.ai/v1/chat/completions" if provider is None else provider
     hdr = {"Authorization": f"Bearer {af.get_conf('CHUTES_API_KEY')}", "Content-Type": "application/json"}
     start = time.monotonic()
     af.QCOUNT.labels(model=model).inc()
@@ -114,14 +118,16 @@ async def query(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm"
     sem = await _get_sem()
     for attempt in range(1, retries+2):
         try:
-            payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
-            async with sem, sess.post(url, json=payload,
-                                      headers=hdr, timeout=timeout) as r:
-                    txt = await r.text(errors="ignore")
-                    if r.status in TERMINAL: return R(None, attempt, f"{r.status}:{txt}", False)
-                    r.raise_for_status()
-                    content = (await r.json())["choices"][0]["message"]["content"]
-                    return R(content, attempt, None, True)
+            if isinstance(prompt, str):
+                payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+            else:
+                payload = prompt
+            async with sem, sess.post(url, json=payload, headers=hdr, timeout=timeout) as r:
+                txt = await r.text(errors="ignore")
+                if r.status in TERMINAL: return R(None, attempt, f"{r.status}:{txt}", False)
+                r.raise_for_status()
+                content = (await r.json())["choices"][0]["message"]["content"]
+                return R(content, attempt, None, True)
         except Exception as e:
             if attempt > retries: return R(None, attempt, str(e), False)
             await asyncio.sleep(backoff * 2**(attempt-1) * (1 + random.uniform(-0.1, 0.1)))
