@@ -292,6 +292,197 @@ MINER_STATS_SCHEMA = {
 }
 
 
+# =============================================================================
+# ELO Rating System Tables
+# =============================================================================
+
+# ELO Ratings Table
+#
+# Design Philosophy:
+# - PK: MINER#{hotkey}#REV#{revision} - partition by miner (same as other tables)
+# - SK: ENV#{env} - one rating record per miner per environment
+# - GSI: env-rating-index for leaderboard queries (get top miners by ELO in env)
+#
+# Query Patterns:
+# 1. Get miner's rating in an env: Direct query by PK + SK
+# 2. Get all ratings for a miner: Query by PK (all envs)
+# 3. Get leaderboard for an env: Query GSI by env, sorted by rating DESC
+# 4. Get all ratings: Full table scan (for bulk operations)
+#
+# Fields:
+# - rating: Current ELO rating (Decimal, default 1500)
+# - peak_rating: Historical peak rating
+# - matches_played: Total matches played in this env
+# - wins, losses, draws: Match outcome counts
+# - last_match_at: Timestamp of last match
+ELO_RATINGS_SCHEMA = {
+    "TableName": get_table_name("elo_ratings"),
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},   # MINER#{hotkey}#REV#{revision}
+        {"AttributeName": "sk", "KeyType": "RANGE"},  # ENV#{env}
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "sk", "AttributeType": "S"},
+        {"AttributeName": "env", "AttributeType": "S"},
+        {"AttributeName": "rating", "AttributeType": "N"},
+    ],
+    "GlobalSecondaryIndexes": [
+        {
+            "IndexName": "env-rating-index",
+            "KeySchema": [
+                {"AttributeName": "env", "KeyType": "HASH"},
+                {"AttributeName": "rating", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        },
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+
+# Match Records Table
+#
+# Design Philosophy:
+# - PK: ENV#{env} - partition by environment for efficient env-scoped queries
+# - SK: MATCH#{timestamp}#{match_uuid} - time-ordered matches within env
+# - GSI: timestamp-index for cross-env time-range queries
+#
+# Query Patterns:
+# 1. Get matches in an env: Query by PK
+# 2. Get matches in time range (all envs): Query GSI by gsi_partition + timestamp
+# 3. Get specific match: Query by PK + SK prefix with match_uuid
+#
+# Fields:
+# - match_type: "pairwise" (from score comparison) or "game" (direct competition)
+# - participants: List of {miner_hotkey, model_revision, outcome, elo_before, elo_after}
+# - task_id: Original task_id that generated this match
+# - game_result: Game-specific result data (for multi-party games)
+MATCH_RECORDS_SCHEMA = {
+    "TableName": get_table_name("match_records"),
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},   # ENV#{env}
+        {"AttributeName": "sk", "KeyType": "RANGE"},  # MATCH#{timestamp}#{match_uuid}
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "sk", "AttributeType": "S"},
+        {"AttributeName": "gsi_partition", "AttributeType": "S"},
+        {"AttributeName": "timestamp", "AttributeType": "N"},
+    ],
+    "GlobalSecondaryIndexes": [
+        {
+            "IndexName": "timestamp-index",
+            "KeySchema": [
+                {"AttributeName": "gsi_partition", "KeyType": "HASH"},  # Fixed "MATCH"
+                {"AttributeName": "timestamp", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        },
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+# TTL settings for match_records (90 days retention)
+MATCH_RECORDS_TTL = {
+    "AttributeName": "ttl",
+}
+
+
+# Match Pool Table (for multi-party games)
+#
+# Design Philosophy:
+# - PK: GAME#{game_type}#STATUS#{status} - partition by game type and status
+# - SK: MATCH#{match_uuid} - unique match identifier
+# - GSI: status-created-index for FIFO-style fetching of pending matches
+#
+# Query Patterns:
+# 1. Get pending matches for a game: Query by PK (game_type + status=pending)
+# 2. Get oldest pending matches (FIFO): Query GSI by status, sorted by created_at
+# 3. Get specific match: Query any partition + SK
+#
+# Fields:
+# - game_type: "tictactoe", "chess", etc.
+# - player_count: Required number of players
+# - participants: List of matched players (filled as they join)
+# - task_id: Game seed/scenario identifier
+# - game_config: Game-specific configuration
+# - status: pending | executing | completed | failed
+MATCH_POOL_SCHEMA = {
+    "TableName": get_table_name("match_pool"),
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},   # GAME#{game_type}#STATUS#{status}
+        {"AttributeName": "sk", "KeyType": "RANGE"},  # MATCH#{match_uuid}
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "sk", "AttributeType": "S"},
+        {"AttributeName": "gsi1_pk", "AttributeType": "S"},
+        {"AttributeName": "gsi1_sk", "AttributeType": "N"},
+    ],
+    "GlobalSecondaryIndexes": [
+        {
+            "IndexName": "status-created-index",
+            "KeySchema": [
+                {"AttributeName": "gsi1_pk", "KeyType": "HASH"},   # STATUS#{status}
+                {"AttributeName": "gsi1_sk", "KeyType": "RANGE"},  # created_at (timestamp)
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        },
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+
+# Match Results Table (per-participant results for multi-party games)
+#
+# Design Philosophy:
+# - PK: MINER#{hotkey}#REV#{revision}#GAME#{game_type} - partition by miner+game
+# - SK: MATCH#{match_uuid} - one record per match per participant
+# - GSI: match-uuid-index for fetching all participants in a match
+#
+# Query Patterns:
+# 1. Get miner's match history in a game: Query by PK
+# 2. Get all participants in a match: Query GSI by match_uuid
+# 3. Get miner's overall stats: Aggregate from query by PK
+#
+# Fields:
+# - outcome: "win", "loss", "draw", "timeout", "error"
+# - score: Normalized score (0.0-1.0)
+# - opponent_hotkeys: List of opponent hotkeys
+# - move_history: Compressed move sequence
+# - latency stats: avg_move_latency_ms, total_latency_ms
+MATCH_RESULTS_SCHEMA = {
+    "TableName": get_table_name("match_results"),
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},   # MINER#{hotkey}#REV#{revision}#GAME#{game_type}
+        {"AttributeName": "sk", "KeyType": "RANGE"},  # MATCH#{match_uuid}
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "sk", "AttributeType": "S"},
+        {"AttributeName": "gsi1_pk", "AttributeType": "S"},
+        {"AttributeName": "gsi1_sk", "AttributeType": "S"},
+    ],
+    "GlobalSecondaryIndexes": [
+        {
+            "IndexName": "match-uuid-index",
+            "KeySchema": [
+                {"AttributeName": "gsi1_pk", "KeyType": "HASH"},   # MATCH#{match_uuid}
+                {"AttributeName": "gsi1_sk", "KeyType": "RANGE"},  # SLOT#{slot}
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        },
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+# TTL settings for match_results (30 days retention)
+MATCH_RESULTS_TTL = {
+    "AttributeName": "ttl",
+}
+
+
 # All table schemas
 ALL_SCHEMAS = [
     SAMPLE_RESULTS_SCHEMA,
@@ -302,4 +493,9 @@ ALL_SCHEMAS = [
     MINERS_SCHEMA,
     SCORE_SNAPSHOTS_SCHEMA,
     MINER_STATS_SCHEMA,
+    # ELO system tables
+    ELO_RATINGS_SCHEMA,
+    MATCH_RECORDS_SCHEMA,
+    MATCH_POOL_SCHEMA,
+    MATCH_RESULTS_SCHEMA,
 ]

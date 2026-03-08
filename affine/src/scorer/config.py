@@ -5,6 +5,7 @@ Central configuration for the scoring algorithm.
 All parameters are defined as constants for clarity and maintainability.
 """
 
+from decimal import Decimal
 from typing import Dict, Any
 
 
@@ -102,7 +103,50 @@ class ScorerConfig:
     # Database & Storage
     SCORE_RECORD_TTL_DAYS: int = 30
     """TTL for score_snapshots table (in days)."""
-    
+
+    # ==========================================================================
+    # ELO Rating System Configuration
+    # ==========================================================================
+
+    ELO_ENABLED: bool = False
+    """Master switch for ELO rating processing. When True, ELO ratings are calculated."""
+
+    ELO_K_FACTOR: int = 32
+    """Base K-factor for ELO rating changes. Higher = more volatile ratings."""
+
+    ELO_K_FACTOR_NEW_PLAYER: int = 40
+    """K-factor for new players (< 30 matches). Higher for faster calibration."""
+
+    ELO_K_FACTOR_ESTABLISHED: int = 24
+    """K-factor for established players (> 100 matches). Lower for stability."""
+
+    ELO_K_FACTOR_ELITE: int = 16
+    """K-factor for elite players (rating > 1800). Lowest for maximum stability."""
+
+    ELO_SCALE: int = 400
+    """Standard ELO scale factor for expected score calculation."""
+
+    ELO_DEFAULT_RATING: Decimal = Decimal("1500")
+    """Default starting ELO rating for new miners."""
+
+    ELO_RATING_FLOOR: Decimal = Decimal("100")
+    """Minimum possible ELO rating."""
+
+    ELO_RATING_CEILING: Decimal = Decimal("3000")
+    """Maximum possible ELO rating."""
+
+    ELO_SCORE_MARGIN: Decimal = Decimal("0.01")
+    """Score difference threshold for declaring a draw in pairwise comparison."""
+
+    ELO_NEW_PLAYER_THRESHOLD: int = 30
+    """Matches before a player is no longer considered 'new'."""
+
+    ELO_ESTABLISHED_THRESHOLD: int = 100
+    """Matches before a player is considered 'established'."""
+
+    ELO_ELITE_RATING_THRESHOLD: Decimal = Decimal("1800")
+    """Rating threshold for 'elite' status (lower K-factor)."""
+
     @classmethod
     def to_dict(cls) -> Dict[str, Any]:
         """Export configuration as dictionary for storage in snapshots."""
@@ -117,8 +161,34 @@ class ScorerConfig:
             'decay_factor': cls.DECAY_FACTOR,
             'min_weight_threshold': cls.MIN_WEIGHT_THRESHOLD,
             'min_completeness': cls.MIN_COMPLETENESS,
+            # ELO config
+            'elo_enabled': cls.ELO_ENABLED,
+            'elo_k_factor': cls.ELO_K_FACTOR,
+            'elo_scale': cls.ELO_SCALE,
+            'elo_default_rating': float(cls.ELO_DEFAULT_RATING),
+            'elo_score_margin': float(cls.ELO_SCORE_MARGIN),
         }
-    
+
+    @classmethod
+    def get_elo_config(cls) -> "EloConfig":
+        """Get ELO configuration as an EloConfig instance."""
+        from affine.src.elo.config import EloConfig
+        return EloConfig(
+            K_FACTOR=cls.ELO_K_FACTOR,
+            K_FACTOR_NEW_PLAYER=cls.ELO_K_FACTOR_NEW_PLAYER,
+            K_FACTOR_ESTABLISHED=cls.ELO_K_FACTOR_ESTABLISHED,
+            K_FACTOR_ELITE=cls.ELO_K_FACTOR_ELITE,
+            SCALE=cls.ELO_SCALE,
+            DEFAULT_RATING=cls.ELO_DEFAULT_RATING,
+            RATING_FLOOR=cls.ELO_RATING_FLOOR,
+            RATING_CEILING=cls.ELO_RATING_CEILING,
+            SCORE_MARGIN=cls.ELO_SCORE_MARGIN,
+            NEW_PLAYER_THRESHOLD=cls.ELO_NEW_PLAYER_THRESHOLD,
+            ESTABLISHED_THRESHOLD=cls.ELO_ESTABLISHED_THRESHOLD,
+            ELITE_RATING_THRESHOLD=cls.ELO_ELITE_RATING_THRESHOLD,
+            ELO_ENABLED=cls.ELO_ENABLED,
+        )
+
     @classmethod
     def validate(cls):
         """Validate configuration parameters."""
@@ -131,6 +201,11 @@ class ScorerConfig:
         assert 0.0 <= cls.DECAY_FACTOR <= 1.0, "DECAY_FACTOR must be in [0, 1]"
         assert 0.0 <= cls.MIN_WEIGHT_THRESHOLD <= 1.0, "MIN_WEIGHT_THRESHOLD must be in [0, 1]"
         assert 0.0 <= cls.MIN_COMPLETENESS <= 1.0, "MIN_COMPLETENESS must be in [0, 1]"
+        # ELO validation
+        assert cls.ELO_K_FACTOR > 0, "ELO_K_FACTOR must be positive"
+        assert cls.ELO_SCALE > 0, "ELO_SCALE must be positive"
+        assert cls.ELO_DEFAULT_RATING > 0, "ELO_DEFAULT_RATING must be positive"
+        assert cls.ELO_RATING_FLOOR < cls.ELO_RATING_CEILING, "ELO_RATING_FLOOR must be < CEILING"
 
 
 # Validate configuration on import

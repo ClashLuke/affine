@@ -19,6 +19,8 @@ from affine.api.routers import (
     scores_router,
     config_router,
     logs_router,
+    matches_router,
+    elo_router,
 )
 from affine.database import init_client, close_client
 
@@ -140,6 +142,8 @@ app.include_router(miners_router, prefix="/api/v1")
 app.include_router(scores_router, prefix="/api/v1")
 app.include_router(config_router, prefix="/api/v1")
 app.include_router(logs_router, prefix="/api/v1")
+app.include_router(matches_router, prefix="/api/v1")
+app.include_router(elo_router, prefix="/api/v1")
 
 
 @app.exception_handler(Exception)
