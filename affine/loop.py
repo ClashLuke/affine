@@ -10,8 +10,8 @@ import bittensor as bt
 from .chain import Subtensor, Challenger, get_challenger_queue, set_weights
 from .config import Config
 from .duel import run_duel
+from .scoring import Verdict, compute_k
 from .vllm import Slot, TargonSlots, health_check, health_ping
-from .wilson import Verdict
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ def _load_envs(config: Config) -> dict[str, tuple]:
     return out
 
 
-async def _cold_start(sub, config, slots) -> tuple[Challenger, Slot]:
+async def _cold_start(sub, config, slots) -> tuple[Challenger, Slot, int]:
     while True:
         queue = await get_challenger_queue(sub, config.netuid)
         if queue:
@@ -48,7 +48,8 @@ async def _cold_start(sub, config, slots) -> tuple[Challenger, Slot]:
             log.info(f"cold start: uid {champion.uid} ({champion.model})")
             slot = await slots.provision(champion.model, champion.revision)
             if await health_check(slot.base_url, config.health_check_timeout):
-                return champion, slot
+                crown_block = await sub.get_current_block()
+                return champion, slot, crown_block
             await slots.teardown(slot)
             log.warning("cold start champion failed health check, retrying")
         else:
@@ -62,7 +63,7 @@ async def run(config: Config, slots=None):
     slots = slots or TargonSlots(config)
     envs = _load_envs(config)
 
-    champion, champion_slot = await _cold_start(sub, config, slots)
+    champion, champion_slot, crown_block = await _cold_start(sub, config, slots)
     if not await set_weights(sub, wallet, config.netuid, champion.uid):
         log.error("failed to set initial weights — continuing, will retry on next dethrone")
 
@@ -89,7 +90,6 @@ async def run(config: Config, slots=None):
                 if not running:
                     break
 
-                # Pre-duel: verify champion is alive
                 if not await health_ping(champion_slot.base_url):
                     log.warning(f"champion endpoint down — attempting auto-dethrone to uid {chall.uid}")
                     new_slot = await _try_provision(slots, chall, config)
@@ -98,19 +98,24 @@ async def run(config: Config, slots=None):
                     log.info(f"DETHRONED (default): uid {chall.uid} — champion was down")
                     await slots.teardown(champion_slot)
                     champion, champion_slot = chall, new_slot
+                    crown_block = await sub.get_current_block()
                     if not await set_weights(sub, wallet, config.netuid, champion.uid):
                         log.error("failed to set weights after auto-dethrone")
                     break
 
-                log.info(f"--- duel: uid {champion.uid} vs uid {chall.uid} ({chall.model}) ---")
+                current_block = await sub.get_current_block()
+                k = compute_k(current_block - crown_block, config.k_init, config.k_final, config.k_halflife)
+                log.info(f"--- duel: uid {champion.uid} vs uid {chall.uid} ({chall.model}) k={k:.2f} ---")
+
                 verdict, chall_slot = await _run_duel_with_retry(
-                    slots, envs, champion_slot, chall, config,
+                    slots, envs, champion_slot, chall, config, k,
                 )
 
                 if verdict is Verdict.CHALLENGER_WINS:
                     log.info(f"DETHRONED: uid {chall.uid} ({chall.model}) beats uid {champion.uid}")
                     await slots.teardown(champion_slot)
                     champion, champion_slot = chall, chall_slot
+                    crown_block = await sub.get_current_block()
                     if not await set_weights(sub, wallet, config.netuid, champion.uid):
                         log.error("failed to set weights after dethrone — will retry next cycle")
                     break
@@ -146,10 +151,9 @@ async def _try_provision(slots, chall: Challenger, config: Config) -> Slot | Non
 
 
 async def _run_duel_with_retry(
-    slots, envs, champion_slot, chall, config,
+    slots, envs, champion_slot, chall, config, k,
 ) -> tuple[Verdict | None, Slot | None]:
     for attempt in range(MAX_DUEL_RETRIES + 1):
-        # Between retries, check champion is still alive
         if attempt > 0 and not await health_ping(champion_slot.base_url):
             log.warning("champion down between retries — auto-dethrone")
             slot = await _try_provision(slots, chall, config)
@@ -166,7 +170,7 @@ async def _run_duel_with_retry(
                 envs, champion_slot, slot,
                 max_tasks=config.max_tasks_per_env,
                 tasks_per_batch=config.tasks_per_batch,
-                z=config.wilson_z,
+                k=k,
                 nonce=chall.block,
             )
         except Exception as e:

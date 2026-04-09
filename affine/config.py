@@ -22,7 +22,9 @@ class Config:
     subtensor_fallback: str = "wss://lite.sub.latent.to:443"
     max_tasks_per_env: int = 200
     tasks_per_batch: int = 4
-    wilson_z: float = 1.96
+    k_init: float = 3.0
+    k_final: float = 1.0
+    k_halflife: int = 7200
     health_check_timeout: int = 300
     log_level: str = "INFO"
     environments: tuple[EnvSpec, ...] = ()
@@ -38,7 +40,9 @@ class Config:
             subtensor_fallback=os.getenv("SUBTENSOR_FALLBACK", "wss://lite.sub.latent.to:443"),
             max_tasks_per_env=int(os.getenv("MAX_TASKS_PER_ENV", "200")),
             tasks_per_batch=int(os.getenv("TASKS_PER_BATCH", "4")),
-            wilson_z=float(os.getenv("WILSON_Z", "1.96")),
+            k_init=float(os.getenv("K_INIT", "3.0")),
+            k_final=float(os.getenv("K_FINAL", "1.0")),
+            k_halflife=int(os.getenv("K_HALFLIFE", "7200")),
             health_check_timeout=int(os.getenv("HEALTH_CHECK_TIMEOUT", "300")),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             environments=_default_environments(),

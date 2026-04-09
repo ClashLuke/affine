@@ -3,11 +3,12 @@ import asyncio
 import hashlib
 import logging
 import random
+from math import sqrt
 from typing import Any
 
 from .config import EnvSpec
+from .scoring import Verdict, bt_mle, aggregate, check_duel
 from .vllm import Slot, health_ping
-from .wilson import Verdict, wilson_lower
 
 log = logging.getLogger(__name__)
 
@@ -28,7 +29,6 @@ def _batch_rng(master: int, batch: int, env_name: str) -> random.Random:
 
 
 async def _eval(env, model: str, url: str, seed: int, task_id: int, params: dict, timeout: float = 600):
-    """Returns True (success), False (task failure/timeout), or None (infra error)."""
     try:
         r = await asyncio.wait_for(
             env.evaluate(model=model, base_url=url, seed=seed, task_id=task_id, **params),
@@ -43,29 +43,6 @@ async def _eval(env, model: str, url: str, seed: int, task_id: int, params: dict
         return None
 
 
-def _check_env(wins: int, losses: int, tasks: int, max_tasks: int, z: float) -> Verdict:
-    n = wins + losses
-    if n > 0 and wilson_lower(wins, n, z) > 0.5:
-        return Verdict.CHALLENGER_WINS
-    remaining = max_tasks - tasks
-    if remaining <= 0:
-        return Verdict.CHAMPION_HOLDS
-    if wilson_lower(wins + remaining, n + remaining, z) <= 0.5:
-        return Verdict.CHAMPION_HOLDS
-    return Verdict.UNDECIDED
-
-
-def _check_majority(verdicts: dict[str, Verdict]) -> Verdict:
-    majority = len(verdicts) // 2 + 1
-    won = sum(v is Verdict.CHALLENGER_WINS for v in verdicts.values())
-    pending = sum(v is Verdict.UNDECIDED for v in verdicts.values())
-    if won >= majority:
-        return Verdict.CHALLENGER_WINS
-    if won + pending < majority:
-        return Verdict.CHAMPION_HOLDS
-    return Verdict.UNDECIDED
-
-
 async def run_duel(
     envs: dict[str, tuple[Any, EnvSpec]],
     champion: Slot,
@@ -73,13 +50,12 @@ async def run_duel(
     *,
     max_tasks: int = 200,
     tasks_per_batch: int = 4,
-    z: float = 1.96,
+    k: float = 2.0,
     nonce: int = 0,
 ) -> Verdict:
-    state = {
-        name: {"wins": 0, "losses": 0, "tasks": 0, "verdict": Verdict.UNDECIDED}
-        for name in envs
-    }
+    wins = {name: 0 for name in envs}
+    losses = {name: 0 for name in envs}
+    tasks = {name: 0 for name in envs}
     master = _master_seed(champion, challenger, nonce)
     champ_err_streak = 0
     chall_err_streak = 0
@@ -88,17 +64,13 @@ async def run_duel(
         coros, keys = [], []
 
         for name, (wrapper, spec) in envs.items():
-            s = state[name]
-            if s["verdict"] is not Verdict.UNDECIDED:
-                continue
-            if s["tasks"] >= max_tasks:
-                s["verdict"] = Verdict.CHAMPION_HOLDS
+            if tasks[name] >= max_tasks:
                 continue
 
             params = dict(spec.params)
             task_timeout = params.pop("timeout", 600)
             rng = _batch_rng(master, batch, name)
-            room = max_tasks - s["tasks"]
+            room = max_tasks - tasks[name]
 
             for _ in range(min(tasks_per_batch, room)):
                 tid = rng.randint(0, 2**31 - 1)
@@ -122,8 +94,7 @@ async def run_duel(
         batch_chall_any_ok = False
 
         for env_name, result in zip(keys, results):
-            s = state[env_name]
-            s["tasks"] += 1
+            tasks[env_name] += 1
             if isinstance(result, Exception):
                 log.warning(f"pair exception in {env_name}: {result}")
                 champ_err_streak += 1
@@ -148,7 +119,10 @@ async def run_duel(
                 continue
 
             if champ_ok != chall_ok:
-                s["wins" if chall_ok else "losses"] += 1
+                if chall_ok:
+                    wins[env_name] += 1
+                else:
+                    losses[env_name] += 1
 
         if champ_err_streak >= INFRA_STREAK_LIMIT or chall_err_streak >= INFRA_STREAK_LIMIT:
             raise RuntimeError(
@@ -156,39 +130,53 @@ async def run_duel(
                 f"challenger={chall_err_streak} consecutive errors)"
             )
 
-        # Mid-duel liveness: if a slot had zero successes in this batch,
-        # confirm it's actually reachable. Catches dead endpoints whose
-        # timeouts/failures look like task losses or produce ties.
         if not batch_champ_any_ok:
             if not await health_ping(champion.base_url):
-                log.info("champion confirmed down mid-duel — challenger wins by default")
-                _log_summary(state, Verdict.CHALLENGER_WINS, champion, challenger)
+                log.info("champion confirmed down — challenger wins by default")
+                _log_summary(wins, losses, tasks, Verdict.CHALLENGER_WINS, champion, challenger, k)
                 return Verdict.CHALLENGER_WINS
         if not batch_chall_any_ok:
             if not await health_ping(challenger.base_url):
-                log.info("challenger confirmed down mid-duel — champion holds")
-                _log_summary(state, Verdict.CHAMPION_HOLDS, champion, challenger)
+                log.info("challenger confirmed down — champion holds")
+                _log_summary(wins, losses, tasks, Verdict.CHAMPION_HOLDS, champion, challenger, k)
                 return Verdict.CHAMPION_HOLDS
 
-        for name, s in state.items():
-            if s["verdict"] is Verdict.UNDECIDED:
-                s["verdict"] = _check_env(s["wins"], s["losses"], s["tasks"], max_tasks, z)
-                if s["verdict"] is not Verdict.UNDECIDED:
-                    log.info(f"  {name}: {s['verdict'].name} W={s['wins']} L={s['losses']} n={s['tasks']}")
+        verdict, z = check_duel(wins, losses, tasks, max_tasks, k)
+        if verdict is not Verdict.UNDECIDED:
+            _log_summary(wins, losses, tasks, verdict, champion, challenger, k)
+            return verdict
 
-        overall = _check_majority({n: s["verdict"] for n, s in state.items()})
-        if overall is not Verdict.UNDECIDED:
-            _log_summary(state, overall, champion, challenger)
-            return overall
-
-    overall = _check_majority({n: s["verdict"] for n, s in state.items()})
-    _log_summary(state, overall, champion, challenger)
-    return overall
+    verdict, _ = check_duel(wins, losses, tasks, max_tasks, k)
+    if verdict is Verdict.UNDECIDED:
+        verdict = Verdict.CHAMPION_HOLDS
+    _log_summary(wins, losses, tasks, verdict, champion, challenger, k)
+    return verdict
 
 
-def _log_summary(state: dict, verdict: Verdict, champion: Slot, challenger: Slot):
-    total = sum(s["tasks"] for s in state.values())
-    decisive = sum(s["wins"] + s["losses"] for s in state.values())
-    log.info(f"duel: {verdict.name} | {champion.model} vs {challenger.model} | {total} tasks, {decisive} decisive")
-    for name, s in state.items():
-        log.info(f"  {name}: {s['verdict'].name} W={s['wins']} L={s['losses']} n={s['tasks']}")
+def _log_summary(wins, losses, tasks, verdict, champion, challenger, k):
+    total_tasks = sum(tasks.values())
+    decisive = sum(wins[n] + losses[n] for n in wins)
+
+    deltas, variances = [], []
+    for name in wins:
+        if wins[name] + losses[name] > 0:
+            d, v = bt_mle(wins[name], losses[name])
+            deltas.append(d)
+            variances.append(v)
+
+    if deltas:
+        delta, var = aggregate(deltas, variances)
+        z = delta / sqrt(var)
+        log.info(f"duel: {verdict.name} | {champion.model} vs {challenger.model} | "
+                 f"z={z:.2f} k={k:.2f} | {total_tasks} tasks, {decisive} decisive")
+    else:
+        log.info(f"duel: {verdict.name} | {champion.model} vs {challenger.model} | "
+                 f"no decisive outcomes | {total_tasks} tasks")
+
+    for name in wins:
+        w, l = wins[name], losses[name]
+        if w + l > 0:
+            d, v = bt_mle(w, l)
+            log.info(f"  {name}: W={w} L={l} n={tasks[name]} delta={d:.3f} se={sqrt(v):.3f}")
+        else:
+            log.info(f"  {name}: W=0 L=0 n={tasks[name]}")
