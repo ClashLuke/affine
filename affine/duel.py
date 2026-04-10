@@ -8,7 +8,7 @@ from typing import Any
 
 from .config import EnvSpec
 from .scoring import Verdict, bt_mle, aggregate, check_duel
-from .vllm import Slot, health_ping
+from .vllm import Slot, health_check, health_ping
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +52,7 @@ async def run_duel(
     tasks_per_batch: int = 4,
     k: float = 2.0,
     nonce: int = 0,
+    progress_interval: int = 0,
 ) -> Verdict:
     wins = {name: 0 for name in envs}
     losses = {name: 0 for name in envs}
@@ -60,6 +61,7 @@ async def run_duel(
     champ_err_streak = 0
     chall_err_streak = 0
 
+    next_progress = progress_interval if progress_interval > 0 else None
     for batch in range(max_tasks):
         coros, keys = [], []
 
@@ -73,7 +75,7 @@ async def run_duel(
             room = max_tasks - tasks[name]
 
             for _ in range(min(tasks_per_batch, room)):
-                tid = rng.randint(0, 2**31 - 1)
+                tid = rng.randint(0, max_tasks - 1) if max_tasks > 0 else 0
                 seed = rng.randint(0, 2**32 - 1)
 
                 async def _pair(w=wrapper, s=seed, t=tid, p=params, to=task_timeout):
@@ -131,17 +133,22 @@ async def run_duel(
             )
 
         if not batch_champ_any_ok:
-            if not await health_ping(champion.base_url):
+            if not await health_check(champion.base_url, timeout=30):
                 log.info("champion confirmed down — challenger wins by default")
                 _log_summary(wins, losses, tasks, Verdict.CHALLENGER_WINS, champion, challenger, k)
                 return Verdict.CHALLENGER_WINS
         if not batch_chall_any_ok:
-            if not await health_ping(challenger.base_url):
+            if not await health_check(challenger.base_url, timeout=30):
                 log.info("challenger confirmed down — champion holds")
                 _log_summary(wins, losses, tasks, Verdict.CHAMPION_HOLDS, champion, challenger, k)
                 return Verdict.CHAMPION_HOLDS
 
         verdict, z = check_duel(wins, losses, tasks, max_tasks, k)
+        if next_progress is not None:
+            total_tasks = sum(tasks.values())
+            while total_tasks >= next_progress:
+                _log_progress(wins, losses, tasks, total_tasks, k, z)
+                next_progress += progress_interval
         if verdict is not Verdict.UNDECIDED:
             _log_summary(wins, losses, tasks, verdict, champion, challenger, k)
             return verdict
@@ -180,3 +187,25 @@ def _log_summary(wins, losses, tasks, verdict, champion, challenger, k):
             log.info(f"  {name}: W={w} L={l} n={tasks[name]} delta={d:.3f} se={sqrt(v):.3f}")
         else:
             log.info(f"  {name}: W=0 L=0 n={tasks[name]}")
+
+
+def _log_progress(wins, losses, tasks, total_tasks, k, z):
+    decisive = sum(wins[n] + losses[n] for n in wins)
+    total_wins = sum(wins.values())
+    deltas, variances = [], []
+    for name in wins:
+        if wins[name] + losses[name] > 0:
+            d, v = bt_mle(wins[name], losses[name])
+            deltas.append(d)
+            variances.append(v)
+
+    if deltas:
+        delta, var = aggregate(deltas, variances)
+        z = delta / sqrt(var)
+        winrate = total_wins / decisive if decisive else 0.0
+        log.info(
+            f"progress: tasks={total_tasks} decisive={decisive} winrate={winrate:.3f} "
+            f"delta={delta:.3f} z={z:.2f} k={k:.2f}"
+        )
+    else:
+        log.info(f"progress: tasks={total_tasks} decisive=0 winrate=0.000 delta=0.000 z=0.00 k={k:.2f}")

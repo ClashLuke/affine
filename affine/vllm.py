@@ -66,19 +66,26 @@ class TargonSlots:
     def __init__(self, config):
         self._config = config
 
-    async def provision(self, model: str, revision: str) -> Slot:
+    async def provision(self, model: str, revision: str, timeout: int = 600) -> Slot:
         env = {**os.environ, "MODEL_NAME": model, "MODEL_REVISION": revision}
-        proc = await asyncio.create_subprocess_exec(
-            "targon", "deploy", _SERVER_SCRIPT,
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    "targon", "deploy", _SERVER_SCRIPT,
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"targon deploy timed out after {timeout}s")
+
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
             raise RuntimeError(f"targon deploy failed: {stderr.decode().strip()}")
         app_id = _parse_field(stdout.decode(), "app")
-        base_url = await _get_url(app_id)
+        base_url = await _get_url(app_id, timeout=60)
         return Slot(model=model, revision=revision, base_url=base_url, slot_id=app_id)
 
     async def teardown(self, slot: Slot) -> None:
@@ -94,12 +101,19 @@ class TargonSlots:
             log.warning(f"targon stop failed for {slot.slot_id}")
 
 
-async def _get_url(app_id: str) -> str:
-    proc = await asyncio.create_subprocess_exec(
-        "targon", "app", "get", app_id,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+async def _get_url(app_id: str, timeout: int = 60) -> str:
+    try:
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                "targon", "app", "get", app_id,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"targon app get timed out after {timeout}s for {app_id}")
+
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
         raise RuntimeError(f"targon app get failed for {app_id}: {stderr.decode().strip()}")

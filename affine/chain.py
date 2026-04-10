@@ -119,6 +119,11 @@ async def get_challenger_queue(
 async def set_weights(
     sub: Subtensor, wallet: bt.Wallet, netuid: int, champion_uid: int, retries: int = 3,
 ) -> bool:
+    meta = await sub.metagraph(netuid)
+    if champion_uid >= len(meta.hotkeys) or not meta.hotkeys[champion_uid]:
+        log.warning(f"champion uid {champion_uid} not in metagraph, skipping weight set")
+        return False
+
     for attempt in range(retries):
         try:
             ok = await sub.set_weights(

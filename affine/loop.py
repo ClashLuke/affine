@@ -90,7 +90,7 @@ async def run(config: Config, slots=None):
                 if not running:
                     break
 
-                if not await health_ping(champion_slot.base_url):
+                if not await health_check(champion_slot.base_url, timeout=30):
                     log.warning(f"champion endpoint down — attempting auto-dethrone to uid {chall.uid}")
                     new_slot = await _try_provision(slots, chall, config)
                     if new_slot is None:
@@ -154,12 +154,15 @@ async def _run_duel_with_retry(
     slots, envs, champion_slot, chall, config, k,
 ) -> tuple[Verdict | None, Slot | None]:
     for attempt in range(MAX_DUEL_RETRIES + 1):
-        if attempt > 0 and not await health_ping(champion_slot.base_url):
-            log.warning("champion down between retries — auto-dethrone")
-            slot = await _try_provision(slots, chall, config)
-            if slot is None:
-                return None, None
-            return Verdict.CHALLENGER_WINS, slot
+        if attempt > 0:
+            if not await health_check(champion_slot.base_url, timeout=30):
+                log.warning("champion down between retries — auto-dethrone")
+                slot = await _try_provision(slots, chall, config)
+                if slot is None:
+                    return None, None
+                return Verdict.CHALLENGER_WINS, slot
+            else:
+                log.info("champion recovered, resuming duel")
 
         slot = await _try_provision(slots, chall, config)
         if slot is None:
