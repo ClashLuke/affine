@@ -10,7 +10,7 @@ import httpx
 log = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class Slot:
     model: str
     revision: str
@@ -62,34 +62,37 @@ class LocalSlots:
 _SERVER_SCRIPT = os.path.join(os.path.dirname(__file__), "_targon_server.py")
 
 
+async def _run_cmd(*args, timeout: int = 60, env=None) -> str:
+    cmd = " ".join(str(a) for a in args[:2])
+    try:
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                *args, env=env,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"{cmd} timed out after {timeout}s")
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError(f"{cmd} hung after {timeout}s")
+    if proc.returncode != 0:
+        raise RuntimeError(f"{cmd} failed: {stderr.decode().strip()}")
+    return stdout.decode()
+
+
 class TargonSlots:
     def __init__(self, config):
         self._config = config
 
     async def provision(self, model: str, revision: str, timeout: int = 600) -> Slot:
         env = {**os.environ, "MODEL_NAME": model, "MODEL_REVISION": revision}
-        try:
-            proc = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    "targon", "deploy", _SERVER_SCRIPT,
-                    env=env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                ),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            raise RuntimeError(f"targon deploy timed out after {timeout}s")
-
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise RuntimeError(f"targon deploy hung after {timeout}s")
-        if proc.returncode != 0:
-            raise RuntimeError(f"targon deploy failed: {stderr.decode().strip()}")
-        app_id = _parse_field(stdout.decode(), "app")
-        base_url = await _get_url(app_id, timeout=60)
+        output = await _run_cmd("targon", "deploy", _SERVER_SCRIPT, timeout=timeout, env=env)
+        app_id = _parse_field(output, "app")
+        base_url = await _get_url(app_id)
         return Slot(model=model, revision=revision, base_url=base_url, slot_id=app_id)
 
     async def teardown(self, slot: Slot) -> None:
@@ -97,8 +100,7 @@ class TargonSlots:
             return
         proc = await asyncio.create_subprocess_exec(
             "targon", "app", "stop", slot.slot_id,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         try:
             await asyncio.wait_for(proc.communicate(), timeout=30)
@@ -111,26 +113,8 @@ class TargonSlots:
 
 
 async def _get_url(app_id: str, timeout: int = 60) -> str:
-    try:
-        proc = await asyncio.wait_for(
-            asyncio.create_subprocess_exec(
-                "targon", "app", "get", app_id,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            ),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        raise RuntimeError(f"targon app get timed out after {timeout}s for {app_id}")
-
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        raise RuntimeError(f"targon app get hung after {timeout}s for {app_id}")
-    if proc.returncode != 0:
-        raise RuntimeError(f"targon app get failed for {app_id}: {stderr.decode().strip()}")
-    url = _parse_field(stdout.decode(), "url")
+    output = await _run_cmd("targon", "app", "get", app_id, timeout=timeout)
+    url = _parse_field(output, "url")
     return url if url.endswith("/v1") else url.rstrip("/") + "/v1"
 
 

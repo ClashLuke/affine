@@ -54,9 +54,15 @@ async def run_duel(
     nonce: int = 0,
     progress_interval: int = 0,
 ) -> Verdict:
-    wins = {name: 0 for name in envs}
-    losses = {name: 0 for name in envs}
-    tasks = {name: 0 for name in envs}
+    env_data = {}
+    for name, (wrapper, spec) in envs.items():
+        params = dict(spec.params)
+        timeout = params.pop("timeout", 600)
+        env_data[name] = (wrapper, params, timeout)
+
+    wins = {name: 0 for name in env_data}
+    losses = {name: 0 for name in env_data}
+    tasks = {name: 0 for name in env_data}
     master = _master_seed(champion, challenger, nonce)
     champ_err_streak = 0
     chall_err_streak = 0
@@ -65,26 +71,20 @@ async def run_duel(
     for batch in range(max_tasks):
         coros, keys = [], []
 
-        for name, (wrapper, spec) in envs.items():
+        for name, (wrapper, params, task_timeout) in env_data.items():
             if tasks[name] >= max_tasks:
                 continue
 
-            params = dict(spec.params)
-            task_timeout = params.pop("timeout", 600)
             rng = _batch_rng(master, batch, name)
             room = max_tasks - tasks[name]
 
             for _ in range(min(tasks_per_batch, room)):
                 tid = rng.randint(0, max_tasks - 1) if max_tasks > 0 else 0
                 seed = rng.randint(0, 2**32 - 1)
-
-                async def _pair(w=wrapper, s=seed, t=tid, p=params, to=task_timeout):
-                    return await asyncio.gather(
-                        _eval(w, champion.model, champion.base_url, s, t, p, to),
-                        _eval(w, challenger.model, challenger.base_url, s, t, p, to),
-                    )
-
-                coros.append(_pair())
+                coros.append(asyncio.gather(
+                    _eval(wrapper, champion.model, champion.base_url, seed, tid, params, task_timeout),
+                    _eval(wrapper, challenger.model, challenger.base_url, seed, tid, params, task_timeout),
+                ))
                 keys.append(name)
 
         if not coros:
@@ -117,14 +117,8 @@ async def run_duel(
                 if chall_ok:
                     batch_chall_any_ok = True
 
-            if champ_ok is None or chall_ok is None:
-                continue
-
-            if champ_ok != chall_ok:
-                if chall_ok:
-                    wins[env_name] += 1
-                else:
-                    losses[env_name] += 1
+            if champ_ok is not None and chall_ok is not None and champ_ok != chall_ok:
+                (wins if chall_ok else losses)[env_name] += 1
 
         if champ_err_streak >= INFRA_STREAK_LIMIT or chall_err_streak >= INFRA_STREAK_LIMIT:
             raise RuntimeError(

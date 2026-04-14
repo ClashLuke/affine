@@ -46,7 +46,7 @@ async def _cold_start(sub, config, slots) -> tuple[Challenger, Slot, int]:
             log.info("no miners registered, waiting 120s")
             await asyncio.sleep(120)
             continue
-        for candidate in sorted(queue, key=lambda c: c.block):
+        for candidate in queue:
             log.info(f"cold start: trying uid {candidate.uid} ({candidate.model})")
             try:
                 slot = await slots.provision(candidate.model, candidate.revision)

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 
-@dataclass
+@dataclass(frozen=True)
 class EnvSpec:
     name: str
     image: str

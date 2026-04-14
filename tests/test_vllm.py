@@ -156,7 +156,7 @@ async def test_get_url_keeps_existing_v1():
 async def test_get_url_nonzero_exit_raises():
     proc = _Proc(returncode=1, stderr=b"bad")
     with patch("affine.vllm.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
-        with pytest.raises(RuntimeError, match="targon app get failed"):
+        with pytest.raises(RuntimeError, match="targon app failed"):
             await _get_url("app-1", timeout=1)
 
 
