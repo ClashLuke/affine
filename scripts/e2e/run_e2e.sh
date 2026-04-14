@@ -30,7 +30,16 @@ die() { printf '\033[1;31mFATAL: %s\033[0m\n' "$*" >&2; exit 1; }
 stop_vllm() {
     local pid="$1" name="$2"
     [ -z "$pid" ] && return
-    kill -0 "$pid" 2>/dev/null || return
+    local children
+    children=$(pgrep -P "$pid" 2>/dev/null || true)
+    kill -0 "$pid" 2>/dev/null || {
+        # parent gone but children may survive
+        for cpid in $children; do
+            kill -9 "$cpid" 2>/dev/null || true
+        done
+        [ -n "$children" ] && log "$name orphan children killed"
+        return
+    }
     log "stopping $name (pid $pid)"
     kill -INT "$pid" 2>/dev/null
     for _ in $(seq 1 15); do
@@ -39,6 +48,9 @@ stop_vllm() {
     done
     log "$name did not exit after SIGINT, sending SIGKILL"
     kill -9 "$pid" 2>/dev/null
+    for cpid in $(pgrep -P "$pid" 2>/dev/null || true); do
+        kill -9 "$cpid" 2>/dev/null || true
+    done
     wait "$pid" 2>/dev/null || true
 }
 
@@ -82,7 +94,7 @@ docker run -d --name "$SUBTENSOR_CONTAINER" \
 
 log "waiting for block production (up to 60s)"
 for i in $(seq 1 60); do
-    if docker logs "$SUBTENSOR_CONTAINER" 2>&1 | grep -q "Imported #1"; then
+    if docker logs "$SUBTENSOR_CONTAINER" 2>&1 | grep "Imported #1" >/dev/null; then
         log "subtensor producing blocks (${i}s)"
         break
     fi

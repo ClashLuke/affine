@@ -64,6 +64,9 @@ async def _cold_start(sub, config, slots) -> tuple[Challenger, Slot, int]:
 
 async def run(config: Config, slots=None):
     import bittensor as bt
+    for _name, _lg in logging.root.manager.loggerDict.items():
+        if isinstance(_lg, logging.Logger) and _name.startswith("affine"):
+            _lg.setLevel(logging.NOTSET)
     sub = Subtensor(config.subtensor_endpoint, config.subtensor_fallback)
     wallet = bt.Wallet(name=config.wallet_name, hotkey=config.hotkey_name)
     slots = slots or TargonSlots(config)
