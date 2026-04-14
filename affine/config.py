@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 
@@ -68,80 +68,36 @@ def _apply_profile(cfg: Config, profile: str) -> Config:
     if profile == "default":
         return cfg
     if profile == "full":
-        return Config(
-            netuid=cfg.netuid,
-            wallet_name=cfg.wallet_name,
-            hotkey_name=cfg.hotkey_name,
-            network=cfg.network,
-            subtensor_endpoint=cfg.subtensor_endpoint,
-            subtensor_fallback=cfg.subtensor_fallback,
+        return replace(cfg,
             max_tasks_per_env=64,
-            tasks_per_batch=4,
-            k_init=cfg.k_init,
-            k_final=cfg.k_final,
-            k_halflife=cfg.k_halflife,
-            health_check_timeout=cfg.health_check_timeout,
-            log_level=cfg.log_level,
             environments=_with_timeouts(cfg.environments, default_timeout=300, game_timeout=1800),
         )
     if profile == "smoke":
-        return Config(
-            netuid=cfg.netuid,
-            wallet_name=cfg.wallet_name,
-            hotkey_name=cfg.hotkey_name,
-            network=cfg.network,
-            subtensor_endpoint=cfg.subtensor_endpoint,
-            subtensor_fallback=cfg.subtensor_fallback,
-            max_tasks_per_env=8,
-            tasks_per_batch=2,
-            k_init=1.0,
-            k_final=1.0,
-            k_halflife=cfg.k_halflife,
+        return replace(cfg,
+            max_tasks_per_env=8, tasks_per_batch=2,
+            k_init=1.0, k_final=1.0,
             health_check_timeout=min(cfg.health_check_timeout, 180),
-            log_level=cfg.log_level,
             environments=_with_timeouts(cfg.environments, default_timeout=90, game_timeout=420),
         )
     raise ValueError(f"unsupported profile: {profile}")
 
 
 def _with_timeouts(
-    environments: tuple[EnvSpec, ...], *, default_timeout: int, game_timeout: int
+    environments: tuple[EnvSpec, ...], *, default_timeout: int, game_timeout: int,
 ) -> tuple[EnvSpec, ...]:
-    out: list[EnvSpec] = []
+    out = []
     for spec in environments:
-        params = dict(spec.params)
-        timeout = game_timeout if spec.name == "game" else default_timeout
-        params["timeout"] = min(int(params.get("timeout", timeout)), timeout)
-        out.append(
-            EnvSpec(
-                name=spec.name,
-                image=spec.image,
-                params=params,
-                env_vars=dict(spec.env_vars),
-                mem_limit=spec.mem_limit,
-            )
-        )
+        t = game_timeout if spec.name == "game" else default_timeout
+        out.append(replace(spec, params={**spec.params, "timeout": min(int(spec.params.get("timeout", t)), t)}))
     return tuple(out)
 
 
 def _apply_json_overrides(cfg: Config, raw: dict) -> Config:
-    top = {
-        "netuid": int(raw.get("netuid", cfg.netuid)),
-        "wallet_name": str(raw.get("wallet_name", cfg.wallet_name)),
-        "hotkey_name": str(raw.get("hotkey_name", cfg.hotkey_name)),
-        "network": str(raw.get("network", cfg.network)),
-        "subtensor_endpoint": str(raw.get("subtensor_endpoint", cfg.subtensor_endpoint)),
-        "subtensor_fallback": str(raw.get("subtensor_fallback", cfg.subtensor_fallback)),
-        "max_tasks_per_env": int(raw.get("max_tasks_per_env", cfg.max_tasks_per_env)),
-        "tasks_per_batch": int(raw.get("tasks_per_batch", cfg.tasks_per_batch)),
-        "k_init": float(raw.get("k_init", cfg.k_init)),
-        "k_final": float(raw.get("k_final", cfg.k_final)),
-        "k_halflife": int(raw.get("k_halflife", cfg.k_halflife)),
-        "health_check_timeout": int(raw.get("health_check_timeout", cfg.health_check_timeout)),
-        "log_level": str(raw.get("log_level", cfg.log_level)),
-    }
-    envs = _apply_env_overrides(cfg.environments, raw)
-    return Config(environments=envs, **top)
+    overrides = {}
+    for f in fields(Config):
+        if f.name != "environments" and f.name in raw:
+            overrides[f.name] = type(getattr(cfg, f.name))(raw[f.name])
+    return replace(cfg, environments=_apply_env_overrides(cfg.environments, raw), **overrides)
 
 
 def _apply_env_overrides(current: tuple[EnvSpec, ...], raw: dict) -> tuple[EnvSpec, ...]:
@@ -153,7 +109,7 @@ def _apply_env_overrides(current: tuple[EnvSpec, ...], raw: dict) -> tuple[EnvSp
             by_name[name] = _merge_env(by_name[name], override)
 
     if isinstance(raw.get("environments"), list):
-        rebuilt: list[EnvSpec] = []
+        rebuilt = []
         for item in raw["environments"]:
             if not isinstance(item, dict) or "name" not in item:
                 raise ValueError("each environments item must be an object with a name")
@@ -162,47 +118,41 @@ def _apply_env_overrides(current: tuple[EnvSpec, ...], raw: dict) -> tuple[EnvSp
             rebuilt.append(_merge_env(base, item))
         return tuple(rebuilt)
 
-    return tuple(by_name[name] for name in [spec.name for spec in current])
+    return tuple(by_name[spec.name] for spec in current)
 
 
 def _merge_env(base: EnvSpec, override: dict) -> EnvSpec:
-    params = dict(base.params)
-    params.update(dict(override.get("params", {})))
-    env_vars = dict(base.env_vars)
-    env_vars.update(dict(override.get("env_vars", {})))
     image = str(override.get("image", base.image))
     if not image:
         raise ValueError(f"environment '{base.name}' has empty image")
-    return EnvSpec(
+    return replace(base,
         name=str(override.get("name", base.name)),
         image=image,
-        params=params,
-        env_vars=env_vars,
+        params={**base.params, **override.get("params", {})},
+        env_vars={**base.env_vars, **override.get("env_vars", {})},
         mem_limit=str(override.get("mem_limit", base.mem_limit)),
     )
 
 
+ENV_REGISTRY: dict[str, EnvSpec] = {
+    "ded": EnvSpec(
+        name="affine:ded", image="affinefoundation/affine-env:v4",
+        params={"task_type": "ded", "temperature": 0.0, "timeout": 600},
+    ),
+    "abd": EnvSpec(
+        name="affine:abd", image="affinefoundation/affine-env:v4",
+        params={"task_type": "abd", "temperature": 0.0, "timeout": 600},
+    ),
+    "game": EnvSpec(
+        name="game", image="affinefoundation/game:openspiel",
+        params={"temperature": 0.0, "timeout": 7200},
+    ),
+    "distill": EnvSpec(
+        name="distill", image="affinefoundation/distill:latest",
+        params={"temperature": 0.0, "timeout": 600}, mem_limit="2g",
+    ),
+}
+
+
 def _default_environments() -> tuple[EnvSpec, ...]:
-    return (
-        EnvSpec(
-            name="affine:ded",
-            image="affinefoundation/affine-env:v4",
-            params={"task_type": "ded", "temperature": 0.0, "timeout": 600},
-        ),
-        EnvSpec(
-            name="affine:abd",
-            image="affinefoundation/affine-env:v4",
-            params={"task_type": "abd", "temperature": 0.0, "timeout": 600},
-        ),
-        EnvSpec(
-            name="game",
-            image="affinefoundation/game:openspiel",
-            params={"temperature": 0.0, "timeout": 7200},
-        ),
-        EnvSpec(
-            name="distill",
-            image="affinefoundation/distill:latest",
-            params={"temperature": 0.0, "timeout": 600},
-            mem_limit="2g",
-        ),
-    )
+    return tuple(ENV_REGISTRY.values())

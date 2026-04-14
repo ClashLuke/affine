@@ -159,3 +159,37 @@ class TestComputeK:
     def test_custom_params(self):
         k = compute_k(0, k_init=5.0, k_final=0.5, halflife=3600)
         assert abs(k - 5.0) < 1e-12
+
+
+# --- Edge cases from affine-cortex comparison ---
+
+class TestCheckDuelEdgeCases:
+
+    def test_single_decisive_insufficient(self):
+        """1 win should NOT clear k=2. z ≈ 0.76 with pseudocounts."""
+        v, z = check_duel({"e": 1}, {"e": 0}, {"e": 1}, 200, 2.0)
+        assert v is Verdict.UNDECIDED
+
+    def test_hopelessness_per_env_budget(self):
+        """Env A exhausted and losing. Env B has budget. Must stay UNDECIDED.
+        Hopelessness must check remaining budget per-env, not globally."""
+        v, _ = check_duel(
+            {"a": 0, "b": 2}, {"a": 50, "b": 3}, {"a": 200, "b": 10}, 200, 2.0,
+        )
+        assert v is Verdict.UNDECIDED
+
+    def test_all_tie_env_excluded_from_aggregate(self):
+        """0W-0L env must not affect z-score. Adding a no-data env should be
+        identical to not having it."""
+        _, z1 = check_duel({"a": 15, "b": 0}, {"a": 5, "b": 0}, {"a": 20, "b": 20}, 200, 2.0)
+        _, z2 = check_duel({"a": 15}, {"a": 5}, {"a": 20}, 200, 2.0)
+        assert abs(z1 - z2) < 1e-12
+
+    def test_inverse_variance_property(self):
+        """100-sample env with slight edge should dominate 5-sample env
+        with strong opposite edge. This is the key difference from the old
+        system's equal-weight ELO."""
+        d_a, v_a = bt_mle(55, 45)   # 100 samples, slight challenger edge
+        d_b, v_b = bt_mle(1, 4)     # 5 samples, strong champion edge
+        d_agg, _ = aggregate([d_a, d_b], [v_a, v_b])
+        assert d_agg > 0  # env_a dominates

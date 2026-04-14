@@ -135,13 +135,9 @@ async def _get_url(app_id: str, timeout: int = 60) -> str:
 
 
 def _parse_field(output: str, field: str) -> str:
-    field_lower = field.lower()
     for line in output.splitlines():
-        parts = line.strip().split(":", 1)
-        if len(parts) == 2:
-            key = parts[0].lower().replace("_", " ").split()
-            if key and key[0] == field_lower:
-                val = parts[1].strip()
-                if val:
-                    return val
+        if ":" in line:
+            k, v = line.split(":", 1)
+            if k.strip().lower() == field.lower() and v.strip():
+                return v.strip()
     raise RuntimeError(f"field '{field}' not found in targon output:\n{output}")

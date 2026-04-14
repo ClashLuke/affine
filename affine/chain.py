@@ -1,11 +1,10 @@
 from __future__ import annotations
 import asyncio
+import inspect
 import json
 import logging
 import os
 from dataclasses import dataclass
-
-import bittensor as bt
 
 log = logging.getLogger(__name__)
 
@@ -21,7 +20,8 @@ class Subtensor:
         self._sub: bt.AsyncSubtensor | None = None
         self._lock = asyncio.Lock()
 
-    async def _connect(self) -> bt.AsyncSubtensor:
+    async def _connect(self):
+        import bittensor as bt
         for url in (self._endpoint, self._fallback):
             if url is None:
                 continue
@@ -55,12 +55,12 @@ class Subtensor:
             sub = await self._ensure()
             try:
                 result = getattr(sub, name)(*args, **kwargs)
-                return await result if asyncio.isawaitable(result) else result
+                return await result if inspect.isawaitable(result) else result
             except Exception:
                 log.debug(f"{name} failed, reconnecting")
                 sub = await self._reconnect()
                 result = getattr(sub, name)(*args, **kwargs)
-                return await result if asyncio.isawaitable(result) else result
+                return await result if inspect.isawaitable(result) else result
         return _call
 
     async def close(self):

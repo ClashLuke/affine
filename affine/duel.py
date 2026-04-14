@@ -146,30 +146,21 @@ async def run_duel(
                 _log_progress(wins, losses, tasks, total_tasks, k, z)
                 next_progress += progress_interval
         if verdict is not Verdict.UNDECIDED:
-            _log_summary(wins, losses, tasks, verdict, champion, challenger, k)
+            _log_summary(wins, losses, tasks, verdict, champion, challenger, k, z)
             return verdict
 
-    verdict, _ = check_duel(wins, losses, tasks, max_tasks, k)
+    verdict, z = check_duel(wins, losses, tasks, max_tasks, k)
     if verdict is Verdict.UNDECIDED:
         verdict = Verdict.CHAMPION_HOLDS
-    _log_summary(wins, losses, tasks, verdict, champion, challenger, k)
+    _log_summary(wins, losses, tasks, verdict, champion, challenger, k, z)
     return verdict
 
 
-def _log_summary(wins, losses, tasks, verdict, champion, challenger, k):
+def _log_summary(wins, losses, tasks, verdict, champion, challenger, k, z):
     total_tasks = sum(tasks.values())
     decisive = sum(wins[n] + losses[n] for n in wins)
 
-    deltas, variances = [], []
-    for name in wins:
-        if wins[name] + losses[name] > 0:
-            d, v = bt_mle(wins[name], losses[name])
-            deltas.append(d)
-            variances.append(v)
-
-    if deltas:
-        delta, var = aggregate(deltas, variances)
-        z = delta / sqrt(var)
+    if decisive:
         log.info(f"duel: {verdict.name} | {champion.model} vs {challenger.model} | "
                  f"z={z:.2f} k={k:.2f} | {total_tasks} tasks, {decisive} decisive")
     else:
@@ -187,21 +178,11 @@ def _log_summary(wins, losses, tasks, verdict, champion, challenger, k):
 
 def _log_progress(wins, losses, tasks, total_tasks, k, z):
     decisive = sum(wins[n] + losses[n] for n in wins)
-    total_wins = sum(wins.values())
-    deltas, variances = [], []
-    for name in wins:
-        if wins[name] + losses[name] > 0:
-            d, v = bt_mle(wins[name], losses[name])
-            deltas.append(d)
-            variances.append(v)
-
-    if deltas:
-        delta, var = aggregate(deltas, variances)
-        z = delta / sqrt(var)
-        winrate = total_wins / decisive if decisive else 0.0
-        log.info(
-            f"progress: tasks={total_tasks} decisive={decisive} winrate={winrate:.3f} "
-            f"delta={delta:.3f} z={z:.2f} k={k:.2f}"
-        )
+    if decisive:
+        total_wins = sum(wins.values())
+        pairs = [bt_mle(wins[n], losses[n]) for n in wins if wins[n] + losses[n] > 0]
+        delta, _ = aggregate([d for d, _ in pairs], [v for _, v in pairs])
+        log.info(f"progress: tasks={total_tasks} decisive={decisive} winrate={total_wins / decisive:.3f} "
+                 f"delta={delta:.3f} z={z:.2f} k={k:.2f}")
     else:
-        log.info(f"progress: tasks={total_tasks} decisive=0 winrate=0.000 delta=0.000 z=0.00 k={k:.2f}")
+        log.info(f"progress: tasks={total_tasks} decisive=0 z=0.00 k={k:.2f}")
