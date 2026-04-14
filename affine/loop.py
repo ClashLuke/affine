@@ -43,17 +43,23 @@ def _load_envs(config: Config) -> dict[str, tuple]:
 async def _cold_start(sub, config, slots) -> tuple[Challenger, Slot, int]:
     while True:
         queue = await get_challenger_queue(sub, config.netuid)
-        if queue:
-            champion = min(queue, key=lambda c: c.block)
-            log.info(f"cold start: uid {champion.uid} ({champion.model})")
-            slot = await slots.provision(champion.model, champion.revision)
+        if not queue:
+            log.info("no miners registered, waiting 120s")
+            await asyncio.sleep(120)
+            continue
+        for candidate in sorted(queue, key=lambda c: c.block):
+            log.info(f"cold start: trying uid {candidate.uid} ({candidate.model})")
+            try:
+                slot = await slots.provision(candidate.model, candidate.revision)
+            except Exception as e:
+                log.warning(f"cold start provision failed uid {candidate.uid}: {e}")
+                continue
             if await health_check(slot.base_url, config.health_check_timeout):
                 crown_block = await sub.get_current_block()
-                return champion, slot, crown_block
+                return candidate, slot, crown_block
             await slots.teardown(slot)
-            log.warning("cold start champion failed health check, retrying")
-        else:
-            log.info("no miners registered, waiting 120s")
+            log.warning(f"cold start health check failed uid {candidate.uid}")
+        log.warning("no viable champion in queue, retrying in 120s")
         await asyncio.sleep(120)
 
 
@@ -64,8 +70,9 @@ async def run(config: Config, slots=None):
     envs = _load_envs(config)
 
     champion, champion_slot, crown_block = await _cold_start(sub, config, slots)
-    if not await set_weights(sub, wallet, config.netuid, champion.uid):
-        log.error("failed to set initial weights — continuing, will retry on next dethrone")
+    weights_ok = await set_weights(sub, wallet, config.netuid, champion.uid)
+    if not weights_ok:
+        log.error("failed to set initial weights — will retry")
 
     running = True
 
@@ -79,6 +86,9 @@ async def run(config: Config, slots=None):
 
     while running:
         try:
+            if not weights_ok:
+                weights_ok = await set_weights(sub, wallet, config.netuid, champion.uid, retries=1)
+
             queue = await get_challenger_queue(sub, config.netuid, champion.hotkey)
 
             if not queue:
@@ -90,18 +100,16 @@ async def run(config: Config, slots=None):
                 if not running:
                     break
 
-                if not await health_check(champion_slot.base_url, timeout=30):
-                    log.warning(f"champion endpoint down — attempting auto-dethrone to uid {chall.uid}")
-                    new_slot = await _try_provision(slots, chall, config)
-                    if new_slot is None:
-                        continue
-                    log.info(f"DETHRONED (default): uid {chall.uid} — champion was down")
+                if not await health_ping(champion_slot.base_url):
+                    log.warning("champion slot unhealthy, reprovisioning")
                     await slots.teardown(champion_slot)
-                    champion, champion_slot = chall, new_slot
-                    crown_block = await sub.get_current_block()
-                    if not await set_weights(sub, wallet, config.netuid, champion.uid):
-                        log.error("failed to set weights after auto-dethrone")
-                    break
+                    new_slot = await _try_provision(slots, champion, config)
+                    if new_slot is None:
+                        log.error("champion reprovision failed, retrying in 60s")
+                        await asyncio.sleep(60)
+                        break
+                    champion_slot = new_slot
+                    log.info(f"champion reprovisioned: {champion_slot.base_url}")
 
                 current_block = await sub.get_current_block()
                 k = compute_k(current_block - crown_block, config.k_init, config.k_final, config.k_halflife)
@@ -116,15 +124,19 @@ async def run(config: Config, slots=None):
                     await slots.teardown(champion_slot)
                     champion, champion_slot = chall, chall_slot
                     crown_block = await sub.get_current_block()
-                    if not await set_weights(sub, wallet, config.netuid, champion.uid):
-                        log.error("failed to set weights after dethrone — will retry next cycle")
+                    weights_ok = await set_weights(sub, wallet, config.netuid, champion.uid)
+                    if not weights_ok:
+                        log.error("failed to set weights after dethrone — will retry")
                     break
             else:
                 log.info("queue exhausted, sleeping 120s")
                 await asyncio.sleep(120)
 
+        except (ConnectionError, OSError) as e:
+            log.error(f"connection error in main loop: {e}", exc_info=True)
+            await asyncio.sleep(60)
         except Exception as e:
-            log.error(f"main loop error: {e}", exc_info=True)
+            log.critical(f"unexpected error in main loop: {e}", exc_info=True)
             await asyncio.sleep(60)
 
     log.info("shutting down")
@@ -155,14 +167,9 @@ async def _run_duel_with_retry(
 ) -> tuple[Verdict | None, Slot | None]:
     for attempt in range(MAX_DUEL_RETRIES + 1):
         if attempt > 0:
-            if not await health_check(champion_slot.base_url, timeout=30):
-                log.warning("champion down between retries — auto-dethrone")
-                slot = await _try_provision(slots, chall, config)
-                if slot is None:
-                    return None, None
-                return Verdict.CHALLENGER_WINS, slot
-            else:
-                log.info("champion recovered, resuming duel")
+            if not await health_ping(champion_slot.base_url):
+                log.warning("champion down between retries, aborting duel")
+                return None, None
 
         slot = await _try_provision(slots, chall, config)
         if slot is None:

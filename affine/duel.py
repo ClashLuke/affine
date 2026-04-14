@@ -8,7 +8,7 @@ from typing import Any
 
 from .config import EnvSpec
 from .scoring import Verdict, bt_mle, aggregate, check_duel
-from .vllm import Slot, health_check, health_ping
+from .vllm import Slot, health_check
 
 log = logging.getLogger(__name__)
 
@@ -134,14 +134,10 @@ async def run_duel(
 
         if not batch_champ_any_ok:
             if not await health_check(champion.base_url, timeout=30):
-                log.info("champion confirmed down — challenger wins by default")
-                _log_summary(wins, losses, tasks, Verdict.CHALLENGER_WINS, champion, challenger, k)
-                return Verdict.CHALLENGER_WINS
+                raise RuntimeError("champion slot down mid-duel")
         if not batch_chall_any_ok:
             if not await health_check(challenger.base_url, timeout=30):
-                log.info("challenger confirmed down — champion holds")
-                _log_summary(wins, losses, tasks, Verdict.CHAMPION_HOLDS, champion, challenger, k)
-                return Verdict.CHAMPION_HOLDS
+                raise RuntimeError("challenger slot down mid-duel")
 
         verdict, z = check_duel(wins, losses, tasks, max_tasks, k)
         if next_progress is not None:

@@ -1,6 +1,8 @@
 from __future__ import annotations
+import json
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -31,7 +33,7 @@ class Config:
 
     @classmethod
     def from_env(cls) -> Config:
-        return cls(
+        cfg = cls(
             netuid=int(os.getenv("NETUID", "120")),
             wallet_name=os.getenv("BT_WALLET_COLD", "default"),
             hotkey_name=os.getenv("BT_WALLET_HOT", "default"),
@@ -47,6 +49,137 @@ class Config:
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             environments=_default_environments(),
         )
+        spec = os.getenv("AFFINE_CONFIG_SPEC", "").strip()
+        return _apply_config_spec(cfg, spec) if spec else cfg
+
+
+def _apply_config_spec(cfg: Config, spec: str) -> Config:
+    normalized = spec.lower()
+    if normalized in {"default", "full", "smoke"}:
+        return _apply_profile(cfg, normalized)
+
+    path = Path(spec).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"AFFINE_CONFIG_SPEC path not found: {path}")
+    return _apply_json_overrides(cfg, json.loads(path.read_text()))
+
+
+def _apply_profile(cfg: Config, profile: str) -> Config:
+    if profile == "default":
+        return cfg
+    if profile == "full":
+        return Config(
+            netuid=cfg.netuid,
+            wallet_name=cfg.wallet_name,
+            hotkey_name=cfg.hotkey_name,
+            network=cfg.network,
+            subtensor_endpoint=cfg.subtensor_endpoint,
+            subtensor_fallback=cfg.subtensor_fallback,
+            max_tasks_per_env=64,
+            tasks_per_batch=4,
+            k_init=cfg.k_init,
+            k_final=cfg.k_final,
+            k_halflife=cfg.k_halflife,
+            health_check_timeout=cfg.health_check_timeout,
+            log_level=cfg.log_level,
+            environments=_with_timeouts(cfg.environments, default_timeout=300, game_timeout=1800),
+        )
+    if profile == "smoke":
+        return Config(
+            netuid=cfg.netuid,
+            wallet_name=cfg.wallet_name,
+            hotkey_name=cfg.hotkey_name,
+            network=cfg.network,
+            subtensor_endpoint=cfg.subtensor_endpoint,
+            subtensor_fallback=cfg.subtensor_fallback,
+            max_tasks_per_env=8,
+            tasks_per_batch=2,
+            k_init=1.0,
+            k_final=1.0,
+            k_halflife=cfg.k_halflife,
+            health_check_timeout=min(cfg.health_check_timeout, 180),
+            log_level=cfg.log_level,
+            environments=_with_timeouts(cfg.environments, default_timeout=90, game_timeout=420),
+        )
+    raise ValueError(f"unsupported profile: {profile}")
+
+
+def _with_timeouts(
+    environments: tuple[EnvSpec, ...], *, default_timeout: int, game_timeout: int
+) -> tuple[EnvSpec, ...]:
+    out: list[EnvSpec] = []
+    for spec in environments:
+        params = dict(spec.params)
+        timeout = game_timeout if spec.name == "game" else default_timeout
+        params["timeout"] = min(int(params.get("timeout", timeout)), timeout)
+        out.append(
+            EnvSpec(
+                name=spec.name,
+                image=spec.image,
+                params=params,
+                env_vars=dict(spec.env_vars),
+                mem_limit=spec.mem_limit,
+            )
+        )
+    return tuple(out)
+
+
+def _apply_json_overrides(cfg: Config, raw: dict) -> Config:
+    top = {
+        "netuid": int(raw.get("netuid", cfg.netuid)),
+        "wallet_name": str(raw.get("wallet_name", cfg.wallet_name)),
+        "hotkey_name": str(raw.get("hotkey_name", cfg.hotkey_name)),
+        "network": str(raw.get("network", cfg.network)),
+        "subtensor_endpoint": str(raw.get("subtensor_endpoint", cfg.subtensor_endpoint)),
+        "subtensor_fallback": str(raw.get("subtensor_fallback", cfg.subtensor_fallback)),
+        "max_tasks_per_env": int(raw.get("max_tasks_per_env", cfg.max_tasks_per_env)),
+        "tasks_per_batch": int(raw.get("tasks_per_batch", cfg.tasks_per_batch)),
+        "k_init": float(raw.get("k_init", cfg.k_init)),
+        "k_final": float(raw.get("k_final", cfg.k_final)),
+        "k_halflife": int(raw.get("k_halflife", cfg.k_halflife)),
+        "health_check_timeout": int(raw.get("health_check_timeout", cfg.health_check_timeout)),
+        "log_level": str(raw.get("log_level", cfg.log_level)),
+    }
+    envs = _apply_env_overrides(cfg.environments, raw)
+    return Config(environments=envs, **top)
+
+
+def _apply_env_overrides(current: tuple[EnvSpec, ...], raw: dict) -> tuple[EnvSpec, ...]:
+    by_name = {spec.name: spec for spec in current}
+    if isinstance(raw.get("env_overrides"), dict):
+        for name, override in raw["env_overrides"].items():
+            if name not in by_name:
+                raise KeyError(f"unknown environment in env_overrides: {name}")
+            by_name[name] = _merge_env(by_name[name], override)
+
+    if isinstance(raw.get("environments"), list):
+        rebuilt: list[EnvSpec] = []
+        for item in raw["environments"]:
+            if not isinstance(item, dict) or "name" not in item:
+                raise ValueError("each environments item must be an object with a name")
+            name = str(item["name"])
+            base = by_name.get(name, EnvSpec(name=name, image=str(item.get("image", ""))))
+            rebuilt.append(_merge_env(base, item))
+        return tuple(rebuilt)
+
+    return tuple(by_name[name] for name in [spec.name for spec in current])
+
+
+def _merge_env(base: EnvSpec, override: dict) -> EnvSpec:
+    params = dict(base.params)
+    params.update(dict(override.get("params", {})))
+    env_vars = dict(base.env_vars)
+    env_vars.update(dict(override.get("env_vars", {})))
+    image = str(override.get("image", base.image))
+    if not image:
+        raise ValueError(f"environment '{base.name}' has empty image")
+    return EnvSpec(
+        name=str(override.get("name", base.name)),
+        image=image,
+        params=params,
+        env_vars=env_vars,
+        mem_limit=str(override.get("mem_limit", base.mem_limit)),
+    )
 
 
 def _default_environments() -> tuple[EnvSpec, ...]:
