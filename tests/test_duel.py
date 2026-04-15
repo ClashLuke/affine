@@ -63,8 +63,18 @@ def _envs(wrapper, timeout=1):
 def test_master_seed_deterministic():
     champ = Slot("model-a", "rev-1", "http://a")
     chall = Slot("model-b", "rev-2", "http://b")
-    assert _master_seed(champ, chall, nonce=7) == _master_seed(champ, chall, nonce=7)
-    assert _master_seed(champ, chall, nonce=7) != _master_seed(champ, chall, nonce=8)
+    assert _master_seed(champ, chall, nonce=7, hotkey="") == _master_seed(champ, chall, nonce=7, hotkey="")
+    assert _master_seed(champ, chall, nonce=7, hotkey="") != _master_seed(champ, chall, nonce=8, hotkey="")
+
+
+def test_master_seed_hotkey_salt():
+    champ = Slot("model-a", "rev-1", "http://a")
+    chall = Slot("model-b", "rev-2", "http://b")
+    s1 = _master_seed(champ, chall, nonce=0, hotkey="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty")
+    s2 = _master_seed(champ, chall, nonce=0, hotkey="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
+    s3 = _master_seed(champ, chall, nonce=0, hotkey="5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty")
+    assert s1 != s2
+    assert s1 == s3
 
 
 def test_batch_rng_deterministic():
@@ -112,8 +122,8 @@ async def test_run_duel_deterministic_task_stream():
     env1 = RecorderEnv(success=True)
     env2 = RecorderEnv(success=True)
 
-    verdict1 = await run_duel(_envs(env1), champ, chall, max_tasks=6, tasks_per_batch=2, k=99.0, nonce=123)
-    verdict2 = await run_duel(_envs(env2), champ, chall, max_tasks=6, tasks_per_batch=2, k=99.0, nonce=123)
+    verdict1 = await run_duel(_envs(env1), champ, chall, max_tasks=6, tasks_per_batch=2, k=99.0, nonce=123, hotkey="")
+    verdict2 = await run_duel(_envs(env2), champ, chall, max_tasks=6, tasks_per_batch=2, k=99.0, nonce=123, hotkey="")
 
     assert verdict1 is Verdict.CHAMPION_HOLDS
     assert verdict2 is Verdict.CHAMPION_HOLDS
@@ -144,7 +154,7 @@ async def test_run_duel_counts_only_decisive_outcomes():
     with patch("affine.duel.check_duel", side_effect=_capture), patch(
         "affine.duel.health_check", AsyncMock(return_value=True)
     ):
-        verdict = await run_duel(_envs(env), champ, chall, max_tasks=3, tasks_per_batch=1, k=99.0)
+        verdict = await run_duel(_envs(env), champ, chall, max_tasks=3, tasks_per_batch=1, k=99.0, hotkey="")
 
     assert verdict is Verdict.CHAMPION_HOLDS
     wins, losses, tasks = observed[-1]
@@ -160,7 +170,7 @@ async def test_run_duel_early_challenger_dethrone():
     env = ModelMapEnv({champ.model: False, chall.model: True})
 
     with patch("affine.duel.health_check", AsyncMock(return_value=True)):
-        verdict = await run_duel(_envs(env), champ, chall, max_tasks=20, tasks_per_batch=1, k=0.5)
+        verdict = await run_duel(_envs(env), champ, chall, max_tasks=20, tasks_per_batch=1, k=0.5, hotkey="")
 
     assert verdict is Verdict.CHALLENGER_WINS
     assert len(env.calls) == 2
@@ -173,7 +183,7 @@ async def test_run_duel_early_hopeless_champion_hold():
     env = ModelMapEnv({champ.model: True, chall.model: False})
 
     with patch("affine.duel.health_check", AsyncMock(return_value=True)):
-        verdict = await run_duel(_envs(env), champ, chall, max_tasks=20, tasks_per_batch=1, k=2.0)
+        verdict = await run_duel(_envs(env), champ, chall, max_tasks=20, tasks_per_batch=1, k=2.0, hotkey="")
 
     assert verdict is Verdict.CHAMPION_HOLDS
     assert len(env.calls) < 40
@@ -185,7 +195,7 @@ async def test_run_duel_budget_exhaustion_defaults_to_champion_hold():
     chall = Slot("chall", "rev-b", "http://chall")
     env = RecorderEnv(success=True)
 
-    verdict = await run_duel(_envs(env), champ, chall, max_tasks=5, tasks_per_batch=2, k=5.0)
+    verdict = await run_duel(_envs(env), champ, chall, max_tasks=5, tasks_per_batch=2, k=5.0, hotkey="")
 
     assert verdict is Verdict.CHAMPION_HOLDS
     assert len(env.calls) == 10
@@ -203,7 +213,7 @@ async def test_run_duel_raises_on_sustained_infra_failure():
         "affine.duel.health_check", AsyncMock(return_value=True)
     ):
         with pytest.raises(RuntimeError, match="sustained infra failure"):
-            await run_duel(_envs(object()), champ, chall, max_tasks=20, tasks_per_batch=1, k=99.0)
+            await run_duel(_envs(object()), champ, chall, max_tasks=20, tasks_per_batch=1, k=99.0, hotkey="")
 
 
 @pytest.mark.asyncio
@@ -218,7 +228,7 @@ async def test_run_duel_raises_when_champion_slot_down_mid_duel():
         "affine.duel.health_check", AsyncMock(return_value=False)
     ):
         with pytest.raises(RuntimeError, match="champion slot down mid-duel"):
-            await run_duel(_envs(object()), champ, chall, max_tasks=5, tasks_per_batch=1, k=99.0)
+            await run_duel(_envs(object()), champ, chall, max_tasks=5, tasks_per_batch=1, k=99.0, hotkey="")
 
 
 @pytest.mark.e2e_fault
@@ -234,4 +244,4 @@ async def test_run_duel_raises_when_challenger_slot_down_mid_duel():
         "affine.duel.health_check", AsyncMock(return_value=False)
     ):
         with pytest.raises(RuntimeError, match="challenger slot down mid-duel"):
-            await run_duel(_envs(object()), champ, chall, max_tasks=5, tasks_per_batch=1, k=99.0)
+            await run_duel(_envs(object()), champ, chall, max_tasks=5, tasks_per_batch=1, k=99.0, hotkey="")

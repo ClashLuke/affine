@@ -15,10 +15,10 @@ log = logging.getLogger(__name__)
 INFRA_STREAK_LIMIT = 8
 
 
-def _master_seed(champion: Slot, challenger: Slot, nonce: int = 0) -> int:
+def _master_seed(champion: Slot, challenger: Slot, nonce: int, hotkey: str) -> int:
     h = hashlib.sha256(
         f"{champion.model}\0{champion.revision}\0"
-        f"{challenger.model}\0{challenger.revision}\0{nonce}".encode()
+        f"{challenger.model}\0{challenger.revision}\0{nonce}\0{hotkey}".encode()
     )
     return int.from_bytes(h.digest()[:8], "big")
 
@@ -52,6 +52,7 @@ async def run_duel(
     tasks_per_batch: int = 4,
     k: float = 2.0,
     nonce: int = 0,
+    hotkey: str,
     progress_interval: int = 0,
 ) -> Verdict:
     env_data = {}
@@ -63,7 +64,7 @@ async def run_duel(
     wins = {name: 0 for name in env_data}
     losses = {name: 0 for name in env_data}
     tasks = {name: 0 for name in env_data}
-    master = _master_seed(champion, challenger, nonce)
+    master = _master_seed(champion, challenger, nonce, hotkey)
     champ_err_streak = 0
     chall_err_streak = 0
 

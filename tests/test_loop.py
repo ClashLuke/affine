@@ -136,6 +136,7 @@ async def test_run_duel_with_retry_recovers_after_first_failure_and_returns_winn
             chall=chall,
             config=cfg,
             k=2.0,
+            hotkey="",
         )
 
     assert verdict is Verdict.CHALLENGER_WINS
@@ -163,6 +164,7 @@ async def test_run_duel_with_retry_aborts_if_champion_down_between_retries():
             chall=chall,
             config=cfg,
             k=2.0,
+            hotkey="",
         )
 
     assert verdict is None
@@ -188,6 +190,7 @@ async def test_run_duel_with_retry_tears_down_losing_challenger_slot():
             chall=chall,
             config=cfg,
             k=2.0,
+            hotkey="",
         )
 
     assert verdict is Verdict.CHAMPION_HOLDS
@@ -212,6 +215,7 @@ async def test_run_duel_with_retry_returns_none_when_provision_fails():
             chall=chall,
             config=cfg,
             k=2.0,
+            hotkey="",
         )
 
     assert verdict is None
@@ -241,6 +245,7 @@ async def test_run_duel_with_retry_exhausts_attempts_after_repeated_failures():
             chall=chall,
             config=cfg,
             k=2.0,
+            hotkey="",
         )
 
     assert verdict is None

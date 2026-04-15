@@ -120,6 +120,7 @@ async def run(config: Config, slots=None):
 
                 verdict, chall_slot = await _run_duel_with_retry(
                     slots, envs, champion_slot, chall, config, k,
+                    hotkey=wallet.hotkey.ss58_address,
                 )
 
                 if verdict is Verdict.CHALLENGER_WINS:
@@ -166,7 +167,7 @@ async def _try_provision(slots, chall: Challenger, config: Config) -> Slot | Non
 
 
 async def _run_duel_with_retry(
-    slots, envs, champion_slot, chall, config, k,
+    slots, envs, champion_slot, chall, config, k, *, hotkey: str,
 ) -> tuple[Verdict | None, Slot | None]:
     for attempt in range(MAX_DUEL_RETRIES + 1):
         if attempt > 0:
@@ -185,6 +186,7 @@ async def _run_duel_with_retry(
                 tasks_per_batch=config.tasks_per_batch,
                 k=k,
                 nonce=chall.block,
+                hotkey=hotkey,
             )
         except Exception as e:
             log.error(f"duel failed (attempt {attempt + 1}/{MAX_DUEL_RETRIES + 1}): {e}", exc_info=True)
