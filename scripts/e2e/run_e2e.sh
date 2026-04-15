@@ -13,8 +13,10 @@ VLLM_PORT_A="${VLLM_PORT_A:-8000}"
 VLLM_PORT_B="${VLLM_PORT_B:-8001}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.35}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-2048}"
-GATE_STAGE="${GATE_STAGE:-smoke}"
-GATE_TIMEOUT="${GATE_TIMEOUT:-600}"
+GATE_STAGE="${GATE_STAGE:-all}"
+SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-2400}"
+FULL_TIMEOUT="${FULL_TIMEOUT:-7200}"
+DETHRONE_TIMEOUT="${DETHRONE_TIMEOUT:-900}"
 SKIP_TESTS="${SKIP_TESTS:-}"
 SKIP_PULL="${SKIP_PULL:-}"
 
@@ -27,13 +29,27 @@ ENV_IMAGES=(
 log() { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31mFATAL: %s\033[0m\n' "$*" >&2; exit 1; }
 
-stop_vllm() {
+# --- stage selection ---
+declare -a STAGES
+case "$GATE_STAGE" in
+    all)      STAGES=(dethrone smoke) ;;
+    dethrone) STAGES=(dethrone) ;;
+    smoke)    STAGES=(smoke) ;;
+    full)     STAGES=(full) ;;
+    both)     STAGES=(smoke full) ;;
+    *)        die "unknown GATE_STAGE=$GATE_STAGE (valid: all, dethrone, smoke, full, both)" ;;
+esac
+
+# --- process management ---
+PORT_A_PID=""
+VLLM_PID_B=""
+
+stop_proc() {
     local pid="$1" name="$2"
     [ -z "$pid" ] && return
     local children
     children=$(pgrep -P "$pid" 2>/dev/null || true)
     kill -0 "$pid" 2>/dev/null || {
-        # parent gone but children may survive
         for cpid in $children; do
             kill -9 "$cpid" 2>/dev/null || true
         done
@@ -54,13 +70,60 @@ stop_vllm() {
     wait "$pid" 2>/dev/null || true
 }
 
+stop_port_a() {
+    if [ -n "$PORT_A_PID" ]; then
+        stop_proc "$PORT_A_PID" "port-$VLLM_PORT_A"
+        PORT_A_PID=""
+    fi
+}
+
 cleanup() {
     log "cleaning up"
-    stop_vllm "${VLLM_PID_A:-}" "vLLM-A"
-    stop_vllm "${VLLM_PID_B:-}" "vLLM-B"
+    stop_port_a
+    stop_proc "${VLLM_PID_B:-}" "vLLM-B"
     docker rm -f "$SUBTENSOR_CONTAINER" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+wait_healthy() {
+    local url="$1" name="$2" timeout="${3:-120}"
+    for i in $(seq 1 "$timeout"); do
+        if curl -sf "$url/models" >/dev/null 2>&1; then
+            log "$name healthy after ${i}s"
+            return 0
+        fi
+        sleep 1
+    done
+    die "$name not healthy after ${timeout}s"
+}
+
+start_stub_on_a() {
+    log "starting stub vLLM on port $VLLM_PORT_A"
+    python3 scripts/e2e/stub_vllm.py \
+        --port "$VLLM_PORT_A" \
+        --model "$MODEL" \
+        >"$PROJECT_DIR/.e2e/stub.log" 2>&1 &
+    PORT_A_PID=$!
+    wait_healthy "http://localhost:$VLLM_PORT_A/v1" "stub-vllm" 10
+
+    curl -sf "http://localhost:$VLLM_PORT_A/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['choices'][0]['message']['content']" \
+        || die "stub server returning invalid chat completions"
+    log "stub sanity check passed"
+}
+
+start_vllm_on_a() {
+    log "starting vLLM-A on port $VLLM_PORT_A"
+    vllm serve "$MODEL" \
+        --port "$VLLM_PORT_A" \
+        --gpu-memory-utilization "$GPU_MEM_UTIL" \
+        --max-model-len "$MAX_MODEL_LEN" \
+        >"$PROJECT_DIR/.e2e/vllm_a.log" 2>&1 &
+    PORT_A_PID=$!
+    wait_healthy "http://localhost:$VLLM_PORT_A/v1" "vLLM-A" 120
+}
 
 # ------------------------------------------------------------------
 # 1. unit tests
@@ -106,20 +169,8 @@ for i in $(seq 1 60); do
 done
 
 # ------------------------------------------------------------------
-# 4. start vLLM model servers
+# 4. start vLLM-B (stays up for all stages)
 # ------------------------------------------------------------------
-wait_healthy() {
-    local url="$1" name="$2" timeout="${3:-120}"
-    for i in $(seq 1 "$timeout"); do
-        if curl -sf "$url/models" >/dev/null 2>&1; then
-            log "$name healthy after ${i}s"
-            return 0
-        fi
-        sleep 1
-    done
-    die "$name not healthy after ${timeout}s"
-}
-
 mkdir -p "$PROJECT_DIR/.e2e"
 
 for port in "$VLLM_PORT_A" "$VLLM_PORT_B"; do
@@ -128,17 +179,7 @@ for port in "$VLLM_PORT_A" "$VLLM_PORT_B"; do
     fi
 done
 
-log "starting vLLM server A (port $VLLM_PORT_A)"
-vllm serve "$MODEL" \
-    --port "$VLLM_PORT_A" \
-    --gpu-memory-utilization "$GPU_MEM_UTIL" \
-    --max-model-len "$MAX_MODEL_LEN" \
-    >"$PROJECT_DIR/.e2e/vllm_a.log" 2>&1 &
-VLLM_PID_A=$!
-
-wait_healthy "http://localhost:$VLLM_PORT_A/v1" "vLLM-A" 120
-
-log "starting vLLM server B (port $VLLM_PORT_B)"
+log "starting vLLM-B on port $VLLM_PORT_B (shared across stages)"
 vllm serve "$MODEL" \
     --port "$VLLM_PORT_B" \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
@@ -179,15 +220,38 @@ export LOG_LEVEL=DEBUG
 
 log "env: SUBTENSOR_ENDPOINT=$SUBTENSOR_ENDPOINT NETUID=$NETUID"
 log "env: BT_WALLET_COLD=$BT_WALLET_COLD BT_WALLET_HOT=$BT_WALLET_HOT"
+log "stages: ${STAGES[*]}"
 
 # ------------------------------------------------------------------
-# 7. run E2E gate
+# 7. run gate stages
 # ------------------------------------------------------------------
-log "running E2E gate (stage=$GATE_STAGE, timeout=$GATE_TIMEOUT)"
-python3 scripts/e2e/run_gate.py \
-    --stage "$GATE_STAGE" \
-    --local \
-    --smoke-timeout "$GATE_TIMEOUT" \
-    --full-timeout "$GATE_TIMEOUT"
+for stage in "${STAGES[@]}"; do
+    stop_port_a
 
-log "E2E gate passed"
+    case "$stage" in
+        dethrone)
+            start_stub_on_a
+            timeout="$DETHRONE_TIMEOUT"
+            ;;
+        smoke)
+            start_vllm_on_a
+            timeout="$SMOKE_TIMEOUT"
+            ;;
+        full)
+            start_vllm_on_a
+            timeout="$FULL_TIMEOUT"
+            ;;
+    esac
+
+    log "running gate: stage=$stage timeout=${timeout}s"
+    python3 scripts/e2e/run_gate.py \
+        --stage "$stage" \
+        --local \
+        --smoke-timeout "$SMOKE_TIMEOUT" \
+        --full-timeout "$FULL_TIMEOUT" \
+        --dethrone-timeout "$DETHRONE_TIMEOUT"
+
+    log "$stage gate passed"
+done
+
+log "all E2E gates passed: ${STAGES[*]}"

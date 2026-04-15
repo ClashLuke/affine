@@ -15,8 +15,12 @@ RE_CONNECTED = re.compile(r"subtensor connected:")
 RE_QUEUE = re.compile(r"challenger queue:\s*(\d+)\s+candidates")
 RE_HEALTH = re.compile(r"slot healthy after")
 RE_WEIGHTS = re.compile(r"weights set:\s*uid")
+RE_WEIGHTS_UID = re.compile(r"weights set:\s*uid\s+(\d+)")
 RE_DUEL_SUMMARY = re.compile(r"duel:\s*(CHALLENGER_WINS|CHAMPION_HOLDS)")
 RE_ENV_SUMMARY = re.compile(r"\b(affine:ded|affine:abd|game|distill):\s*W=")
+RE_DECISIVE = re.compile(r"W=(\d+)\s+L=(\d+)")
+RE_DETHRONE = re.compile(r"DETHRONED:")
+RE_QUEUE_EXHAUSTED = re.compile(r"queue exhausted")
 RE_SHUTDOWN = re.compile(r"shutting down")
 
 
@@ -29,11 +33,13 @@ class StageConfig:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run affine pre-deploy E2E gate with hard assertions")
-    p.add_argument("--stage", choices=["smoke", "full", "both"], default="both")
+    p.add_argument("--stage", choices=["smoke", "full", "both", "dethrone"], default="both")
     p.add_argument("--smoke-spec", default="smoke")
     p.add_argument("--full-spec", default="full")
+    p.add_argument("--dethrone-spec", default="smoke")
     p.add_argument("--smoke-timeout", type=int, default=2400)
     p.add_argument("--full-timeout", type=int, default=7200)
+    p.add_argument("--dethrone-timeout", type=int, default=900)
     p.add_argument("--cmd", default="affine")
     p.add_argument("--log-dir", default=".e2e/logs")
     p.add_argument("--result-dir", default=".e2e/results")
@@ -47,6 +53,8 @@ def _stages(args: argparse.Namespace) -> list[StageConfig]:
         return [StageConfig("smoke", args.smoke_spec, args.smoke_timeout)]
     if args.stage == "full":
         return [StageConfig("full", args.full_spec, args.full_timeout)]
+    if args.stage == "dethrone":
+        return [StageConfig("dethrone", args.dethrone_spec, args.dethrone_timeout)]
     return [
         StageConfig("smoke", args.smoke_spec, args.smoke_timeout),
         StageConfig("full", args.full_spec, args.full_timeout),
@@ -96,6 +104,13 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
     requested_shutdown = False
     deadline = start + stage.timeout
 
+    # dethrone-stage tracking
+    dethrone_seen = False
+    duel_count = 0
+    decisive_seen = False
+    queue_exhausted_seen = False
+    weights_uids: list[int] = []
+
     with log_path.open("w") as log_fp:
         while True:
             now = time.time()
@@ -130,22 +145,46 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
                 health_count += 1
             if RE_WEIGHTS.search(line):
                 weights_set = True
+            m_wuid = RE_WEIGHTS_UID.search(line)
+            if m_wuid:
+                weights_uids.append(int(m_wuid.group(1)))
             if RE_DUEL_SUMMARY.search(line):
                 duel_seen = True
+                duel_count += 1
             m_env = RE_ENV_SUMMARY.search(line)
             if m_env:
                 envs_seen.add(m_env.group(1))
+            m_dec = RE_DECISIVE.search(line)
+            if m_dec and (int(m_dec.group(1)) > 0 or int(m_dec.group(2)) > 0):
+                decisive_seen = True
+            if RE_DETHRONE.search(line):
+                dethrone_seen = True
+            if RE_QUEUE_EXHAUSTED.search(line):
+                queue_exhausted_seen = True
             if RE_SHUTDOWN.search(line):
                 shutdown_seen = True
 
-            should_stop = (
-                connected
-                and queue_seen
-                and health_count >= 2
-                and weights_set
-                and duel_seen
-                and envs_seen == {"affine:ded", "affine:abd", "game", "distill"}
-            )
+            if stage.name == "dethrone":
+                should_stop = (
+                    connected
+                    and queue_seen
+                    and health_count >= 2
+                    and dethrone_seen
+                    and duel_count >= 2
+                    and decisive_seen
+                    and len(weights_uids) >= 2
+                    and queue_exhausted_seen
+                    and envs_seen == {"affine:ded", "affine:abd", "game", "distill"}
+                )
+            else:
+                should_stop = (
+                    connected
+                    and queue_seen
+                    and health_count >= 2
+                    and weights_set
+                    and duel_seen
+                    and envs_seen == {"affine:ded", "affine:abd", "game", "distill"}
+                )
             if should_stop and not requested_shutdown:
                 proc.send_signal(signal.SIGINT)
                 requested_shutdown = True
@@ -155,6 +194,32 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
             proc.send_signal(signal.SIGTERM)
             proc.wait(timeout=30)
 
+    base_ok = (
+        connected
+        and queue_seen
+        and health_count >= 2
+        and shutdown_seen
+        and proc.returncode in (0, -2, 130)
+    )
+    if stage.name == "dethrone":
+        stage_ok = (
+            base_ok
+            and dethrone_seen
+            and duel_count >= 2
+            and decisive_seen
+            and len(weights_uids) >= 2
+            and weights_uids[0] != weights_uids[-1]
+            and queue_exhausted_seen
+            and envs_seen == {"affine:ded", "affine:abd", "game", "distill"}
+        )
+    else:
+        stage_ok = (
+            base_ok
+            and weights_set
+            and duel_seen
+            and envs_seen == {"affine:ded", "affine:abd", "game", "distill"}
+        )
+
     result = {
         "stage": stage.name,
         "config_spec": stage.spec,
@@ -162,22 +227,18 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
         "queue_seen": queue_seen,
         "health_count": health_count,
         "weights_set": weights_set,
+        "weights_uids": weights_uids,
         "duel_seen": duel_seen,
+        "duel_count": duel_count,
+        "decisive_seen": decisive_seen,
+        "dethrone_seen": dethrone_seen,
+        "queue_exhausted_seen": queue_exhausted_seen,
         "envs_seen": sorted(envs_seen),
         "shutdown_seen": shutdown_seen,
         "exit_code": proc.returncode,
         "duration_seconds": round(time.time() - start, 2),
         "log_path": str(log_path),
-        "ok": (
-            connected
-            and queue_seen
-            and health_count >= 2
-            and weights_set
-            and duel_seen
-            and envs_seen == {"affine:ded", "affine:abd", "game", "distill"}
-            and shutdown_seen
-            and proc.returncode in (0, -2, 130)
-        ),
+        "ok": stage_ok,
     }
     result_path.write_text(json.dumps(result, indent=2, sort_keys=True))
     if not result["ok"]:
