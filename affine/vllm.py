@@ -43,8 +43,24 @@ async def health_check(base_url: str, timeout: int = 300, interval: int = 5) -> 
     return False
 
 
+def _docker_host_ip() -> str | None:
+    """Docker bridge gateway IP, allowing containers to reach the host."""
+    try:
+        import docker as _docker
+        gw = _docker.from_env().networks.get("bridge").attrs["IPAM"]["Config"][0]["Gateway"]
+        return gw if gw else None
+    except Exception:
+        return None
+
+
 class LocalSlots:
     def __init__(self, champion_url: str, challenger_url: str):
+        # Environment containers (Docker bridge network) can't reach localhost
+        # on the host. Replace with the Docker bridge gateway IP.
+        gw = _docker_host_ip()
+        if gw:
+            champion_url = champion_url.replace("localhost", gw).replace("127.0.0.1", gw)
+            challenger_url = challenger_url.replace("localhost", gw).replace("127.0.0.1", gw)
         self._urls = [champion_url, challenger_url]
         self._free: list[str] = list(self._urls)
 

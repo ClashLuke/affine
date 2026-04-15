@@ -11,7 +11,7 @@ SUBTENSOR_IMAGE="${SUBTENSOR_IMAGE:-ghcr.io/opentensor/subtensor-localnet:devnet
 SUBTENSOR_CONTAINER="${SUBTENSOR_CONTAINER:-subtensor-dev}"
 VLLM_PORT_A="${VLLM_PORT_A:-8000}"
 VLLM_PORT_B="${VLLM_PORT_B:-8001}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.35}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.28}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-2048}"
 GATE_STAGE="${GATE_STAGE:-all}"
 SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-2400}"
@@ -81,6 +81,17 @@ cleanup() {
     log "cleaning up"
     stop_port_a
     stop_proc "${VLLM_PID_B:-}" "vLLM-B"
+    # vLLM spawns child processes (EngineCore) that survive parent death and
+    # get reparented to init, leaking GPU memory. Kill anything still on our
+    # ports as a safety net.
+    for port in "$VLLM_PORT_A" "$VLLM_PORT_B"; do
+        local pids
+        pids=$(lsof -i :"$port" -t 2>/dev/null || true)
+        if [ -n "$pids" ]; then
+            echo "$pids" | xargs kill -9 2>/dev/null || true
+            log "killed leaked processes on port $port"
+        fi
+    done
     docker rm -f "$SUBTENSOR_CONTAINER" 2>/dev/null || true
 }
 trap cleanup EXIT
