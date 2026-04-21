@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from affine.vllm import LocalSlots, Slot, TargonSlots, _get_url, _parse_field, health_check, health_ping
+from affine.vllm import LocalSlots, Slot, SlotProvisionFailed, TargonSlots, health_ping
 
 
 class _ClientFactory:
@@ -35,40 +34,43 @@ class _ClientFactory:
 
 
 @dataclass
-class _Proc:
-    returncode: int = 0
-    stdout: bytes = b""
-    stderr: bytes = b""
-    delay: float = 0.0
+class _FakeHttp:
+    register_resp: dict | None = None
+    deploy_resp: dict | None = None
+    state_responses: list | None = None
+    events_responses: list | None = None
+    delete_resp: dict | None = None
 
     def __post_init__(self):
-        self.killed = False
+        self.posts: list[tuple[str, dict | None]] = []
+        self.gets: list[str] = []
+        self.deletes: list[str] = []
 
-    async def communicate(self):
-        if self.delay:
-            await asyncio.sleep(self.delay)
-        return self.stdout, self.stderr
+    async def _async_post(self, path, json=None):
+        self.posts.append((path, json))
+        if path.endswith("/deploy"):
+            return self.deploy_resp or {}
+        return self.register_resp or {}
 
-    def kill(self):
-        self.killed = True
+    async def _async_get(self, path):
+        self.gets.append(path)
+        if path.endswith("/events"):
+            if not self.events_responses:
+                return {"items": []}
+            item = self.events_responses.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        if not self.state_responses:
+            return {"urls": []}
+        item = self.state_responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
-
-def test_parse_field_basic():
-    assert _parse_field("App: abc123\nUrl: http://host:8000", "app") == "abc123"
-
-
-def test_parse_field_case_insensitive():
-    assert _parse_field("APP: abc123", "app") == "abc123"
-    assert _parse_field("app: abc123", "App") == "abc123"
-
-
-def test_parse_field_colon_in_value():
-    assert _parse_field("Url: http://host:8000/v1", "url") == "http://host:8000/v1"
-
-
-def test_parse_field_missing_raises():
-    with pytest.raises(RuntimeError, match="field 'app' not found"):
-        _parse_field("Url: http://host:8000", "app")
+    async def _async_delete(self, path):
+        self.deletes.append(path)
+        return self.delete_resp or {}
 
 
 @pytest.mark.asyncio
@@ -93,147 +95,169 @@ async def test_health_ping_exception_returns_false():
 
 
 @pytest.mark.asyncio
-async def test_health_check_polls_until_healthy():
-    factory = _ClientFactory([
-        SimpleNamespace(status_code=503),
-        SimpleNamespace(status_code=503),
-        SimpleNamespace(status_code=200),
-    ])
-    with patch("affine.vllm.httpx.AsyncClient", factory):
-        ok = await health_check("http://svc", timeout=5, interval=0)
-    assert ok is True
-    assert factory.calls == 3
-
-
-@pytest.mark.asyncio
-async def test_health_check_times_out():
-    factory = _ClientFactory([SimpleNamespace(status_code=503), SimpleNamespace(status_code=503)])
-    with patch("affine.vllm.httpx.AsyncClient", factory), patch(
-        "affine.vllm.time.monotonic", side_effect=[0.0, 0.5, 1.0, 2.1]
-    ):
-        ok = await health_check("http://svc", timeout=2, interval=0)
-    assert ok is False
-
-
-@pytest.mark.asyncio
 async def test_local_slots_lifecycle():
-    slots = LocalSlots("http://a/v1", "http://b/v1")
-    s1 = await slots.provision("m1", "r1")
-    assert s1.base_url == "http://a/v1"
-    s2 = await slots.provision("m2", "r2")
-    assert s2.base_url == "http://b/v1"
-    await slots.teardown(s1)
-    s3 = await slots.provision("m3", "r3")
-    assert s3.base_url == "http://a/v1"
+    with patch("affine.vllm._docker_host_ip", return_value=None), patch(
+        "affine.vllm.health_ping", AsyncMock(return_value=True)
+    ):
+        slots = LocalSlots("http://a/v1", "http://b/v1")
+        s1 = await slots.provision("m1", "r1")
+        assert s1.base_url == "http://a/v1"
+        s2 = await slots.provision("m2", "r2")
+        assert s2.base_url == "http://b/v1"
+        await slots.teardown(s1)
+        s3 = await slots.provision("m3", "r3")
+        assert s3.base_url == "http://a/v1"
 
 
 @pytest.mark.asyncio
 async def test_local_slots_exhaustion():
-    slots = LocalSlots("http://a/v1", "http://b/v1")
-    await slots.provision("m1", "r1")
-    await slots.provision("m2", "r2")
-    with pytest.raises(RuntimeError, match="no free local slots"):
-        await slots.provision("m3", "r3")
-
-
-@pytest.mark.asyncio
-async def test_get_url_appends_v1_when_missing():
-    proc = _Proc(returncode=0, stdout=b"Url: http://host:8000\n")
-    with patch("affine.vllm.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
-        url = await _get_url("app-1", timeout=1)
-    assert url == "http://host:8000/v1"
-
-
-@pytest.mark.asyncio
-async def test_get_url_keeps_existing_v1():
-    proc = _Proc(returncode=0, stdout=b"Url: http://host:8000/v1\n")
-    with patch("affine.vllm.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
-        url = await _get_url("app-1", timeout=1)
-    assert url == "http://host:8000/v1"
-
-
-@pytest.mark.asyncio
-async def test_get_url_nonzero_exit_raises():
-    proc = _Proc(returncode=1, stderr=b"bad")
-    with patch("affine.vllm.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
-        with pytest.raises(RuntimeError, match="targon app failed"):
-            await _get_url("app-1", timeout=1)
-
-
-@pytest.mark.asyncio
-async def test_get_url_timeout_on_spawn():
-    async def _slow_spawn(*args, **kwargs):
-        await asyncio.sleep(0.05)
-        return _Proc()
-
-    with patch("affine.vllm.asyncio.create_subprocess_exec", _slow_spawn):
-        with pytest.raises(RuntimeError, match="timed out"):
-            await _get_url("app-1", timeout=0.01)
-
-
-@pytest.mark.asyncio
-async def test_get_url_timeout_on_communicate_kills_process():
-    proc = _Proc(delay=0.05)
-    with patch("affine.vllm.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
-        with pytest.raises(RuntimeError, match="hung"):
-            await _get_url("app-1", timeout=0.01)
-    assert proc.killed is True
-
-
-@pytest.mark.asyncio
-async def test_targon_provision_success():
-    slots = TargonSlots(config=SimpleNamespace())
-    proc = _Proc(returncode=0, stdout=b"App: abc123\n")
-
-    with patch("affine.vllm.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)), patch(
-        "affine.vllm._get_url", AsyncMock(return_value="http://svc/v1")
+    with patch("affine.vllm._docker_host_ip", return_value=None), patch(
+        "affine.vllm.health_ping", AsyncMock(return_value=True)
     ):
-        slot = await slots.provision("model/a", "rev1", timeout=1)
-
-    assert slot == Slot(model="model/a", revision="rev1", base_url="http://svc/v1", slot_id="abc123")
-
-
-@pytest.mark.asyncio
-async def test_targon_provision_nonzero_exit_raises():
-    slots = TargonSlots(config=SimpleNamespace())
-    proc = _Proc(returncode=1, stderr=b"deploy failed")
-    with patch("affine.vllm.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
-        with pytest.raises(RuntimeError, match="targon deploy failed"):
-            await slots.provision("model/a", "rev1", timeout=1)
+        slots = LocalSlots("http://a/v1", "http://b/v1")
+        await slots.provision("m1", "r1")
+        await slots.provision("m2", "r2")
+        with pytest.raises(RuntimeError, match="no free local slots"):
+            await slots.provision("m3", "r3")
 
 
 @pytest.mark.asyncio
-async def test_targon_provision_hung_kills_process():
-    slots = TargonSlots(config=SimpleNamespace())
-    proc = _Proc(returncode=0, stdout=b"App: abc123\n", delay=0.05)
+async def test_local_slots_unhealthy_raises_and_returns_slot_to_pool():
+    with patch("affine.vllm._docker_host_ip", return_value=None), patch(
+        "affine.vllm.health_ping", AsyncMock(return_value=False)
+    ):
+        slots = LocalSlots("http://a/v1", "http://b/v1")
+        with pytest.raises(SlotProvisionFailed):
+            await slots.provision("m1", "r1")
+        assert len(slots._free) == 2
 
-    with patch("affine.vllm.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
-        with pytest.raises(RuntimeError, match="targon deploy hung"):
-            await slots.provision("model/a", "rev1", timeout=0.01)
 
-    assert proc.killed is True
+@pytest.mark.asyncio
+async def test_targon_provision_registers_deploys_and_returns_slot_when_ready():
+    http = _FakeHttp(
+        register_resp={"uid": "wl-123"},
+        state_responses=[{"urls": [{"port": 8000, "url": "http://rental.host"}]}],
+    )
+    factory = _ClientFactory([SimpleNamespace(status_code=200)])
+    with patch("affine.vllm._http", return_value=http), patch(
+        "affine.vllm.httpx.AsyncClient", factory
+    ), patch("affine.vllm.asyncio.sleep", AsyncMock()):
+        slot = await TargonSlots(SimpleNamespace()).provision("model/a", "rev1", timeout=10)
+
+    assert slot.slot_id == "wl-123"
+    assert slot.base_url == "http://rental.host/v1"
+    register_path, register_body = http.posts[0]
+    deploy_path, _ = http.posts[1]
+    assert register_path == "/tha/v2/workloads"
+    assert register_body["type"] == "RENTAL"
+    assert register_body["image"].startswith("vllm/")
+    assert register_body["resource_name"] == "h200-small"
+    assert register_body["ports"] == [{"port": 8000, "protocol": "TCP"}]
+    assert "--enable-prefix-caching" in register_body["args"]
+    assert deploy_path == "/tha/v2/workloads/wl-123/deploy"
+
+
+@pytest.mark.asyncio
+async def test_targon_provision_missing_uid_raises_runtime_error():
+    http = _FakeHttp(register_resp={})
+    with patch("affine.vllm._http", return_value=http):
+        with pytest.raises(RuntimeError, match="no uid"):
+            await TargonSlots(SimpleNamespace()).provision("model/a", "rev1", timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_targon_provision_crashloop_raises_slot_provision_failed_and_deletes():
+    http = _FakeHttp(
+        register_resp={"uid": "wl-123"},
+        events_responses=[{"items": [{"event_type": "POD_CRASHLOOP_BACKOFF"}]}],
+    )
+    with patch("affine.vllm._http", return_value=http), patch(
+        "affine.vllm.asyncio.sleep", AsyncMock()
+    ):
+        with pytest.raises(SlotProvisionFailed, match="crashlooping"):
+            await TargonSlots(SimpleNamespace()).provision("model/a", "rev1", timeout=10)
+    assert http.deletes == ["/tha/v2/workloads/wl-123"]
+
+
+@pytest.mark.asyncio
+async def test_targon_provision_timeout_raises_timeout_error_and_deletes():
+    http = _FakeHttp(register_resp={"uid": "wl-123"}, state_responses=[{"urls": []}] * 10)
+    with patch("affine.vllm._http", return_value=http), patch(
+        "affine.vllm.asyncio.sleep", AsyncMock()
+    ), patch("affine.vllm.time.monotonic", side_effect=[0.0, 0.1, 999.0] + [999.0] * 20):
+        with pytest.raises(TimeoutError, match="not ready"):
+            await TargonSlots(SimpleNamespace()).provision("model/a", "rev1", timeout=1)
+    assert http.deletes == ["/tha/v2/workloads/wl-123"]
+
+
+@pytest.mark.asyncio
+async def test_targon_provision_deploy_failure_deletes_workload():
+    http = _FakeHttp(register_resp={"uid": "wl-123"})
+
+    async def _boom(path, json=None):
+        http.posts.append((path, json))
+        if path.endswith("/deploy"):
+            raise RuntimeError("deploy failed")
+        return http.register_resp or {}
+
+    http._async_post = _boom
+    with patch("affine.vllm._http", return_value=http):
+        with pytest.raises(RuntimeError, match="deploy failed"):
+            await TargonSlots(SimpleNamespace()).provision("model/a", "rev1", timeout=1)
+    assert http.deletes == ["/tha/v2/workloads/wl-123"]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_ready_detects_crashloop_after_models_returns_ok_first():
+    from affine.vllm import _wait_for_ready
+
+    http = _FakeHttp(
+        state_responses=[{"urls": [{"port": 8000, "url": "http://rental.host"}]}],
+        events_responses=[
+            {"items": []},
+            {"items": [{"event_type": "POD_OOM_KILLED"}]},
+        ],
+    )
+    factory = _ClientFactory([
+        SimpleNamespace(status_code=503),
+        SimpleNamespace(status_code=503),
+    ])
+    with patch("affine.vllm._http", return_value=http), patch(
+        "affine.vllm.httpx.AsyncClient", factory
+    ), patch("affine.vllm.asyncio.sleep", AsyncMock()):
+        with pytest.raises(SlotProvisionFailed, match="crashlooping"):
+            await _wait_for_ready("wl-1", timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_targon_teardown_deletes_workload():
+    http = _FakeHttp()
+    with patch("affine.vllm._http", return_value=http):
+        await TargonSlots(SimpleNamespace()).teardown(
+            Slot(model="m", revision="r", base_url="http://x/v1", slot_id="wl-abc")
+        )
+    assert http.deletes == ["/tha/v2/workloads/wl-abc"]
 
 
 @pytest.mark.asyncio
 async def test_targon_teardown_ignores_local_slots():
-    slots = TargonSlots(config=SimpleNamespace())
-    with patch("affine.vllm.asyncio.create_subprocess_exec", AsyncMock()) as spawn:
-        await slots.teardown(Slot(model="m", revision="r", base_url="http://x", slot_id="local-http://x"))
-    spawn.assert_not_called()
+    http = _FakeHttp()
+    with patch("affine.vllm._http", return_value=http):
+        await TargonSlots(SimpleNamespace()).teardown(
+            Slot(model="m", revision="r", base_url="http://x", slot_id="local-http://x")
+        )
+    assert http.deletes == []
 
 
 @pytest.mark.asyncio
-async def test_targon_teardown_timeout_kills_process():
-    slots = TargonSlots(config=SimpleNamespace())
-    proc = _Proc(returncode=0)
+async def test_targon_teardown_swallows_errors():
+    http = _FakeHttp()
 
-    async def _timeout(coro, timeout):
-        coro.close()
-        raise asyncio.TimeoutError
+    async def _boom(path):
+        raise RuntimeError("API down")
 
-    with patch("affine.vllm.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)), patch(
-        "affine.vllm.asyncio.wait_for", side_effect=_timeout
-    ):
-        await slots.teardown(Slot(model="m", revision="r", base_url="http://x", slot_id="abc123"))
-
-    assert proc.killed is True
+    http._async_delete = _boom
+    with patch("affine.vllm._http", return_value=http):
+        await TargonSlots(SimpleNamespace()).teardown(
+            Slot(model="m", revision="r", base_url="http://x/v1", slot_id="wl-xyz")
+        )

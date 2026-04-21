@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -88,8 +88,9 @@ def test_batch_rng_deterministic():
 @pytest.mark.asyncio
 async def test_eval_success_field():
     env = RecorderEnv(success=True)
-    out = await _eval(env, "m", "u", 1, 2, {}, timeout=1)
-    assert out is True
+    ok, dt = await _eval(env, "m", "u", 1, 2, {}, timeout=1)
+    assert ok is True
+    assert dt >= 0
 
 
 @pytest.mark.asyncio
@@ -98,20 +99,20 @@ async def test_eval_falls_back_to_score_field():
         async def evaluate(self, **kwargs):
             return {"score": 0.1}
 
-    out = await _eval(ScoreEnv(), "m", "u", 1, 2, {}, timeout=1)
-    assert out is True
+    ok, _ = await _eval(ScoreEnv(), "m", "u", 1, 2, {}, timeout=1)
+    assert ok is True
 
 
 @pytest.mark.asyncio
 async def test_eval_timeout_returns_false():
-    out = await _eval(SlowEnv(), "m", "u", 1, 2, {}, timeout=0.01)
-    assert out is False
+    ok, _ = await _eval(SlowEnv(), "m", "u", 1, 2, {}, timeout=0.01)
+    assert ok is False
 
 
 @pytest.mark.asyncio
 async def test_eval_error_returns_none():
-    out = await _eval(ErrorEnv(), "m", "u", 1, 2, {}, timeout=1)
-    assert out is None
+    ok, _ = await _eval(ErrorEnv(), "m", "u", 1, 2, {}, timeout=1)
+    assert ok is None
 
 
 @pytest.mark.asyncio
@@ -151,9 +152,7 @@ async def test_run_duel_counts_only_decisive_outcomes():
         observed.append((wins.copy(), losses.copy(), tasks.copy()))
         return Verdict.UNDECIDED, 0.0
 
-    with patch("affine.duel.check_duel", side_effect=_capture), patch(
-        "affine.duel.health_check", AsyncMock(return_value=True)
-    ):
+    with patch("affine.duel.check_duel", side_effect=_capture):
         verdict = await run_duel(_envs(env), champ, chall, max_tasks=3, tasks_per_batch=1, k=99.0, hotkey="")
 
     assert verdict is Verdict.CHAMPION_HOLDS
@@ -169,8 +168,7 @@ async def test_run_duel_early_challenger_dethrone():
     chall = Slot("chall", "rev-b", "http://chall")
     env = ModelMapEnv({champ.model: False, chall.model: True})
 
-    with patch("affine.duel.health_check", AsyncMock(return_value=True)):
-        verdict = await run_duel(_envs(env), champ, chall, max_tasks=20, tasks_per_batch=1, k=0.5, hotkey="")
+    verdict = await run_duel(_envs(env), champ, chall, max_tasks=20, tasks_per_batch=1, k=0.5, hotkey="")
 
     assert verdict is Verdict.CHALLENGER_WINS
     assert len(env.calls) == 2
@@ -182,8 +180,7 @@ async def test_run_duel_early_hopeless_champion_hold():
     chall = Slot("chall", "rev-b", "http://chall")
     env = ModelMapEnv({champ.model: True, chall.model: False})
 
-    with patch("affine.duel.health_check", AsyncMock(return_value=True)):
-        verdict = await run_duel(_envs(env), champ, chall, max_tasks=20, tasks_per_batch=1, k=2.0, hotkey="")
+    verdict = await run_duel(_envs(env), champ, chall, max_tasks=20, tasks_per_batch=1, k=2.0, hotkey="")
 
     assert verdict is Verdict.CHAMPION_HOLDS
     assert len(env.calls) < 40
@@ -207,41 +204,10 @@ async def test_run_duel_raises_on_sustained_infra_failure():
     chall = Slot("chall", "rev-b", "http://chall")
 
     async def _fake_eval(env, model, url, seed, task_id, params, timeout=600):
-        return None if model == champ.model else True
+        return (None if model == champ.model else True, 0.0)
 
-    with patch("affine.duel._eval", side_effect=_fake_eval), patch(
-        "affine.duel.health_check", AsyncMock(return_value=True)
-    ):
+    with patch("affine.duel._eval", side_effect=_fake_eval):
         with pytest.raises(RuntimeError, match="sustained infra failure"):
             await run_duel(_envs(object()), champ, chall, max_tasks=20, tasks_per_batch=1, k=99.0, hotkey="")
 
 
-@pytest.mark.asyncio
-async def test_run_duel_raises_when_champion_slot_down_mid_duel():
-    champ = Slot("champ", "rev-a", "http://champ")
-    chall = Slot("chall", "rev-b", "http://chall")
-
-    async def _fake_eval(env, model, url, seed, task_id, params, timeout=600):
-        return False if model == champ.model else True
-
-    with patch("affine.duel._eval", side_effect=_fake_eval), patch(
-        "affine.duel.health_check", AsyncMock(return_value=False)
-    ):
-        with pytest.raises(RuntimeError, match="champion slot down mid-duel"):
-            await run_duel(_envs(object()), champ, chall, max_tasks=5, tasks_per_batch=1, k=99.0, hotkey="")
-
-
-@pytest.mark.e2e_fault
-@pytest.mark.asyncio
-async def test_run_duel_raises_when_challenger_slot_down_mid_duel():
-    champ = Slot("champ", "rev-a", "http://champ")
-    chall = Slot("chall", "rev-b", "http://chall")
-
-    async def _fake_eval(env, model, url, seed, task_id, params, timeout=600):
-        return True if model == champ.model else False
-
-    with patch("affine.duel._eval", side_effect=_fake_eval), patch(
-        "affine.duel.health_check", AsyncMock(return_value=False)
-    ):
-        with pytest.raises(RuntimeError, match="challenger slot down mid-duel"):
-            await run_duel(_envs(object()), champ, chall, max_tasks=5, tasks_per_batch=1, k=99.0, hotkey="")

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
@@ -136,6 +137,21 @@ async def set_weights(
 ) -> bool:
     if os.getenv("AFFINE_DRY_RUN"):
         log.info(f"DRY RUN — would set weights: uid {champion_uid} = 1.0")
+        path = os.getenv("AFFINE_SHADOW_LOG")
+        if path:
+            record = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "type": "weight_intent",
+                "netuid": netuid,
+                "champion_uid": champion_uid,
+                "weights": [1.0],
+                "dry_run": True,
+            }
+            try:
+                with open(path, "a") as f:
+                    f.write(json.dumps(record) + "\n")
+            except OSError as e:
+                log.warning(f"shadow log write failed: {e}")
         return True
     meta = await sub.metagraph(netuid)
     if champion_uid >= len(meta.hotkeys) or not meta.hotkeys[champion_uid]:

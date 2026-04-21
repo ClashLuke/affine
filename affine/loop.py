@@ -10,11 +10,55 @@ from .chain import Subtensor, Challenger, get_challenger_queue, set_weights
 from .config import Config
 from .duel import run_duel
 from .scoring import Verdict, compute_k
-from .vllm import Slot, TargonSlots, health_check, health_ping
+from .vllm import Slot, SlotProvisionFailed, TargonSlots, health_ping
 
 log = logging.getLogger(__name__)
 
 MAX_DUEL_RETRIES = 2
+
+# Cold-start KOTH baselines. Synthetic `uid=-1` entries used as the initial
+# champion when the validator has no sitting winner — real miners must beat
+# the baseline on its own duel terms to claim the throne. Tried in order.
+BASELINES: tuple[Challenger, ...] = (
+    Challenger(uid=-1, hotkey="", model="Qwen/Qwen3-32B", revision="main", block=0),
+)
+
+
+class Skiplist:
+    """Tracks miner artifacts that should not be provisioned.
+
+    Two tiers: model-wildcard (from env config) and (model, revision) pairs
+    (added at runtime when provisioning fails). A miner re-committing a new
+    revision gets another chance; a known-bad baseline stays excluded forever.
+    """
+
+    def __init__(self):
+        self._models: set[str] = set()
+        self._pairs: set[tuple[str, str]] = set()
+
+    @classmethod
+    def from_env(cls) -> "Skiplist":
+        sl = cls()
+        raw = os.getenv("AFFINE_MODEL_SKIPLIST", "")
+        for s in raw.split(","):
+            s = s.strip()
+            if s:
+                sl._models.add(s)
+        return sl
+
+    def add(self, model: str, revision: str) -> None:
+        self._pairs.add((model, revision))
+        log.info(f"skiplist: added {model}@{revision}")
+
+    def __contains__(self, c: Challenger) -> bool:
+        return c.model in self._models or (c.model, c.revision) in self._pairs
+
+    def filter(self, queue: list[Challenger]) -> list[Challenger]:
+        out = [c for c in queue if c not in self]
+        dropped = len(queue) - len(out)
+        if dropped:
+            log.info(f"skiplist filtered {dropped}/{len(queue)} candidates")
+        return out
 
 
 def _load_envs(config: Config) -> dict[str, tuple]:
@@ -34,30 +78,37 @@ def _load_envs(config: Config) -> dict[str, tuple]:
             pull=True,
             cleanup=True,
         )
+        backend = getattr(wrapper, "_backend", None)
+        if backend is not None and hasattr(backend, "_check_container_restart"):
+            backend._check_container_restart = lambda: False
         out[spec.name] = (wrapper, spec)
         log.info(f"loaded env: {spec.name} ({spec.image})")
     return out
 
 
-async def _cold_start(sub, config, slots) -> tuple[Challenger, Slot, int]:
+async def _cold_start(sub, config, slots, skip: Skiplist) -> tuple[Challenger, Slot, int]:
+    for baseline in BASELINES:
+        if baseline in skip:
+            continue
+        log.info(f"cold start: trying baseline {baseline.model}@{baseline.revision}")
+        slot = await _try_provision(slots, baseline, skip)
+        if slot is not None:
+            crown_block = await sub.get_current_block()
+            log.info(f"cold start: baseline {baseline.model} seated at block {crown_block}")
+            return baseline, slot, crown_block
+
     while True:
-        queue = await get_challenger_queue(sub, config.netuid)
+        queue = skip.filter(await get_challenger_queue(sub, config.netuid))
         if not queue:
             log.info("no miners registered, waiting 120s")
             await asyncio.sleep(120)
             continue
         for candidate in queue:
             log.info(f"cold start: trying uid {candidate.uid} ({candidate.model})")
-            try:
-                slot = await slots.provision(candidate.model, candidate.revision)
-            except Exception as e:
-                log.warning(f"cold start provision failed uid {candidate.uid}: {e}")
-                continue
-            if await health_check(slot.base_url, config.health_check_timeout):
+            slot = await _try_provision(slots, candidate, skip)
+            if slot is not None:
                 crown_block = await sub.get_current_block()
                 return candidate, slot, crown_block
-            await slots.teardown(slot)
-            log.warning(f"cold start health check failed uid {candidate.uid}")
         log.warning("no viable champion in queue, retrying in 120s")
         await asyncio.sleep(120)
 
@@ -71,9 +122,10 @@ async def run(config: Config, slots=None):
     wallet = bt.Wallet(name=config.wallet_name, hotkey=config.hotkey_name)
     slots = slots or TargonSlots(config)
     envs = _load_envs(config)
+    skip = Skiplist.from_env()
 
-    champion, champion_slot, crown_block = await _cold_start(sub, config, slots)
-    weights_ok = await set_weights(sub, wallet, config.netuid, champion.uid)
+    champion, champion_slot, crown_block = await _cold_start(sub, config, slots, skip)
+    weights_ok = await _maybe_set_weights(sub, wallet, config.netuid, champion)
     if not weights_ok:
         log.error("failed to set initial weights — will retry")
 
@@ -90,9 +142,9 @@ async def run(config: Config, slots=None):
     while running:
         try:
             if not weights_ok:
-                weights_ok = await set_weights(sub, wallet, config.netuid, champion.uid, retries=1)
+                weights_ok = await _maybe_set_weights(sub, wallet, config.netuid, champion, retries=1)
 
-            queue = await get_challenger_queue(sub, config.netuid, champion.hotkey)
+            queue = skip.filter(await get_challenger_queue(sub, config.netuid, champion.hotkey))
 
             if not queue:
                 log.info("no challengers, sleeping 120s")
@@ -106,7 +158,7 @@ async def run(config: Config, slots=None):
                 if not await health_ping(champion_slot.base_url):
                     log.warning("champion slot unhealthy, reprovisioning")
                     await slots.teardown(champion_slot)
-                    new_slot = await _try_provision(slots, champion, config)
+                    new_slot = await _try_provision(slots, champion, skip=None)
                     if new_slot is None:
                         log.error("champion reprovision failed, retrying in 60s")
                         await asyncio.sleep(60)
@@ -120,7 +172,7 @@ async def run(config: Config, slots=None):
 
                 verdict, chall_slot = await _run_duel_with_retry(
                     slots, envs, champion_slot, chall, config, k,
-                    hotkey=wallet.hotkey.ss58_address,
+                    hotkey=wallet.hotkey.ss58_address, skip=skip,
                 )
 
                 if verdict is Verdict.CHALLENGER_WINS:
@@ -128,7 +180,7 @@ async def run(config: Config, slots=None):
                     await slots.teardown(champion_slot)
                     champion, champion_slot = chall, chall_slot
                     crown_block = await sub.get_current_block()
-                    weights_ok = await set_weights(sub, wallet, config.netuid, champion.uid)
+                    weights_ok = await _maybe_set_weights(sub, wallet, config.netuid, champion)
                     if not weights_ok:
                         log.error("failed to set weights after dethrone — will retry")
                     break
@@ -153,21 +205,28 @@ async def run(config: Config, slots=None):
     await sub.close()
 
 
-async def _try_provision(slots, chall: Challenger, config: Config) -> Slot | None:
+async def _maybe_set_weights(sub, wallet, netuid: int, champion: Challenger, retries: int = 3) -> bool:
+    if champion.uid < 0:
+        log.info(f"baseline champion {champion.model} — skipping set_weights")
+        return True
+    return await set_weights(sub, wallet, netuid, champion.uid, retries=retries)
+
+
+async def _try_provision(slots, chall: Challenger, skip: Skiplist | None = None) -> Slot | None:
     try:
-        slot = await slots.provision(chall.model, chall.revision)
+        return await slots.provision(chall.model, chall.revision)
+    except SlotProvisionFailed as e:
+        log.warning(f"provision failed uid {chall.uid} ({chall.model}@{chall.revision}): {e}")
+        if skip is not None:
+            skip.add(chall.model, chall.revision)
+        return None
     except Exception as e:
-        log.error(f"provision failed uid {chall.uid}: {e}")
+        log.error(f"provision error uid {chall.uid}: {e}")
         return None
-    if not await health_check(slot.base_url, config.health_check_timeout):
-        log.warning(f"health check failed uid {chall.uid}")
-        await slots.teardown(slot)
-        return None
-    return slot
 
 
 async def _run_duel_with_retry(
-    slots, envs, champion_slot, chall, config, k, *, hotkey: str,
+    slots, envs, champion_slot, chall, config, k, *, hotkey: str, skip: Skiplist | None = None,
 ) -> tuple[Verdict | None, Slot | None]:
     for attempt in range(MAX_DUEL_RETRIES + 1):
         if attempt > 0:
@@ -175,7 +234,9 @@ async def _run_duel_with_retry(
                 log.warning("champion down between retries, aborting duel")
                 return None, None
 
-        slot = await _try_provision(slots, chall, config)
+        # Only skiplist on the first attempt — if we provisioned once, the
+        # artifact is runnable, and a later failure is probably transient infra.
+        slot = await _try_provision(slots, chall, skip if attempt == 0 else None)
         if slot is None:
             return None, None
 
