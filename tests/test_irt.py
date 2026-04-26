@@ -215,6 +215,29 @@ def test_fit_2pl_floor_caps_posterior_draw_magnitude():
     assert np.all(np.abs(draws).max(axis=0) < 5.0)
 
 
+def test_fit_flags_alpha_saturation_as_degenerate():
+    """An α saturating its bound is an active-set KKT solution, not an unconstrained
+    MAP — the unconstrained Hessian we compute below ignores the active bound, so
+    the Laplace cov is wrong. σ_α=0.5 puts |α|=50 at >100σ; saturating the bound
+    means data is forcing a value the model doesn't believe. Must surface as
+    degenerate so callers refuse the fit. Constructed via a near-perfect-separation
+    pattern that drives α arbitrarily high."""
+    # 2 miners, 1 env, 1000 obs each — miner 0 always passes, miner 1 always fails.
+    # Likelihood is monotone in α: higher α makes the contrast sharper, no upper
+    # plateau. The optimizer drives α to the bound.
+    n = 1000
+    m_idx = np.concatenate([np.zeros(n, dtype=np.intp), np.ones(n, dtype=np.intp)])
+    e_idx = np.zeros(2 * n, dtype=np.intp)
+    y = np.concatenate([np.ones(n), np.zeros(n)])
+    fit = fit_2pl(m_idx, e_idx, y, 2, 1, Priors(sigma_alpha=10.0))   # loose α prior
+    if abs(fit.alpha[0]) >= 49.999:
+        assert fit.degenerate, "α at bound must be flagged degenerate"
+    else:
+        # Loose-prior path didn't saturate (data not extreme enough); fit stayed
+        # in the interior. That's a valid non-degenerate MAP.
+        assert not fit.degenerate
+
+
 def test_fit_alpha_bound_matches_draw_cap():
     """Bound and draw cap must match: a healthy MAP cannot have |α|>50 under
     σ_α=0.5 (>100σ), so saturating the optimizer bound IS a degenerate signal.

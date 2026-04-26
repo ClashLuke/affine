@@ -63,10 +63,13 @@ class Fit:
     def contrast(self, i: int, j: int) -> tuple[float, float]:
         delta = float(self.theta[i] - self.theta[j])
         var = float(self.cov[i, i] + self.cov[j, j] - 2.0 * self.cov[i, j])
-        if var < 0.0:
-            log.warning("non-PD contrast covariance (i=%d j=%d var=%.3e); Hessian likely singular", i, j, var)
-            var = 0.0
-        return delta, math.sqrt(var)
+        # fit_2pl floors eigvals at 1e-12 → cov is PSD by construction, so var<0
+        # only via round-off (~1e-15 for typical cov scale). Warn only outside
+        # that band; below the band, clamp silently. -1e-9 is 6 orders above
+        # plausible round-off, well below any genuinely-corrupt cov.
+        if var < -1e-9:
+            log.warning("non-PD contrast covariance (i=%d j=%d var=%.3e)", i, j, var)
+        return delta, math.sqrt(max(var, 0.0))
 
     def sample(self, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """One draw from the joint Laplace posterior over (θ, β, α). fit_2pl floors
@@ -157,6 +160,7 @@ def fit_2pl(m_idx, e_idx, y, n_m, n_e, priors: Priors = Priors()) -> Fit:
     N = n_m + 2 * n_e
     x = np.zeros(N)
     nonfinite = False
+    alpha_saturated = False
     if m_idx.size:
         bounds = [(None, None)] * (n_m + n_e) + [(-_ALPHA_BOUND, _ALPHA_BOUND)] * n_e
         result = minimize(_obj_and_grad, x, args=(m_idx, e_idx, y, n_m, n_e, priors),
@@ -164,6 +168,19 @@ def fit_2pl(m_idx, e_idx, y, n_m, n_e, priors: Priors = Priors()) -> Fit:
                           options={"ftol": 1e-12, "gtol": 1e-7, "maxiter": 10000})
         if np.all(np.isfinite(result.x)) and np.isfinite(result.fun):
             x = result.x
+            # An α landing at the bound is an active-set KKT solution, not an
+            # unconstrained MAP — the unconstrained Hessian computed below
+            # ignores the active bound, so the Laplace cov on α (and any θ/β
+            # entries coupled to it) is wrong. σ_α=0.5 puts |α|=50 at >100σ
+            # under the prior; saturation indicates the data is forcing a
+            # value the model doesn't believe. Flag degenerate so callers
+            # refuse the fit. Tolerance 1e-3 = ~1e-5 of the bound, well
+            # outside any optimizer-convergence wobble.
+            alpha = x[n_m + n_e:]
+            if np.any(np.abs(alpha) >= _ALPHA_BOUND - 1e-3):
+                log.warning("fit_2pl: α saturated bound (max |α|=%.3f, bound=%g) — fit flagged degenerate",
+                            float(np.abs(alpha).max()), _ALPHA_BOUND)
+                alpha_saturated = True
         else:
             log.warning("fit_2pl: non-finite optimizer state (%s); using prior", result.message)
             nonfinite = True
@@ -182,7 +199,7 @@ def fit_2pl(m_idx, e_idx, y, n_m, n_e, priors: Priors = Priors()) -> Fit:
     eig_scale = float(np.abs(w).max()) if w.size else 1.0
     eig_tol = -1e-8 * max(eig_scale, 1.0)
     structurally_negative = bool((w < eig_tol).any())
-    degenerate = nonfinite or structurally_negative
+    degenerate = nonfinite or structurally_negative or alpha_saturated
     if structurally_negative:
         log.warning("fit_2pl: %d negative Hessian eigenvalues (min=%.3e, tol=%.3e) — not at MAP; fit flagged degenerate",
                     int((w < eig_tol).sum()), float(w.min()), eig_tol)

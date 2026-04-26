@@ -139,18 +139,19 @@ class MinerStates:
         return all(self.state(m.uid, k) is State.DURABLE_SKIP for m in committing)
 
     def filter(self, miners: list[Miner]) -> list[Miner]:
-        out: list[Miner] = []
+        committers: dict[ArtKey, list[int]] = {}
         for m in miners:
-            if m.model in self._excluded_models:
-                continue
-            k = art_key(m)
-            s = self.state(m.uid, k)
-            if s in (State.SESSION_SKIP, State.DURABLE_SKIP):
-                continue
-            if self.art_durable(k, miners):
-                continue
-            out.append(m)
-        return out
+            committers.setdefault(art_key(m), []).append(m.uid)
+        durable_art = {
+            k: (k in self._legacy_durable
+                or all(self.state(u, k) is State.DURABLE_SKIP for u in uids))
+            for k, uids in committers.items()
+        }
+        skipped = (State.SESSION_SKIP, State.DURABLE_SKIP)
+        return [m for m in miners
+                if m.model not in self._excluded_models
+                and self.state(m.uid, art_key(m)) not in skipped
+                and not durable_art[art_key(m)]]
 
     def clear_attempted(self) -> None:
         self._records = {key: rec for key, rec in self._records.items()
@@ -498,21 +499,26 @@ def _task_id(king_uid: int, chal_uid: int, env: str, iter_idx: int,
 
 async def _sample(chain: Chain, wrapper, params: dict, timeout: float, slot: Slot,
                   miner: Miner, env_name: str, store: EvidenceStore,
-                  task_id: int, block: int) -> Row | None:
-    """One evaluation of `miner` in `env_name` on `slot`. Returns a row on success,
-    None on infra failure. Counter/seed state lives in `store`. `block` is supplied
-    by the caller — reading current_block per sample puts the chain RPC in the
-    sample's exception path, where any blip would be misattributed as an env
-    failure (env_fails counter triggers spurious quarantine)."""
+                  task_id: int, block: int) -> tuple[Row, bool]:
+    """One evaluation of `miner` in `env_name` on `slot`. Returns (row, delivered).
+    `delivered=False` iff the miner's endpoint failed to produce a verdict (None
+    from run_one); the row is then a synthetic loss (p=0, l=0). The dwell uses
+    `delivered` for side-streak attribution and env-vs-side classification.
+
+    Per notes/plan.md ("Challenger times out on a task → that task is a loss
+    for the challenger"), failure-to-deliver is a loss for the miner. Recording
+    the loss instead of dropping the row makes a chronically-broken endpoint
+    accumulate negative evidence so the IRT contrast eventually surfaces the
+    "first functioning challenger wins by default" semantics the design specifies."""
     c = store.next_counter(miner.uid, miner.revision, env_name)
     outcome, latency = await run_one(wrapper, params, timeout, slot,
                                      seed=_seed(miner.uid, miner.revision, env_name, c, salt=chain.hotkey),
                                      task_id=task_id)
-    if outcome is None:
-        return None
+    delivered = outcome is not None
     return Row(m=miner.uid, r=miner.revision, e=env_name, c=c,
-               p=int(outcome), t=int(block), l=float(latency), i=int(task_id),
-               k=miner.model)
+               p=int(bool(outcome)), t=int(block),
+               l=float(latency) if delivered else 0.0,
+               i=int(task_id), k=miner.model), delivered
 
 
 SIDE_FAIL_THRESHOLD = 3   # consecutive single-side Nones across diverse envs → side broken
@@ -611,30 +617,27 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
             env_fails[e] += 1
             chal_streak = king_streak = 0
             continue
-        k_row, c_row = results
-        if k_row is None and c_row is None:
-            # Ambiguous: env failed; don't accumulate side-specific streak signal.
+        (k_row, k_ok), (c_row, c_ok) = results
+        if not k_ok and not c_ok:
+            # Both failed → env-side: don't accumulate side-specific streak; don't
+            # record synthetic losses (we can't blame either miner when the env
+            # itself appears to be down).
             env_fails[e] += 1
             chal_streak = king_streak = 0
             if env_fails[e] == ENV_FAIL_QUARANTINE:
                 log.warning(f"quarantine env '{env_name}' after {env_fails[e]} consecutive fails (king={king.uid} chal={challenger.uid})")
             continue
-        # Single-side None below: env produced a valid result for at least one side,
-        # so env_fails resets — env is fine, the issue is side-attributable. The
-        # surviving side's outcome IS real evidence about that miner — append it
-        # even if the partner failed. The IRT fit is global per-miner, not
-        # matched-pair, so unpaired rows tighten the surviving side's posterior
-        # and preserve signal that would otherwise be discarded on every
-        # transient infra blip on the other side.
-        if k_row is None:
-            king_streak += 1; chal_streak = 0; env_fails[e] = 0
-            store.append(c_row); rows.append(c_row)
-        elif c_row is None:
-            chal_streak += 1; king_streak = 0; env_fails[e] = 0
-            store.append(k_row); rows.append(k_row)
-        else:
-            chal_streak = king_streak = 0; env_fails[e] = 0
-            store.append(k_row, c_row); rows.extend((k_row, c_row))
+        # At least one side delivered — env is functional. Per design intent,
+        # the failing side's loss is recorded as p=0 (synthetic-loss row carries
+        # l=0.0 to distinguish from real samples). Side streaks still trigger
+        # KING_BROKEN/CHAL_BROKEN abort so we stop wasting compute on a
+        # confirmed-broken endpoint, but the accumulated loss rows let a
+        # functional challenger eventually dethrone a chronically-broken king
+        # via cross-duel evidence.
+        king_streak = 0 if k_ok else king_streak + 1
+        chal_streak = 0 if c_ok else chal_streak + 1
+        env_fails[e] = 0
+        store.append(k_row, c_row); rows.extend((k_row, c_row))
         fit = _fit(rows, miners, env_names, priors)
 
         if king_streak >= SIDE_FAIL_THRESHOLD:
@@ -647,7 +650,7 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
         if not fit.degenerate:
             delta, se = fit.contrast(c_idx, k_idx)
             z = delta / se if se > 0 else 0.0
-            k = compute_k(max(block - reign_start_block, 0),
+            k = compute_k(block - reign_start_block,
                           cfg.k_init, cfg.k_final, cfg.k_halflife)
             if z > k:
                 log.info(f"dwell early-stop i={i+1}/{cfg.dwell}: z={z:+.2f} > k={k:.2f}")
@@ -806,8 +809,7 @@ def _audit_verdict(verdict_str: str, king: Miner, chal: Miner, ev: VerdictEviden
     audit(type="duel", verdict=verdict_str, abort_reason=None,
           king=_miner_pl(king), challenger=_miner_pl(chal),
           delta=ev.delta, se=ev.se, z=ev.z, k=ev.k,
-          reign_blocks=ev.reign_blocks,
-          rows_per_env={e: [p, n] for e, (p, n) in ev.rows_per_env.items()})
+          reign_blocks=ev.reign_blocks, rows_per_env=ev.rows_per_env)
 
 
 async def run(cfg: Config, chain: Chain, slots=None):
@@ -941,13 +943,21 @@ async def run(cfg: Config, chain: Chain, slots=None):
                                       miners, rows, envs, env_names, store, cfg,
                                       priors, rng, stop,
                                       reign_start_block=state.reign.start_block)
-                    rows = out.rows
                     duel_rows = rows[-out.rows_added:] if out.rows_added > 0 else []
                     needs_reign = (out.status is DuelStatus.COMPLETED
                                    and out.rows_added > 0
                                    and not out.fit.degenerate)
-                    reign_blocks = (await chain.current_block() - state.reign.start_block
-                                    if needs_reign else 0)
+                    # Falling back to 0 (i.e. k_init) on RPC failure is conservative —
+                    # k_init is the strictest threshold, so a chain blip can never
+                    # cause a spurious dethrone. Mirrors dwell's same fallback.
+                    if needs_reign:
+                        try: cur_block = await chain.current_block()
+                        except Exception as ex:
+                            log.warning(f"current_block failed at verdict: {ex}; using 0")
+                            cur_block = state.reign.start_block
+                        reign_blocks = max(cur_block - state.reign.start_block, 0)
+                    else:
+                        reign_blocks = 0
 
                     king_id = (king.uid, king.revision)
                     chal_id = (challenger.uid, challenger.revision)

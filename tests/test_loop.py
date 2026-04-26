@@ -1099,13 +1099,13 @@ async def test_dwell_quarantines_broken_env_keeps_sampling_healthy(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dwell_aborts_with_chal_broken_when_only_chal_returns_none(tmp_path, monkeypatch):
-    """When chal is bad (every sample → None) but king is fine, dwell attributes
-    failure to chal-side and aborts after SIDE_FAIL_THRESHOLD picks across diverse
-    envs. The king's outcomes from those picks ARE real evidence about the king's
-    ability and must be preserved — the IRT fit is per-miner global, not
-    matched-pair, so unpaired king rows tighten king's posterior. Discarding
-    them on every transient chal blip would silently lose signal."""
+async def test_dwell_aborts_with_chal_broken_records_synthetic_loss(tmp_path, monkeypatch):
+    """Per notes/plan.md: failure to deliver a verdict is a loss for that miner.
+    With chal returning None on every pick and king delivering, dwell records
+    BOTH a synthetic chal-loss row (p=0, l=0) and the real king row, then aborts
+    after SIDE_FAIL_THRESHOLD picks. Recording the loss is what makes
+    'first functioning challenger wins by default' eventually surface — without
+    it, a chronically-broken endpoint paid no statistical cost."""
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
         return (True if slot.model == "mk" else None), 0.01
     monkeypatch.setattr("affine.loop.run_one", split)
@@ -1124,8 +1124,11 @@ async def test_dwell_aborts_with_chal_broken_when_only_chal_returns_none(tmp_pat
     )
     rows, _, abort = out.rows, out.fit, out.status
     assert abort is DuelStatus.CHAL_BROKEN
-    assert all(r.m == king.uid for r in rows)
-    assert len(rows) >= 1
+    king_rows = [r for r in rows if r.m == king.uid]
+    chal_rows = [r for r in rows if r.m == chal.uid]
+    assert len(king_rows) == len(chal_rows) > 0      # paired
+    assert all(r.p == 1 for r in king_rows)
+    assert all(r.p == 0 and r.l == 0.0 for r in chal_rows)   # synthetic loss
     assert rows == store.read()
 
 
@@ -1152,11 +1155,11 @@ async def test_dwell_aborts_with_king_broken_when_only_king_returns_none(tmp_pat
     )
     rows, _, abort = out.rows, out.fit, out.status
     assert abort is DuelStatus.KING_BROKEN
-    # Mirror of the chal_broken case: chal's real outcomes are preserved,
-    # though the verdict path will skip on king_broken so they don't dethrone
-    # the (slot-broken, artifact-healthy) king.
-    assert all(r.m == chal.uid for r in rows)
-    assert len(rows) >= 1
+    king_rows = [r for r in rows if r.m == king.uid]
+    chal_rows = [r for r in rows if r.m == chal.uid]
+    assert len(king_rows) == len(chal_rows) > 0
+    assert all(r.p == 0 and r.l == 0.0 for r in king_rows)   # synthetic loss
+    assert all(r.p == 1 for r in chal_rows)
     assert rows == store.read()
 
 
@@ -1236,6 +1239,51 @@ async def test_dwell_env_fails_resets_on_single_side_success(tmp_path, monkeypat
     # Before fix, abort at pick 4 (envs_quarantined) → no rows from later picks.
     assert abort is not DuelStatus.ENVS_QUARANTINED, "env_fails must reset after single-side success"
     assert len(rows) > 0, "dwell must reach productive picks after fix"
+
+
+@pytest.mark.asyncio
+async def test_dwell_synthetic_loss_drives_dethrone_against_broken_king(tmp_path, monkeypatch):
+    """Cross-duel evidence accumulation: a chronically-broken king accumulates
+    synthetic-loss rows over multiple aborted dwells. Once enough are stacked,
+    the next dwell's first refit shows θ̂_chal ≫ θ̂_king with tight SE → early-stop
+    z>k. Without synthetic-loss recording, the broken king reigned forever
+    (KING_BROKEN aborts produced zero negative evidence per duel)."""
+    async def king_broken(wrapper, params, timeout, slot, seed, task_id=0):
+        return (None if slot.model == "mk" else True), 0.01
+    monkeypatch.setattr("affine.loop.run_one", king_broken)
+    envs = {n: (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name=n, image="i", params={"timeout": 5}))
+            for n in ("A", "B", "C", "D")}
+    store = EvidenceStore(tmp_path / "ev.jsonl")
+    chain = Chain(hotkey="V", list_miners=AsyncMock(),
+                  current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
+    king = _miner(0, model="mk")
+    cfg = Config(dwell=20, evidence_path=str(tmp_path / "ev.jsonl"))
+
+    rows: list[Row] = []
+    chal_uids = list(range(1, 9))
+    for chal_uid in chal_uids:
+        chal = _miner(chal_uid, model=f"mc{chal_uid}")
+        out = await dwell(
+            chain, king, SimpleNamespace(model="mk", base_url="uk"),
+            chal, SimpleNamespace(model=chal.model, base_url=f"uc{chal_uid}"),
+            [king, chal], rows, envs, list(envs), store, cfg, Priors(),
+            np.random.default_rng(chal_uid), asyncio.Event(), reign_start_block=0,
+        )
+        rows = out.rows
+
+    # After ~8 duels each producing 3 synthetic-loss rows for the broken king,
+    # accumulated cross-duel evidence drives king's θ̂ down. The latest chal's
+    # contrast should exceed k_init=3 — the design's "first functioning
+    # challenger wins by default" reached via accumulated negative evidence.
+    from affine.loop import _fit, _respondents
+    all_miners = [king] + [_miner(u, model=f"mc{u}") for u in chal_uids]
+    fit = _fit(rows, all_miners, list(envs), Priors())
+    art_keys = _respondents(all_miners, rows)
+    chal_idx = art_keys.index((f"mc{chal_uids[-1]}", "r"))
+    king_idx = art_keys.index(("mk", "r"))
+    delta, se = fit.contrast(chal_idx, king_idx)
+    assert delta > 0
+    assert delta / se > 3.0, f"chronically-broken king must yield dethrone-grade z; got {delta/se:.2f}"
 
 
 @pytest.mark.asyncio

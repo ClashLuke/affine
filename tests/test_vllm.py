@@ -191,6 +191,29 @@ async def test_local_slots_unhealthy_raises_and_returns_slot_to_pool():
 
 
 @pytest.mark.asyncio
+async def test_local_slots_cancel_during_health_returns_slot_to_pool():
+    """Regression: a cancellation mid-await on health_ping must still return the
+    URL to the free pool. Without try/except, the URL is popped but never
+    re-appended → repeated cancels exhaust the pool and the validator stalls
+    in 'no free local slots' on every subsequent provision."""
+    import asyncio
+    started = asyncio.Event()
+    async def hang(_url, *a, **kw):
+        started.set()
+        await asyncio.sleep(60)
+    with patch("affine.vllm._docker_host_ip", return_value=None), patch(
+        "affine.vllm.health_ping", side_effect=hang
+    ):
+        slots = LocalSlots("http://a/v1", "http://b/v1")
+        task = asyncio.create_task(slots.provision("m1", "r1"))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(slots._free) == 2
+
+
+@pytest.mark.asyncio
 async def test_targon_provision_registers_deploys_and_returns_slot_when_ready():
     http = _FakeHttp(
         register_resp={"uid": "wl-123"},

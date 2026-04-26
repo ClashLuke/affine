@@ -95,10 +95,13 @@ class LocalSlots:
         if not self._free:
             raise RuntimeError("no free local slots")
         url = self._free.pop(0)
-        if not await health_ping(url):
+        try:
+            if not await health_ping(url):
+                raise SlotProvisionFailed(f"local slot not healthy: {url}")
+            return Slot(model=model, revision=revision, base_url=url, slot_id=f"local-{url}")
+        except BaseException:
             self._free.append(url)
-            raise SlotProvisionFailed(f"local slot not healthy: {url}")
-        return Slot(model=model, revision=revision, base_url=url, slot_id=f"local-{url}")
+            raise
 
     async def teardown(self, slot: Slot) -> None:
         if slot.base_url in self._urls and slot.base_url not in self._free:
