@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import secrets
 import time
 from dataclasses import dataclass
 
@@ -224,10 +225,12 @@ class TargonSlots:
         if timeout is None:
             timeout = int(getattr(self._config, "provision_timeout", 900))
         # Concurrent provisions of the same artifact (king & challenger sharing a
-        # popular model) collide on artifact-hash + epoch-second. Mix in a process-
-        # local nanosecond counter so siblings within one epoch second still differ.
+        # popular model) collide on artifact-hash alone. monotonic_ns wraps every
+        # second after the modulo so two siblings dispatched within 1ns of each
+        # other could still collide; a 32-bit random suffix is collision-free for
+        # the few-per-loop call rate and avoids the wall-clock dependence entirely.
         h = hashlib.sha256(f"{model}\0{revision}".encode()).hexdigest()[:8]
-        name = f"{self._prefix}-{h}-{time.monotonic_ns() % 1_000_000_000:09d}"
+        name = f"{self._prefix}-{h}-{secrets.token_hex(4)}"
         args = [
             "--model", model,
             "--revision", revision,
@@ -256,12 +259,19 @@ class TargonSlots:
 
         http = _http()
         log.info(f"targon rental register: name={name} image={_VLLM_IMAGE} resource={_RESOURCE} model={model}")
-        reg = await http._async_post(_WORKLOADS, json=payload)
-        if not isinstance(reg, dict) or not reg.get("uid"):
-            raise RuntimeError(f"rental register returned no uid: {reg!r}")
-        uid = reg["uid"]
-
+        # Single try wrapping register+deploy+wait. The register call itself
+        # creates the workload on Targon's side: a CancelledError delivered as
+        # the post() returns, or a malformed response that triggers RuntimeError
+        # below, would leave the rental allocated with no handle to delete it.
+        # We pull uid out of `reg` inside the try so any exception path runs the
+        # shielded delete with whatever uid we managed to capture.
+        uid: str | None = None
         try:
+            reg = await http._async_post(_WORKLOADS, json=payload)
+            if isinstance(reg, dict):
+                uid = reg.get("uid") or None
+            if not uid:
+                raise RuntimeError(f"rental register returned no uid: {reg!r}")
             log.info(f"targon rental deploy: uid={uid}")
             await http._async_post(f"{_WORKLOADS}/{uid}/deploy")
             log.info(f"targon rental uid={uid}; waiting for ready (timeout {timeout}s)")
@@ -270,7 +280,8 @@ class TargonSlots:
             # Shield: if the outer task is being cancelled (SIGTERM during a
             # parallel provision, _cancellable timeout), still finish deletion
             # so the Targon rental doesn't leak. _delete has its own 30s budget.
-            await asyncio.shield(self._delete(uid))
+            if uid is not None:
+                await asyncio.shield(self._delete(uid))
             raise
         log.info(f"targon slot ready: uid={uid} base_url={base_url}")
         return Slot(model=model, revision=revision, base_url=base_url, slot_id=uid)

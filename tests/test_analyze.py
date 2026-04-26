@@ -79,6 +79,27 @@ def test_analyze_contrast_picks_most_recent_revision(tmp_path):
     assert "rev_z" in out.stdout, f"diagnostic should name the chosen revision: {out.stdout}"
 
 
+def test_analyze_warns_on_degenerate_fit(tmp_path, monkeypatch, capsys):
+    """Offline replay must surface fit.degenerate so the user doesn't read θ̂/SE
+    as a valid posterior. Force degenerate via a fit_2pl shim to avoid depending
+    on real-world non-convergence cases."""
+    import affine.analyze as analyze
+    real = analyze.fit_2pl
+    def degen(*a, **kw):
+        f = real(*a, **kw)
+        f.degenerate = True
+        return f
+    monkeypatch.setattr(analyze, "fit_2pl", degen)
+    path = tmp_path / "ev.jsonl"
+    _write(path, [{"m": 1, "r": "a", "e": "E", "c": i, "p": i % 2, "t": 0, "l": 100.0} for i in range(20)]
+                  + [{"m": 2, "r": "a", "e": "E", "c": i, "p": (i + 1) % 2, "t": 0, "l": 100.0} for i in range(20)])
+    monkeypatch.setattr(sys, "argv", ["affine.analyze", str(path)])
+    rc = analyze.main()
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "DEGENERATE" in out
+
+
 def test_analyze_missing_file(tmp_path):
     out = _run([str(tmp_path / "nope.jsonl")])
     assert out.returncode == 1

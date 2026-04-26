@@ -164,6 +164,41 @@ def test_append_pair_truncates_on_short_write(tmp_path, monkeypatch):
     assert len(rows) == 2  # only the original pre-failure pair
 
 
+def test_append_pair_rolls_back_on_fsync_failure(tmp_path, monkeypatch):
+    """fsync failure (EIO, ENOSPC late, hardware fault) leaves durability
+    unconfirmed. Without rollback the unflushed pair sits half-visible to the next
+    process while in-memory counters never advanced — the next append would write
+    over a `c` that may or may not be on disk. Fix: ftruncate back to pre-write size
+    so counters and disk agree."""
+    import os
+    store = EvidenceStore(tmp_path / "ev.jsonl")
+    store.append_pair(_row(m=1, c=0, p=1), _row(m=2, c=0, p=0))
+    pre_size = store.path.stat().st_size
+
+    real_open, real_fsync = os.open, os.fsync
+    target_fd = [None]
+    def open_capture(path, *a, **kw):
+        fd = real_open(path, *a, **kw)
+        if str(path) == str(store.path):
+            target_fd[0] = fd
+        return fd
+    def fail_fsync(fd):
+        if fd == target_fd[0]:
+            raise OSError("fsync failed: EIO")
+        return real_fsync(fd)
+    monkeypatch.setattr(os, "open", open_capture)
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+    with pytest.raises(OSError, match="fsync failed"):
+        store.append_pair(_row(m=1, c=1, p=1), _row(m=2, c=1, p=0))
+    # File is rolled back to pre-failure size.
+    assert store.path.stat().st_size == pre_size
+    # Counters didn't advance (the failed pair shouldn't be considered written).
+    assert store.next_counter(1, "rev", "ded") == 1
+    assert store.next_counter(2, "rev", "ded") == 1
+    rows = EvidenceStore(tmp_path / "ev.jsonl").read()
+    assert len(rows) == 2
+
+
 def test_append_pair_advances_both_counters(tmp_path):
     store = EvidenceStore(tmp_path / "ev.jsonl")
     store.append_pair(_row(m=1, r="r1", c=0), _row(m=2, r="r2", c=0))

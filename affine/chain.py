@@ -216,9 +216,11 @@ async def set_weights(
 
     # Retry only chain-level rejections (success=False — broadcast confirmed not
     # landing). Exceptions can fire AFTER broadcast (transport drop during
-    # wait_for_inclusion); retrying then double-submits and burns weight quota.
-    # The outer loop calls _maybe_publish every iteration, so a single exception
-    # gets a fresh attempt next tick — no need for inner exception retry.
+    # wait_for_inclusion finalization wait): the extrinsic IS on chain but the
+    # client timed out waiting. Returning False makes the outer loop call us
+    # again next tick → double-submit, burning weight quota. Verify on chain
+    # before deciding: read our weight row; if it already targets winner_uid,
+    # the broadcast landed.
     for attempt in range(retries):
         try:
             ok = await sub.set_weights(
@@ -227,7 +229,10 @@ async def set_weights(
                 wait_for_inclusion=True, wait_for_finalization=True,
             )
         except Exception as e:
-            log.error(f"set_weights error (attempt {attempt + 1}/{retries}, not retrying): {e}")
+            log.error(f"set_weights raised (attempt {attempt + 1}/{retries}): {e}; verifying on chain")
+            if await _confirm_on_chain(sub, netuid, wallet.hotkey.ss58_address, winner_uid):
+                log.info(f"on-chain weight already targets uid {winner_uid}; treating as success")
+                return True
             return False
         log.debug(f"set_weights response: success={ok.success} message={ok.message}")
         if ok.success:
@@ -237,3 +242,32 @@ async def set_weights(
         if attempt < retries - 1:
             await asyncio.sleep(60)
     return False
+
+
+async def _confirm_on_chain(sub: Subtensor, netuid: int, my_hotkey: str,
+                             winner_uid: int, settle_s: float = 12.0) -> bool:
+    """Best-effort: did our last set_weights actually land? Re-read metagraph and
+    inspect our own weight row. Returns True iff the row exclusively concentrates
+    on `winner_uid`. Sleep one block first so a just-broadcast extrinsic has time
+    to be included before we read.
+    """
+    try:
+        await asyncio.sleep(settle_s)
+        meta = await sub.metagraph(netuid)
+        my_uid = next((i for i, h in enumerate(meta.hotkeys) if h == my_hotkey), None)
+        if my_uid is None:
+            return False
+        W = getattr(meta, "W", None)
+        if W is None or my_uid >= len(W):
+            return False
+        row = W[my_uid]
+        if hasattr(row, "tolist"):
+            row = row.tolist()
+        if not row or winner_uid >= len(row):
+            return False
+        # Winner-takes-all: row[winner_uid] dominates. Threshold 0.99 since on-chain
+        # encoding is u16-quantized so 1.0 round-trips to ~0.999985.
+        return float(row[winner_uid]) >= 0.99
+    except Exception as e:
+        log.warning(f"on-chain weight verification failed: {e}")
+        return False

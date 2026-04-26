@@ -21,6 +21,17 @@ def _reject_constant(c: str):
     raise ValueError(f"non-finite JSON constant: {c}")
 
 
+def _rollback(fd: int, pre: int) -> None:
+    """Truncate back to pre-write size and durably commit the truncation. Without
+    the trailing fsync, a power loss after rollback can journal-replay the partial
+    bytes the rollback was meant to discard."""
+    os.ftruncate(fd, pre)
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+
+
 @dataclass(frozen=True)
 class Row:
     m: int    # miner uid
@@ -99,11 +110,18 @@ class EvidenceStore:
             try:
                 n = os.write(fd, payload)
             except OSError:
-                os.ftruncate(fd, pre); raise
+                _rollback(fd, pre); raise
             if n != len(payload):
-                os.ftruncate(fd, pre)
+                _rollback(fd, pre)
                 raise OSError(f"short write: {n}/{len(payload)} bytes; truncated to {pre}")
-            os.fsync(fd)
+            try:
+                os.fsync(fd)
+            except OSError:
+                # fsync failure (ENOSPC late, EIO, hardware fault) means durability
+                # is unconfirmed. Roll back so counters and disk stay consistent;
+                # the rollback itself must be durable, otherwise journal replay
+                # after power loss can resurrect the partial pair we just truncated.
+                _rollback(fd, pre); raise
         finally:
             os.close(fd)
         for row in (row_a, row_b):

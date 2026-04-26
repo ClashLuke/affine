@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -245,6 +246,27 @@ async def test_targon_provision_timeout_raises_timeout_error_and_deletes():
         with pytest.raises(TimeoutError, match="not ready"):
             await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).provision("model/a", "rev1", timeout=1)
     assert http.deletes == ["/tha/v2/workloads/wl-123"]
+
+
+@pytest.mark.asyncio
+async def test_targon_provision_cancel_during_deploy_deletes_workload():
+    """Outer cancel between register-success and ready: rental allocated on Targon
+    but caller never sees a Slot. Original code's `try:` opened *after* register —
+    a cancel hitting the deploy await would raise out before any cleanup. With
+    register inside the try, the except shield-deletes whichever uid was captured."""
+    http = _FakeHttp(register_resp={"uid": "wl-cancel"})
+
+    async def _post(path, json=None):
+        http.posts.append((path, json))
+        if path.endswith("/deploy"):
+            raise asyncio.CancelledError("outer cancel")
+        return http.register_resp or {}
+
+    http._async_post = _post
+    with patch("affine.vllm._http", return_value=http):
+        with pytest.raises(asyncio.CancelledError):
+            await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).provision("model/a", "rev1", timeout=1)
+    assert http.deletes == ["/tha/v2/workloads/wl-cancel"]
 
 
 @pytest.mark.asyncio

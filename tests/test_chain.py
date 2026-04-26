@@ -73,9 +73,42 @@ async def test_set_weights_does_not_retry_on_exception():
     sub = _mock_sub()
     sub.set_weights = AsyncMock(side_effect=RuntimeError("transport drop after broadcast"))
     wallet = AsyncMock()
-    result = await set_weights(sub, wallet, netuid=1, winner_uid=0, retries=3)
+    with patch("affine.chain.asyncio.sleep", new_callable=AsyncMock):
+        result = await set_weights(sub, wallet, netuid=1, winner_uid=0, retries=3)
     assert result is False
     assert sub.set_weights.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_set_weights_exception_returns_true_when_chain_already_landed():
+    """Transport-drop AFTER broadcast: the extrinsic is on chain but the client
+    didn't get the response. Re-broadcasting on next tick burns weight quota.
+    Verify on chain — if our row already targets winner_uid, treat as success."""
+    meta = FakeMeta(["hk_me", "hk1", "hk_winner"])
+    meta.W = [[0.0, 0.0, 1.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    sub = _mock_sub(meta=meta)
+    sub.set_weights = AsyncMock(side_effect=RuntimeError("transport drop"))
+    wallet = AsyncMock()
+    wallet.hotkey.ss58_address = "hk_me"
+    with patch("affine.chain.asyncio.sleep", new_callable=AsyncMock):
+        result = await set_weights(sub, wallet, netuid=1, winner_uid=2, retries=3)
+    assert result is True
+    assert sub.set_weights.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_set_weights_exception_returns_false_when_chain_did_not_land():
+    """Same exception path, but on-chain weights show the extrinsic didn't land.
+    Outer loop's next iteration must retry."""
+    meta = FakeMeta(["hk_me", "hk1", "hk_winner"])
+    meta.W = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+    sub = _mock_sub(meta=meta)
+    sub.set_weights = AsyncMock(side_effect=RuntimeError("pre-broadcast network error"))
+    wallet = AsyncMock()
+    wallet.hotkey.ss58_address = "hk_me"
+    with patch("affine.chain.asyncio.sleep", new_callable=AsyncMock):
+        result = await set_weights(sub, wallet, netuid=1, winner_uid=2, retries=3)
+    assert result is False
 
 
 @pytest.mark.asyncio

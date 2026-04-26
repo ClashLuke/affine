@@ -40,6 +40,45 @@ def test_fit_on_empty_data_returns_prior():
     assert np.allclose(fit.alpha, 0.0)
     # σ_θ is fixed at 1 for IRT identification, so θ_se = 1 with no data.
     assert np.allclose(fit.theta_se, 1.0)
+    assert fit.degenerate is False  # prior-only fit is the unique MAP, Hessian PSD
+
+
+def test_fit_marks_degenerate_when_grad_far_from_zero(monkeypatch):
+    """Real non-convergence: x stuck far from MAP, ||grad||_∞ large. The verdict
+    path must skip this fit — the Laplace cov has no posterior interpretation
+    when x isn't a stationary point. Force success=False AND a high gradient
+    (mock returns the initial x0, where the data-driven gradient is nonzero)."""
+    from scipy.optimize import OptimizeResult
+    import affine.irt as irt
+    real_min = irt.minimize
+    def fake(fn, x0, *args, **kwargs):
+        f0, g0 = fn(x0, *kwargs.get("args", ()))
+        return OptimizeResult(x=x0, fun=f0, success=False, message="forced",
+                              jac=g0, nit=0, status=1)
+    monkeypatch.setattr(irt, "minimize", fake)
+    m_idx, e_idx, y, *_ = _synth(5, 2, 20)
+    fit = fit_2pl(m_idx, e_idx, y, 5, 2)
+    assert fit.degenerate is True
+
+
+def test_fit_accepts_success_false_when_grad_small(monkeypatch):
+    """Regression for over-broad nonconverged: L-BFGS-B reports success=False on
+    ABNORMAL_TERMINATION_IN_LNSRCH at a true MAP (line search hits machine-eps
+    progress with gradient already small). Flagging that as degenerate forces
+    _elect into baseline-fallback unnecessarily. The principled test is the
+    gradient norm, not the success flag."""
+    from scipy.optimize import OptimizeResult
+    import affine.irt as irt
+    real_min = irt.minimize
+    def fake(fn, x0, *args, **kwargs):
+        res = real_min(fn, x0, *args, **kwargs)
+        return OptimizeResult(x=res.x, fun=res.fun, success=False,
+                              message="ABNORMAL_TERMINATION_IN_LNSRCH",
+                              jac=res.jac, nit=res.nit, status=2)
+    monkeypatch.setattr(irt, "minimize", fake)
+    m_idx, e_idx, y, *_ = _synth(5, 2, 20)
+    fit = fit_2pl(m_idx, e_idx, y, 5, 2)
+    assert fit.degenerate is False
 
 
 def test_fit_respects_priors():
@@ -210,6 +249,16 @@ def test_fit_2pl_floor_caps_posterior_draw_magnitude():
     # With unit prior on θ/β and σ_α=0.5 prior on log α: stddev ≤ 1.0 in θ/β,
     # ≤ 0.5 in log α. No direction should exceed 5σ across 2000 draws.
     assert np.all(np.abs(draws).max(axis=0) < 5.0)
+
+
+def test_fit_alpha_bound_matches_draw_cap():
+    """Bound and draw cap must match: a healthy MAP cannot have |α|>50 under
+    σ_α=0.5 (>100σ), so saturating the optimizer bound IS a degenerate signal.
+    Mismatched values would let a non-degenerate fit produce α=80 (extreme but
+    in-bounds) and then have draws clipped to 50 — Fisher info computed under
+    an α the model doesn't believe."""
+    from affine.irt import _ALPHA_BOUND
+    assert _ALPHA_BOUND == 50.0
 
 
 def test_compute_k_decays_from_init_to_final():

@@ -329,6 +329,22 @@ def test_apply_skip_chal_sharing_king_artifact_exempt(tmp_path):
     assert skip.filter([chal]) == [chal]
 
 
+def test_apply_skip_artifact_exempt_quarantines_chal_uid(tmp_path):
+    """Artifact-skip exemption preserves the cached king but the broken chal
+    IDENTITY must still be quarantined. Otherwise the queue clears `attempted`
+    every reign and the broken chal gets retried forever."""
+    skip = Skiplist(path=tmp_path / "skip.jsonl")
+    chal = _miner(8, model="shared", rev="r1")
+    quarantined: set[tuple[int, str]] = set()
+    _apply_skip(skip, chal, "crashloop", is_king=False,
+                king_artifact=("shared", "r1"), quarantined_chals=quarantined)
+    assert (8, "r1") in quarantined
+    assert skip.filter([chal]) == [chal]   # artifact still admissible
+    _apply_skip(skip, chal, "timeout", is_king=False,
+                king_artifact=("shared", "r1"), quarantined_chals=quarantined)
+    assert (8, "r1") in quarantined
+
+
 def test_apply_skip_king_crashloop_still_durable(tmp_path):
     """The king itself crashlooping must still durable-skip — exempting on
     artifact-match would let a broken king poison reign forever."""
@@ -758,6 +774,50 @@ async def test_elect_cold_start_falls_back_to_lowest_block_when_no_baseline():
     assert (uid, rev) == (2, "r2")
 
 
+@pytest.mark.asyncio
+async def test_elect_falls_back_to_baseline_when_fit_is_degenerate(monkeypatch):
+    """argmax(θ̂) on a non-MAP (degenerate) fit can publish a fabricated winner.
+    Same risk the verdict path refuses for. With evidence + a degenerate fit,
+    election must fall back to the baseline (or lowest-block when no baseline)."""
+    from affine.loop import _elect
+    import affine.irt as irt
+
+    real_fit_2pl = irt.fit_2pl
+    def degen(*a, **kw):
+        f = real_fit_2pl(*a, **kw)
+        f.degenerate = True
+        return f
+    monkeypatch.setattr("affine.loop.fit_2pl", degen)
+
+    miners = [
+        Miner(uid=5, hotkey="h5", model="off-A", revision="r5", block=200),
+        Miner(uid=2, hotkey="h2", model="off-B", revision="r2", block=100),
+        Miner(uid=9, hotkey="h9", model="off-C", revision="r9", block=300),
+    ]
+    rows = [Row(m=5, r="r5", e="E", c=0, p=1, t=0, l=0.1, i=0)]
+    uid, rev = await _elect(rows, miners, ["E"], Priors())
+    assert (uid, rev) == (2, "r2")
+
+
+@pytest.mark.asyncio
+async def test_elect_uses_argmax_theta_when_fit_is_healthy():
+    """Sanity: with non-degenerate evidence, election still picks argmax(θ̂)."""
+    from affine.loop import _elect
+    miners = [
+        Miner(uid=5, hotkey="h5", model="off-A", revision="r5", block=200),
+        Miner(uid=2, hotkey="h2", model="off-B", revision="r2", block=100),
+    ]
+    rows = []
+    # Push uid 5 to high θ̂ via wins on env E, uid 2 losses.
+    for c in range(20):
+        rows.append(Row(m=5, r="r5", e="E", c=c, p=1, t=0, l=0.1, i=c))
+        rows.append(Row(m=2, r="r2", e="E", c=c, p=0, t=0, l=0.1, i=c))
+        rows.append(Row(m=5, r="r5", e="F", c=c, p=1, t=0, l=0.1, i=c))
+        rows.append(Row(m=2, r="r2", e="F", c=c, p=0, t=0, l=0.1, i=c))
+    uid, _ = await _elect(rows, miners, ["E", "F"], Priors())
+    assert uid == 5
+
+
 def test_static_chain_returns_fixed_miners():
     miners = [_miner(0), _miner(1)]
     chain = static_chain(miners, hotkey="hk")
@@ -826,6 +886,51 @@ async def test_dwell_keeps_sampling_through_zero_variance(tmp_path, monkeypatch)
         np.random.default_rng(0), asyncio.Event(),
     )
     assert len(rows) == 2 * cfg.dwell, "dwell must use full budget despite all-pass degeneracy"
+
+
+@pytest.mark.asyncio
+async def test_dwell_routes_around_fisher_env_when_fit_is_degenerate(tmp_path, monkeypatch):
+    """Degenerate fit → cov has 1e12-scale entries → Fit.sample produces garbage
+    draws → log_info collapses, fisher_env is meaningless. _dwell must fall back
+    to uniform random env selection so coverage is preserved over the dwell budget."""
+    import affine.loop as loop_mod
+    real_fit_2pl = loop_mod.fit_2pl
+    def degen(*a, **kw):
+        f = real_fit_2pl(*a, **kw)
+        f.degenerate = True
+        return f
+    monkeypatch.setattr(loop_mod, "fit_2pl", degen)
+    fisher_calls = [0]
+    def boom(*a, **kw):
+        fisher_calls[0] += 1
+        raise AssertionError("fisher_env must not be called on degenerate fit")
+    monkeypatch.setattr(loop_mod, "fisher_env", boom)
+
+    store = EvidenceStore(tmp_path / "ev.jsonl")
+    chain = Chain(hotkey="V", list_miners=AsyncMock(),
+                  current_block=AsyncMock(return_value=42), publish_winner=AsyncMock())
+    king, chal = _miner(0, model="mk"), _miner(1, model="mc")
+    cfg = Config(dwell=5, evidence_path=str(tmp_path / "ev.jsonl"))
+    async def _ok(wrapper, params, timeout, slot, seed, task_id=0):
+        return True, 0.01
+    monkeypatch.setattr("affine.loop.run_one", _ok)
+    envs = {
+        "A": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="A", image="i", params={"timeout": 5})),
+        "B": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="B", image="i", params={"timeout": 5})),
+    }
+    rows, fit, _abort = await _dwell(
+        chain, king, SimpleNamespace(model="mk", base_url="uk"),
+        chal, SimpleNamespace(model="mc", base_url="uc"),
+        [king, chal], [], envs, ["A", "B"], store, cfg, Priors(),
+        np.random.default_rng(0), asyncio.Event(),
+    )
+    assert len(rows) == 2 * cfg.dwell
+    assert fisher_calls[0] == 0
+    # Coverage: with degenerate-fit uniform fallback over 5 picks across 2 envs,
+    # both envs should appear (RNG seed 0 is deterministic; this is verifying
+    # the fallback path runs, not its randomness).
+    envs_seen = {r.e for r in store.read()}
+    assert envs_seen == {"A", "B"}
 
 
 @pytest.mark.asyncio

@@ -108,6 +108,11 @@ def main() -> int:
     table = _env_table(rows)
 
     print(f"# {len(rows)} rows, {len(miners)} (uid,rev) pairs, {len(envs)} envs\n")
+    if fit.degenerate:
+        print("# WARNING: fit is DEGENERATE (optimizer non-converged or non-PD Hessian).")
+        print("# θ̂, SE, and contrast verdicts below are NOT a valid Laplace posterior.")
+        print("# The live loop refuses to elect or dethrone on a degenerate fit; treat")
+        print("# the numbers as diagnostic only.\n")
     print("## Env parameters (sorted by discrimination)")
     print(f"{'env':>14}  {'a (disc)':>10}  {'β (diff)':>10}")
     for i in np.argsort(-fit.a):

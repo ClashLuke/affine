@@ -26,10 +26,18 @@ from scipy.special import expit, log_expit
 
 log = logging.getLogger(__name__)
 
-# Cap |α| in posterior draws used for Fisher-info computation. exp(50) ≈ 5e21 is
-# already past any meaningful discrimination; without a cap, draws from a wide
-# posterior produce 0·∞ NaNs in the harmonic-mean info.
-_ALPHA_DRAW_CAP = 50.0
+# Bound |α| in BOTH the optimizer and the posterior draws. exp(50) ≈ 5e21 is
+# already past any meaningful discrimination, and σ_α=0.5 puts |α|>50 at >100σ.
+# A non-degenerate fit cannot land here; saturating the bound surfaces as
+# success=False → Fit.degenerate. Without a draw cap, wide-posterior samples
+# produce 0·∞ NaNs in the harmonic-mean Fisher info.
+_ALPHA_BOUND = 50.0
+
+# ||grad||_∞ at the MAP. Real fits across random starts converge to <1e-3 (per the
+# module docstring); 1e-2 is loose enough that L-BFGS-B's line-search-exhausted
+# results still pass when they're effectively at the optimum, tight enough that a
+# stuck-far-from-MAP fit (the actual non-converged case) trips it.
+_GRAD_TOL = 1e-2
 
 
 @dataclass(frozen=True)
@@ -44,6 +52,7 @@ class Fit:
     beta: np.ndarray
     alpha: np.ndarray
     cov: np.ndarray         # (n_m + 2 n_e)² joint Laplace posterior
+    degenerate: bool = False  # True iff optimizer failed to reach a MAP (non-PD Hessian)
 
     @property
     def a(self) -> np.ndarray: return np.exp(self.alpha)
@@ -153,21 +162,38 @@ def fit_2pl(m_idx, e_idx, y, n_m, n_e, priors: Priors = Priors()) -> Fit:
     y = np.asarray(y, dtype=np.float64)
     N = n_m + 2 * n_e
     x = np.zeros(N)
+    nonfinite = False
+    nonconverged = False
     if m_idx.size:
-        # Bound α to keep exp(α) finite. L-BFGS-B's line search can excursively
-        # evaluate at α ≈ 700+ where exp overflows, producing NaN obj/grad and
-        # killing the fit. ±100 is ~200σ under priors.sigma_alpha=0.5 — far past
-        # any realistic discrimination, but safe under any sigma_alpha < 50.
-        bounds = [(None, None)] * (n_m + n_e) + [(-100.0, 100.0)] * n_e
+        # Bound α tight enough that saturating the bound IS a degenerate signal:
+        # under priors.sigma_alpha=0.5, |α|=50 is at 100σ, so a healthy MAP cannot
+        # land here. A run-away optimizer that hits the bound returns success=False
+        # → fit flagged degenerate. Without a tight bound, L-BFGS-B's line search
+        # can excursively evaluate α≈700+ where exp overflows.
+        bounds = [(None, None)] * (n_m + n_e) + [(-_ALPHA_BOUND, _ALPHA_BOUND)] * n_e
         result = minimize(_obj_and_grad, x, args=(m_idx, e_idx, y, n_m, n_e, priors),
                           method="L-BFGS-B", jac=True, bounds=bounds,
                           options={"ftol": 1e-12, "gtol": 1e-7, "maxiter": 10000})
         if not np.all(np.isfinite(result.x)) or not np.isfinite(result.fun):
             log.warning("fit_2pl: optimizer produced non-finite state (status=%s); using prior", result.message)
+            nonfinite = True
         else:
             x = result.x
             if not result.success:
-                log.warning("fit_2pl: optimizer did not converge: %s", result.message)
+                # L-BFGS-B reports success=False on ABNORMAL_TERMINATION_IN_LNSRCH
+                # (line search hits machine-eps progress) and MAXITER even when the
+                # gradient is small enough that x IS at a MAP. The authoritative
+                # non-MAP test is ||grad||_∞ — if it's small, the Hessian eigenvalue
+                # check below is sufficient. Using success alone falsely degenerates
+                # healthy fits and forces _elect into baseline-fallback unnecessarily.
+                grad_inf = float(np.max(np.abs(result.jac))) if result.jac is not None else float("inf")
+                if grad_inf > _GRAD_TOL:
+                    log.warning("fit_2pl: not at MAP (status=%s, ||grad||_∞=%.3e); flagging degenerate",
+                                result.message, grad_inf)
+                    nonconverged = True
+                else:
+                    log.info("fit_2pl: optimizer status=%s but ||grad||_∞=%.3e ≤ %.0e; accepting",
+                             result.message, grad_inf, _GRAD_TOL)
     H = _hessian(x, m_idx, e_idx, y, n_m, n_e, priors)
     H = 0.5 * (H + H.T)
     w, V = np.linalg.eigh(H)
@@ -178,14 +204,19 @@ def fit_2pl(m_idx, e_idx, y, n_m, n_e, priors: Priors = Priors()) -> Fit:
     # *shrinks* cov, which *shrinks* SE, which *grows* z = Δθ̂/SE — overconfident
     # in the dethrone direction. The right policy is: keep the true small
     # eigenvalues (cov correspondingly large → SE large → z low → conservative).
-    # Negative eigenvalues mean we did not actually find a MAP — log loudly.
-    if (w < 0).any():
-        log.warning("fit_2pl: %d negative Hessian eigenvalues (min=%.3e) — not at MAP",
-                    int((w < 0).sum()), float(w.min()))
+    # Tolerance: round-off can yield ~−1e-12 eigvals on a true PD matrix. Flag
+    # as non-MAP only when the most-negative eigenvalue exceeds −1e-8·max(|w|).
+    eig_scale = float(np.abs(w).max()) if w.size else 1.0
+    eig_tol = -1e-8 * max(eig_scale, 1.0)
+    structurally_negative = bool((w < eig_tol).any())
+    degenerate = nonfinite or nonconverged or structurally_negative
+    if structurally_negative:
+        log.warning("fit_2pl: %d negative Hessian eigenvalues (min=%.3e, tol=%.3e) — not at MAP; fit flagged degenerate",
+                    int((w < eig_tol).sum()), float(w.min()), eig_tol)
     w = np.maximum(w, 1e-12)
     cov = (V / w) @ V.T
     return Fit(theta=x[:n_m].copy(), beta=x[n_m:n_m + n_e].copy(),
-               alpha=x[n_m + n_e:].copy(), cov=cov)
+               alpha=x[n_m + n_e:].copy(), cov=cov, degenerate=degenerate)
 
 
 def fisher_env(fit: Fit, i: int, j: int, rng: np.random.Generator,
@@ -206,7 +237,7 @@ def fisher_env(fit: Fit, i: int, j: int, rng: np.random.Generator,
     if len(excluded) >= fit.n_e:
         raise ValueError("all envs excluded")
     theta, beta, alpha = fit.sample(rng)
-    alpha = np.clip(alpha, -_ALPHA_DRAW_CAP, _ALPHA_DRAW_CAP)
+    alpha = np.clip(alpha, -_ALPHA_BOUND, _ALPHA_BOUND)
     a = np.exp(alpha)
     L_i = a * (theta[i] - beta)
     L_j = a * (theta[j] - beta)

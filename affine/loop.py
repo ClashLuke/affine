@@ -219,8 +219,9 @@ async def _load_envs(cfg: Config) -> dict[str, tuple]:
         return out
     except BaseException:
         for wrapper, _ in loaded.values():
-            try: await wrapper.cleanup()
-            except Exception: pass
+            try: await asyncio.wait_for(wrapper.cleanup(), timeout=30.0)
+            except (Exception, asyncio.TimeoutError) as e:
+                log.warning(f"env cleanup-on-fail: {e}")
         raise
 
 
@@ -324,7 +325,8 @@ async def _provision(slots, miner: Miner, stop: asyncio.Event) -> tuple[Slot | N
 
 
 def _apply_skip(skip: Skiplist, miner: Miner, status: str, *,
-                is_king: bool, king_artifact: tuple[str, str] | None = None) -> None:
+                is_king: bool, king_artifact: tuple[str, str] | None = None,
+                quarantined_chals: set[tuple[int, str]] | None = None) -> None:
     """Translate a provision status into skiplist policy.
 
     The current king is never session-skipped on a transient timeout — that would
@@ -337,8 +339,15 @@ def _apply_skip(skip: Skiplist, miner: Miner, status: str, *,
     and healthy. During concurrent first-time provisioning (no cached king), this
     is None — otherwise a crashloop on a shared artifact gets suppressed on both
     sides (king's task cancelled by fail-fast, challenger exempted) and the loop
-    retries the same pair indefinitely."""
+    retries the same pair indefinitely.
+
+    `quarantined_chals` (uid, rev) set: when an artifact-skip is exempted, the
+    chal IDENTITY is still recorded here so it isn't re-attempted every reign
+    (`attempted` clears on queue exhaustion). Without this, a broken chal sharing
+    the king's artifact gets retried indefinitely."""
     if not is_king and king_artifact and (miner.model, miner.revision) == king_artifact:
+        if status in ("crashloop", "timeout", "unhealthy", "error") and quarantined_chals is not None:
+            quarantined_chals.add((miner.uid, miner.revision))
         return
     if status == "crashloop":
         skip.add(miner.model, miner.revision, durable=True)
@@ -355,7 +364,9 @@ def _apply_skip(skip: Skiplist, miner: Miner, status: str, *,
 
 
 async def _provision_pair(slots, king: Miner, chal: Miner, skip: Skiplist,
-                          stop: asyncio.Event) -> tuple[Slot | None, Slot | None, bool]:
+                          stop: asyncio.Event,
+                          quarantined_chals: set[tuple[int, str]] | None = None,
+                          ) -> tuple[Slot | None, Slot | None, bool]:
     """Provision king and challenger concurrently with fail-fast cancellation.
 
     Returns `(king_slot, chal_slot, king_attempt_failed)`. `king_attempt_failed`
@@ -430,7 +441,8 @@ async def _provision_pair(slots, king: Miner, chal: Miner, skip: Skiplist,
             if t.cancelled() or t.exception() is not None:
                 continue
             _, status = t.result()
-            _apply_skip(skip, m, status, is_king=is_king, king_artifact=king_artifact)
+            _apply_skip(skip, m, status, is_king=is_king, king_artifact=king_artifact,
+                        quarantined_chals=quarantined_chals)
     except BaseException:
         for s in slots_got:
             if s is not None: await asyncio.shield(_safe_teardown(slots, s, "pair-error"))
@@ -546,7 +558,15 @@ async def _dwell(chain: Chain, king: Miner, king_slot: Slot, challenger: Miner,
         if len(excluded) >= len(env_names):
             log.warning(f"all envs quarantined at i={i}; aborting dwell (king={king.uid} chal={challenger.uid})")
             return rows, fit, "envs_quarantined"
-        e = fisher_env(fit, c_idx, k_idx, rng, excluded=excluded)
+        # Degenerate fit: cov is fabricated (eigvals floored from large negatives
+        # to 1e-12 → inverse ~1e12), so Fit.sample produces garbage draws and
+        # log_info collapses to ~constant. Targeted acquisition is meaningless;
+        # uniform random over non-excluded envs at least preserves coverage.
+        if fit.degenerate:
+            choices = [j for j in range(len(env_names)) if j not in excluded]
+            e = int(rng.choice(choices))
+        else:
+            e = fisher_env(fit, c_idx, k_idx, rng, excluded=excluded)
         env_name = env_names[e]
         wrapper, spec = envs[env_name]
         params = {k: v for k, v in spec.params.items() if k != "timeout"}
@@ -623,20 +643,24 @@ async def _elect(rows: list[Row], miners: list[Miner], env_names: list[str],
     registered; otherwise pick the lowest-block miner (fairest tiebreaker — first
     to commit holds the throne until evidence dethrones them). With evidence:
     argmax(θ̂)."""
-    if not rows:
+    def _seat_baseline_or_lowest(reason: str) -> tuple[int, str]:
         for target in BASELINE_MODELS:
             for m in miners:
                 if m.model == target:
-                    log.info(f"cold start: seating baseline {m.model} as uid {m.uid}")
+                    log.info(f"{reason}: seating baseline {m.model} as uid {m.uid}")
                     return m.uid, m.revision
-        # No baseline registered and no rows: argmax(θ̂) on a prior-only fit
-        # returns uid 0 by tie-break, which is misleading. Pick lowest-block
-        # explicitly so the choice is interpretable (and the loop's normal
-        # queue-by-block logic dominates from there).
         m = min(miners, key=lambda x: (x.block, _tiebreak(x)))
-        log.info(f"cold start: no baseline registered; seating lowest-block uid {m.uid} model {m.model}")
+        log.info(f"{reason}: no baseline registered; seating lowest-block uid {m.uid} model {m.model}")
         return m.uid, m.revision
+    if not rows:
+        return _seat_baseline_or_lowest("cold start")
     fit = _fit(rows, miners, env_names, priors)
+    if fit.degenerate:
+        # argmax(θ̂) on a non-MAP fit can publish a winner from a fabricated
+        # posterior — same risk the verdict path refuses for. Fall back to the
+        # cold-start choice; once new evidence accumulates the next election
+        # gets a real fit.
+        return _seat_baseline_or_lowest("elect: degenerate fit")
     n = len(miners)
     i = int(np.argmax(fit.theta[:n]))
     log.info(f"elect: uid {miners[i].uid} (θ̂={fit.theta[i]:+.3f})")
@@ -690,80 +714,86 @@ async def run(cfg: Config, chain: Chain, slots=None):
     slots = slots or TargonSlots(cfg, hotkey=chain.hotkey)
     if hasattr(slots, "reconcile"):
         await slots.reconcile()
-    envs = await _load_envs(cfg)
-    env_names = [spec.name for spec in cfg.environments]
-    store = EvidenceStore(cfg.evidence_path)
-    reign_state_path = Path(cfg.evidence_path).parent / f"reign-{chain.hotkey[:8]}.json"
-    skiplist_path = Path(cfg.evidence_path).parent / f"skiplist-{chain.hotkey[:8]}.jsonl"
-    skip = Skiplist(
-        {s.strip() for s in os.getenv("AFFINE_MODEL_SKIPLIST", "").split(",") if s.strip()},
-        path=skiplist_path,
-    )
-    priors = Priors(cfg.sigma_beta, cfg.sigma_alpha)
-    # Mix hotkey with OS entropy so fisher_env's Thompson stream isn't replayed
-    # across restarts. Hotkey-only seeding makes a tight crashloop deterministically
-    # repick the same env that triggered the crash; entropy breaks the cycle and
-    # gives fresh exploration on each restart. Determinism we DO need (per-sample
-    # task seeds, counter monotonicity) is anchored elsewhere — in evidence rows
-    # and SHA(uid||rev||env||counter) — and is unaffected by rng-state choice.
-    hotkey_int = int.from_bytes(chain.hotkey.encode()[:8].ljust(8, b"\0"), "big")
-    rng = np.random.default_rng(np.random.SeedSequence([hotkey_int, secrets.randbits(64)]))
-
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for s in (signal.SIGTERM, signal.SIGINT):
-        try: loop.add_signal_handler(s, stop.set)
-        except (NotImplementedError, ValueError): signal.signal(s, lambda *_: stop.set())
-
-    rows = store.read()
-    champion, reign_start, last_published_uid = _load_reign_state(reign_state_path)
-    if champion is not None:
-        log.info(f"resuming reign: uid {champion[0]}@{champion[1]} from block {reign_start} "
-                 f"(last_published_uid={last_published_uid})")
-    attempted: set[tuple[int, str]] = set()   # (uid, revision) tried this reign
-    king_fail_backoff: int = 60               # 60→120→240→480→600 on repeated failures
+    envs: dict[str, tuple] = await _load_envs(cfg)
     # King slot persists across duels within a reign. Re-provisioning a 600GB
     # model download for every challenger was the dominant cost: this single
-    # cache saves ~10min per duel on average.
+    # cache saves ~10min per duel on average. Hoisted above try: so the outer
+    # finally can shield-tear it down even if init below raises.
     king_slot: Slot | None = None
-
-    async def _drop_king():
-        nonlocal king_slot
-        if king_slot is None:
-            return
-        slot, king_slot = king_slot, None
-        # Shield: a parent cancel mid-teardown (SIGTERM during shutdown) would
-        # otherwise abort the Targon DELETE call and orphan the rental on the
-        # account. Shield ensures the delete completes; reconcile() at next
-        # startup is the backstop if even that fails.
-        try:
-            await asyncio.shield(_safe_teardown(slots, slot, "king-drop"))
-        except asyncio.CancelledError:
-            log.warning("king teardown cancelled mid-flight; reconcile will clean up")
-            raise
-
-    async def _maybe_publish(uid: int, expected_hotkey: str) -> None:
-        nonlocal last_published_uid
-        if uid == last_published_uid:
-            return
-        audit(type="weight_intent", netuid=cfg.netuid, winner_uid=uid,
-              dry_run=_truthy_env("AFFINE_DRY_RUN"))
-        # Don't wrap in _cancellable: cancelling between broadcast and inclusion-wait
-        # leaves the extrinsic on-chain but `last_published_uid` unset, so a restart
-        # double-submits and burns weight quota. set_weights owns its own retry budget.
-        if not await chain.publish_winner(uid, expected_hotkey):
-            log.warning(f"publish_winner uid={uid} failed; will retry next iteration")
-            return
-        # Persist BEFORE mutating in-memory: if _save raises (disk full, etc.) and we'd
-        # already advanced last_published_uid in memory, we'd skip the next idempotent
-        # retry but the disk would still say "not published" — restart would re-submit
-        # and burn weight quota. Save-first means a save failure leaves both memory and
-        # disk un-advanced; the next iteration retries publish (idempotent on chain).
-        if champion is not None:
-            _save_reign_state(reign_state_path, champion, reign_start, uid)
-        last_published_uid = uid
-
     try:
+        env_names = [spec.name for spec in cfg.environments]
+        store = EvidenceStore(cfg.evidence_path)
+        reign_state_path = Path(cfg.evidence_path).parent / f"reign-{chain.hotkey[:8]}.json"
+        skiplist_path = Path(cfg.evidence_path).parent / f"skiplist-{chain.hotkey[:8]}.jsonl"
+        skip = Skiplist(
+            {s.strip() for s in os.getenv("AFFINE_MODEL_SKIPLIST", "").split(",") if s.strip()},
+            path=skiplist_path,
+        )
+        priors = Priors(cfg.sigma_beta, cfg.sigma_alpha)
+        # Mix hotkey with OS entropy so fisher_env's Thompson stream isn't replayed
+        # across restarts. Hotkey-only seeding makes a tight crashloop deterministically
+        # repick the same env that triggered the crash; entropy breaks the cycle and
+        # gives fresh exploration on each restart. Determinism we DO need (per-sample
+        # task seeds, counter monotonicity) is anchored elsewhere — in evidence rows
+        # and SHA(uid||rev||env||counter) — and is unaffected by rng-state choice.
+        hotkey_int = int.from_bytes(chain.hotkey.encode()[:8].ljust(8, b"\0"), "big")
+        rng = np.random.default_rng(np.random.SeedSequence([hotkey_int, secrets.randbits(64)]))
+
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for s in (signal.SIGTERM, signal.SIGINT):
+            try: loop.add_signal_handler(s, stop.set)
+            except (NotImplementedError, ValueError): signal.signal(s, lambda *_: stop.set())
+
+        rows = store.read()
+        champion, reign_start, last_published_uid = _load_reign_state(reign_state_path)
+        if champion is not None:
+            log.info(f"resuming reign: uid {champion[0]}@{champion[1]} from block {reign_start} "
+                     f"(last_published_uid={last_published_uid})")
+        attempted: set[tuple[int, str]] = set()   # (uid, revision) tried this reign
+        # Session-only (uid, rev) quarantine: a chal sharing the king's artifact
+        # exempts the artifact from skiplist (so the cached king isn't filtered
+        # out), but the chal's own identity still needs to be quarantined or it
+        # gets retried every cycle when `attempted` clears at queue exhaustion.
+        quarantined_chals: set[tuple[int, str]] = set()
+        king_fail_backoff: int = 60               # 60→120→240→480→600 on repeated failures
+
+        async def _drop_king():
+            nonlocal king_slot
+            if king_slot is None:
+                return
+            slot, king_slot = king_slot, None
+            # Shield: a parent cancel mid-teardown (SIGTERM during shutdown) would
+            # otherwise abort the Targon DELETE call and orphan the rental on the
+            # account. Shield ensures the delete completes; reconcile() at next
+            # startup is the backstop if even that fails.
+            try:
+                await asyncio.shield(_safe_teardown(slots, slot, "king-drop"))
+            except asyncio.CancelledError:
+                log.warning("king teardown cancelled mid-flight; reconcile will clean up")
+                raise
+
+        async def _maybe_publish(uid: int, expected_hotkey: str) -> None:
+            nonlocal last_published_uid
+            if uid == last_published_uid:
+                return
+            audit(type="weight_intent", netuid=cfg.netuid, winner_uid=uid,
+                  dry_run=_truthy_env("AFFINE_DRY_RUN"))
+            # Don't wrap in _cancellable: cancelling between broadcast and inclusion-wait
+            # leaves the extrinsic on-chain but `last_published_uid` unset, so a restart
+            # double-submits and burns weight quota. set_weights owns its own retry budget.
+            if not await chain.publish_winner(uid, expected_hotkey):
+                log.warning(f"publish_winner uid={uid} failed; will retry next iteration")
+                return
+            # Persist BEFORE mutating in-memory: if _save raises (disk full, etc.) and we'd
+            # already advanced last_published_uid in memory, we'd skip the next idempotent
+            # retry but the disk would still say "not published" — restart would re-submit
+            # and burn weight quota. Save-first means a save failure leaves both memory and
+            # disk un-advanced; the next iteration retries publish (idempotent on chain).
+            if champion is not None:
+                _save_reign_state(reign_state_path, champion, reign_start, uid)
+            last_published_uid = uid
+
         while not stop.is_set():
             try:
                 miners = skip.filter(await chain.list_miners())
@@ -784,6 +814,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
                     last_published_uid = None
                     _save_reign_state(reign_state_path, new_champion, new_reign_start, None)
                     champion, reign_start, attempted = new_champion, new_reign_start, set()
+                    quarantined_chals.clear()
                     if stop.is_set(): break
                     log.info(f"champion: uid {champion[0]}@{champion[1]} (reign start block {reign_start})")
                 if stop.is_set(): break
@@ -793,7 +824,8 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 await _maybe_publish(king.uid, king.hotkey)
                 queue = sorted(
                     (m for m in miners if (m.uid, m.revision) != champion
-                                       and (m.uid, m.revision) not in attempted),
+                                       and (m.uid, m.revision) not in attempted
+                                       and (m.uid, m.revision) not in quarantined_chals),
                     key=lambda m: (m.block, _tiebreak(m)),
                 )
                 if not queue:
@@ -815,11 +847,13 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 king_attempt_failed = False
                 try:
                     if king_slot is None:
-                        king_slot, chal_slot, king_attempt_failed = await _provision_pair(slots, king, challenger, skip, stop)
+                        king_slot, chal_slot, king_attempt_failed = await _provision_pair(
+                            slots, king, challenger, skip, stop, quarantined_chals)
                     else:
                         chal_slot, chal_status = await _provision(slots, challenger, stop)
                         _apply_skip(skip, challenger, chal_status, is_king=False,
-                                    king_artifact=(king.model, king.revision))
+                                    king_artifact=(king.model, king.revision),
+                                    quarantined_chals=quarantined_chals)
                 except asyncio.CancelledError:
                     if stop.is_set(): break
                     raise
@@ -867,12 +901,14 @@ async def run(cfg: Config, chain: Chain, slots=None):
                         # is healthy on this artifact. Skipping it would filter king on
                         # the next iteration. (Cached-king + chal sharing king's
                         # artifact CAN reach _dwell — two miners committing the same
-                        # popular base model, second uid as challenger.)
+                        # popular base model, second uid as challenger.) When exempting,
+                        # still quarantine the chal IDENTITY so it doesn't get retried.
                         if (challenger.model, challenger.revision) != (king.model, king.revision):
                             skip.add(challenger.model, challenger.revision, durable=False)
                         else:
+                            quarantined_chals.add((challenger.uid, challenger.revision))
                             log.info(f"chal_broken on king-shared artifact {king.model}@{king.revision}; "
-                                     f"not session-skipping to preserve king cache")
+                                     f"artifact-exempt, uid {challenger.uid} quarantined")
                     elif abort_reason == "king_broken":
                         # Drop the slot. Re-provision next iter — Targon may give a different
                         # host. Don't re-elect: a transient leak shouldn't flip the throne, and
@@ -880,9 +916,18 @@ async def run(cfg: Config, chain: Chain, slots=None):
                         log.warning(f"king uid{king.uid} mid-dwell broken; dropping slot for re-provision")
                         await _drop_king()
 
-                    if len(rows) == rows_before:
-                        log.info(f"duel aborted with no evidence (king uid{king.uid} vs chal uid{challenger.uid}); skipping verdict")
-                        audit(type="duel_aborted", reason=abort_reason or "no_rows",
+                    skip_verdict = (len(rows) == rows_before
+                                    or abort_reason == "chal_broken"
+                                    or fit.degenerate)
+                    if skip_verdict:
+                        # chal_broken: side-broken streak hit threshold AND artifact is session-skipped.
+                        # Computing a verdict on partial rows + then promoting the same artifact we just
+                        # quarantined is incoherent. degenerate: Hessian non-PD → optimizer didn't reach
+                        # a MAP, posterior cov is fabricated → z untrustworthy. Champion holds.
+                        reason = ("degenerate_fit" if fit.degenerate
+                                  else (abort_reason or "no_rows"))
+                        log.info(f"duel aborted ({reason}, rows={len(rows) - rows_before}); skipping verdict")
+                        audit(type="duel_aborted", reason=reason,
                               king={"uid": king.uid, "model": king.model, "revision": king.revision},
                               challenger={"uid": challenger.uid, "model": challenger.model, "revision": challenger.revision})
                         continue
@@ -920,6 +965,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
                             champion = (challenger.uid, challenger.revision)
                             reign_start = new_reign_start
                             attempted = set()
+                            quarantined_chals.clear()
                             last_published_uid = None
                             _save_reign_state(reign_state_path, champion, reign_start, None)
                             await _maybe_publish(challenger.uid, challenger.hotkey)
@@ -933,7 +979,9 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 await _cancellable(asyncio.sleep(60), stop)
     finally:
         log.info("shutdown")
-        await _drop_king()
+        if king_slot is not None:
+            try: await asyncio.shield(_safe_teardown(slots, king_slot, "shutdown"))
+            except Exception as e: log.warning(f"king teardown on shutdown: {e}")
         for wrapper, _ in envs.values():
             try: await asyncio.wait_for(wrapper.cleanup(), timeout=30.0)
             except (Exception, asyncio.TimeoutError) as e:
