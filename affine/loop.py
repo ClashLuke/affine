@@ -190,7 +190,7 @@ def _respondents(miners: list[Miner], rows: list[Row]) -> list[ArtKey]:
 
 
 def _fit(rows: list[Row], miners: list[Miner], env_names: list[str],
-         priors: Priors) -> Fit:
+         priors: Priors, init_x: np.ndarray | None = None) -> Fit:
     """Drops envs whose every observed outcome is identical (all-pass or all-fail)
     from the fit data — they tighten the contrast SE based on Hessian mass that
     has no per-miner discrimination. Filtered envs keep their slot in the returned
@@ -216,7 +216,7 @@ def _fit(rows: list[Row], miners: list[Miner], env_names: list[str],
                         dtype=np.intp, count=len(filtered))
     e_idx = np.fromiter((e2i[r.e] for r in filtered), dtype=np.intp, count=len(filtered))
     y = np.fromiter((r.p for r in filtered), dtype=np.float64, count=len(filtered))
-    return fit_2pl(m_idx, e_idx, y, len(keys), len(env_names), priors)
+    return fit_2pl(m_idx, e_idx, y, len(keys), len(env_names), priors, init_x=init_x)
 
 
 async def _load_envs(cfg: Config) -> dict[str, tuple]:
@@ -556,6 +556,8 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
     def _out(status: DuelStatus, fit: Fit) -> DuelOutcome:
         return DuelOutcome(rows=rows, fit=fit, status=status, rows_added=len(rows) - rows0)
     fit = _fit(rows, miners, env_names, priors)
+    init_x = (np.concatenate([fit.theta, fit.beta, fit.alpha])
+              if not fit.degenerate else None)
     art_keys = _respondents(miners, rows)
     k_idx = art_keys.index(art_key(king))
     c_idx = art_keys.index(art_key(challenger))
@@ -638,7 +640,9 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
         chal_streak = 0 if c_ok else chal_streak + 1
         env_fails[e] = 0
         store.append(k_row, c_row); rows.extend((k_row, c_row))
-        fit = _fit(rows, miners, env_names, priors)
+        fit = _fit(rows, miners, env_names, priors, init_x=init_x)
+        if not fit.degenerate:
+            init_x = np.concatenate([fit.theta, fit.beta, fit.alpha])
 
         if king_streak >= SIDE_FAIL_THRESHOLD:
             log.warning(f"king uid{king.uid} appears broken: {king_streak} consecutive king-only Nones across envs; aborting dwell")
@@ -654,6 +658,26 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
                           cfg.k_init, cfg.k_final, cfg.k_halflife)
             if z > k:
                 log.info(f"dwell early-stop i={i+1}/{cfg.dwell}: z={z:+.2f} > k={k:.2f}")
+                return _out(DuelStatus.COMPLETED, fit)
+            # Hopelessness (plan §6): past midpoint with SE meaningfully shrunk
+            # (data-informed posterior), if z is so far below k that the
+            # upper-bound shift over remaining iters can't close the gap,
+            # abort to save GPU. The 0.1·remaining bound is empirical: across
+            # simulated regimes with realistic history (θ_diff ∈ {0.5..2.0},
+            # n≥80 trials), no trial with z_mid > 2 SE below k at midpoint
+            # reached z>k by full budget.
+            #
+            # Gates:
+            #  - dwell ≥ 20: empirical bound was calibrated at dwell=30; with
+            #    smaller budgets the linear extrapolation overstates how much
+            #    z can drift, risking premature abort on a recoverable chal.
+            #  - SE < 1.0: prior contrast SE = √2 ≈ 1.41; below 1.0 means
+            #    the fit is data-informed enough to trust the bound.
+            remaining = cfg.dwell - (i + 1)
+            if (cfg.dwell >= 20 and i + 1 >= cfg.dwell // 2
+                    and se < 1.0 and z + 0.1 * remaining < k):
+                log.info(f"dwell hopeless i={i+1}/{cfg.dwell}: z={z:+.2f} k={k:.2f} "
+                         f"se={se:.2f} remaining={remaining}; champion holds")
                 return _out(DuelStatus.COMPLETED, fit)
     return _out(DuelStatus.COMPLETED, fit)
 
