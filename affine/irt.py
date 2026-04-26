@@ -228,6 +228,9 @@ def fisher_env(fit: Fit, i: int, j: int, rng: np.random.Generator,
 def compute_k(reign_blocks: int, k_init: float, k_final: float, halflife: int) -> float:
     """Dethronement threshold: decays from k_init → k_final with half-life in blocks.
     Higher k = harder to dethrone. Resets on champion change. Negative reign (chain
-    reconnect/fork reporting an older block) clamps to 0 so k never exceeds k_init."""
+    reconnect/fork reporting an older block) clamps to 0 so k never exceeds k_init.
+    halflife<=0 (would divide by zero) collapses to the final floor."""
+    if halflife <= 0:
+        return k_final
     reign_blocks = max(reign_blocks, 0)
     return k_final + (k_init - k_final) * math.exp(-math.log(2) * reign_blocks / halflife)

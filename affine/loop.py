@@ -569,25 +569,29 @@ async def _dwell(chain: Chain, king: Miner, king_slot: Slot, challenger: Miner,
             for r in results:
                 if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
                     log.warning(f"_dwell sample raised on env={env_name}: {type(r).__name__}: {r}")
-            # Sample exceptions are infra-side (sampler swallows wrapper-reported
-            # failures into None; an exception here means the asyncio plumbing or
-            # _sample itself raised — env-side, not miner-side).
+            # Sample exception: ambiguous evidence (env-side plumbing failure can't
+            # attribute to a miner). Track as env-side; don't feed side streaks.
             env_fails[e] += 1
+            chal_streak = king_streak = 0
             continue
         k_row, c_row = results
         if k_row is None and c_row is None:
+            # Ambiguous: env failed; don't accumulate side-specific streak signal.
             env_fails[e] += 1
+            chal_streak = king_streak = 0
             if env_fails[e] == ENV_FAIL_QUARANTINE:
                 log.warning(f"quarantine env '{env_name}' after {env_fails[e]} consecutive fails (king={king.uid} chal={challenger.uid})")
             continue
+        # Single-side None below: env produced a valid result for at least one side,
+        # so env_fails resets — env is fine, the issue is side-attributable.
         if k_row is None:
-            king_streak += 1; chal_streak = 0
+            king_streak += 1; chal_streak = 0; env_fails[e] = 0
             if king_streak >= SIDE_FAIL_THRESHOLD:
                 log.warning(f"king uid{king.uid} appears broken: {king_streak} consecutive king-only Nones across envs; aborting dwell")
                 return rows, fit, "king_broken"
             continue
         if c_row is None:
-            chal_streak += 1; king_streak = 0
+            chal_streak += 1; king_streak = 0; env_fails[e] = 0
             if chal_streak >= SIDE_FAIL_THRESHOLD:
                 log.warning(f"chal uid{challenger.uid} appears broken: {chal_streak} consecutive chal-only Nones across envs; aborting dwell")
                 return rows, fit, "chal_broken"

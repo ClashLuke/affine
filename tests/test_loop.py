@@ -907,6 +907,82 @@ async def test_dwell_aborts_with_king_broken_when_only_king_returns_none(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_dwell_streak_resets_on_ambiguous_both_none(tmp_path, monkeypatch):
+    """Both-None is *ambiguous* evidence: the env failed, can't attribute to a side.
+    Without resetting side streaks on both-None, a chal-None / both-None alternation
+    spuriously trips chal_broken even though the side signal is interleaved with
+    env-side noise. Fix: reset streaks on ambiguous evidence; let env_fails carry
+    the ambiguous signal."""
+    counter = {"n": 0}
+    async def alternating(wrapper, params, timeout, slot, seed, task_id=0):
+        counter["n"] += 1
+        # Per call (king and chal each call run_one): odd picks chal-None / king-ok,
+        # even picks both-None. We tag by slot.model so each side decides on its own.
+        # Pick index from king's call count: floor((n+1)/2).
+        pick = (counter["n"] + 1) // 2
+        if pick % 2 == 1:                                                 # odd: chal-only fail
+            return (True if slot.model == "mk" else None), 0.01
+        return None, 0.01                                                 # even: both-None
+    monkeypatch.setattr("affine.loop.run_one", alternating)
+    envs = {"X": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="X", image="i", params={"timeout": 5}))}
+    store = EvidenceStore(tmp_path / "ev.jsonl")
+    chain = Chain(hotkey="V", list_miners=AsyncMock(),
+                  current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
+    king, chal = _miner(0, model="mk"), _miner(1, model="mc")
+    cfg = Config(dwell=20, evidence_path=str(tmp_path / "ev.jsonl"))
+    rows, _, abort = await _dwell(
+        chain, king, SimpleNamespace(model="mk", base_url="uk"),
+        chal, SimpleNamespace(model="mc", base_url="uc"),
+        [king, chal], [], envs, list(envs), store, cfg, Priors(),
+        np.random.default_rng(0), asyncio.Event(),
+    )
+    # Before fix: chal_streak grows 1,1,2,2,3 → "chal_broken". After fix: streak
+    # resets on both-None, env_fails carries the ambiguous signal → "envs_quarantined".
+    assert abort != "chal_broken", "ambiguous both-None must not feed side-broken signal"
+
+
+@pytest.mark.asyncio
+async def test_dwell_env_fails_resets_on_single_side_success(tmp_path, monkeypatch):
+    """env_fails[e] tracks consecutive *both-None* failures on env e — the env-side
+    signal. A single-side success means the env produced a valid result for at least
+    one model: the env is fine. Without resetting env_fails on single-side success,
+    a long-running session accumulates spurious quarantine pressure across picks."""
+    seq: list[tuple[bool | None, bool | None]] = [
+        (None, None),                                                     # pick 1: both-None → env_fails=1
+        (None, None),                                                     # pick 2: both-None → env_fails=2
+        (True, None),                                                     # pick 3: chal-None, king-ok → env_fails should reset
+        (None, None),                                                     # pick 4: both-None → env_fails=1 (fix) vs 3=quarantine (bug)
+        (None, None),                                                     # pick 5: both-None → env_fails=2 (fix)
+    ]
+    pick = {"i": 0}
+    last_pick = {"slot_count": 0}
+    async def scripted(wrapper, params, timeout, slot, seed, task_id=0):
+        last_pick["slot_count"] += 1
+        idx = (last_pick["slot_count"] + 1) // 2 - 1
+        if idx >= len(seq):
+            return False, 0.01                                            # productive failures keep dwell going
+        k, c = seq[idx]
+        return (k if slot.model == "mk" else c), 0.01
+    monkeypatch.setattr("affine.loop.run_one", scripted)
+    envs = {"X": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="X", image="i", params={"timeout": 5}))}
+    store = EvidenceStore(tmp_path / "ev.jsonl")
+    chain = Chain(hotkey="V", list_miners=AsyncMock(),
+                  current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
+    king, chal = _miner(0, model="mk"), _miner(1, model="mc")
+    cfg = Config(dwell=10, evidence_path=str(tmp_path / "ev.jsonl"))
+    rows, _, abort = await _dwell(
+        chain, king, SimpleNamespace(model="mk", base_url="uk"),
+        chal, SimpleNamespace(model="mc", base_url="uc"),
+        [king, chal], [], envs, list(envs), store, cfg, Priors(),
+        np.random.default_rng(0), asyncio.Event(),
+    )
+    # After fix, picks 6+ produce both-False (productive failures) → rows accumulate.
+    # Before fix, abort at pick 4 (envs_quarantined) → no rows from later picks.
+    assert abort != "envs_quarantined", "env_fails must reset after single-side success"
+    assert len(rows) > 0, "dwell must reach productive picks after fix"
+
+
+@pytest.mark.asyncio
 async def test_dwell_intermittent_one_side_does_not_abort(tmp_path, monkeypatch):
     """Verify the streak resets on success: alternating None / pass on chal
     must NOT trigger chal_broken because the streak never reaches threshold."""

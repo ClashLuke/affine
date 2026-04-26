@@ -232,6 +232,14 @@ def test_compute_k_clamps_negative_reign():
     assert compute_k(-10**6, 3.0, 1.0, 7200) == 3.0
 
 
+def test_compute_k_handles_zero_halflife():
+    # config validates halflife>0, but bypassing config (tests, offline analysis)
+    # used to ZeroDivision. Collapse to k_final — the no-decay equivalent.
+    assert compute_k(0, 3.0, 1.0, 0) == 1.0
+    assert compute_k(1000, 3.0, 1.0, 0) == 1.0
+    assert compute_k(-5, 3.0, 1.0, -1) == 1.0
+
+
 def test_contrast_warns_on_non_pd_covariance(caplog):
     import logging
     D = 2 + 2 * 1
