@@ -659,26 +659,6 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
             if z > k:
                 log.info(f"dwell early-stop i={i+1}/{cfg.dwell}: z={z:+.2f} > k={k:.2f}")
                 return _out(DuelStatus.COMPLETED, fit)
-            # Hopelessness (plan §6): past midpoint with SE meaningfully shrunk
-            # (data-informed posterior), if z is so far below k that the
-            # upper-bound shift over remaining iters can't close the gap,
-            # abort to save GPU. The 0.1·remaining bound is empirical: across
-            # simulated regimes with realistic history (θ_diff ∈ {0.5..2.0},
-            # n≥80 trials), no trial with z_mid > 2 SE below k at midpoint
-            # reached z>k by full budget.
-            #
-            # Gates:
-            #  - dwell ≥ 20: empirical bound was calibrated at dwell=30; with
-            #    smaller budgets the linear extrapolation overstates how much
-            #    z can drift, risking premature abort on a recoverable chal.
-            #  - SE < 1.0: prior contrast SE = √2 ≈ 1.41; below 1.0 means
-            #    the fit is data-informed enough to trust the bound.
-            remaining = cfg.dwell - (i + 1)
-            if (cfg.dwell >= 20 and i + 1 >= cfg.dwell // 2
-                    and se < 1.0 and z + 0.1 * remaining < k):
-                log.info(f"dwell hopeless i={i+1}/{cfg.dwell}: z={z:+.2f} k={k:.2f} "
-                         f"se={se:.2f} remaining={remaining}; champion holds")
-                return _out(DuelStatus.COMPLETED, fit)
     return _out(DuelStatus.COMPLETED, fit)
 
 

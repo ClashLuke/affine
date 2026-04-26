@@ -913,9 +913,7 @@ def _env(err=False):
 
 @pytest.mark.asyncio
 async def test_dwell_appends_two_rows_per_env_pick(tmp_path, monkeypatch):
-    """Each fisher_env pick must append exactly two rows (king + challenger).
-    Asserts the pair-structure invariant — independent of when dwell terminates
-    (early-stop, hopelessness, or budget exhaustion)."""
+    """Each fisher_env pick must append exactly two rows (king + challenger)."""
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=42), publish_winner=AsyncMock())
@@ -933,9 +931,9 @@ async def test_dwell_appends_two_rows_per_env_pick(tmp_path, monkeypatch):
         np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
     )
     rows, fit, _abort = out.rows, out.fit, out.status
-    assert len(rows) > 0 and len(rows) % 2 == 0
+    assert len(rows) == 2 * cfg.dwell
     uids = [r.m for r in store.read()]
-    assert uids.count(0) == uids.count(1) == len(rows) // 2
+    assert uids.count(0) == cfg.dwell and uids.count(1) == cfg.dwell
     assert fit.n_m == 2
 
 
@@ -1040,48 +1038,6 @@ async def test_dwell_early_stops_when_z_exceeds_k(tmp_path, monkeypatch):
     )
     assert out.status is DuelStatus.COMPLETED
     assert out.rows_added < 2 * cfg.dwell, "early-stop must fire before budget exhausts"
-
-
-@pytest.mark.asyncio
-async def test_dwell_hopelessness_aborts_clearly_losing_chal(tmp_path, monkeypatch):
-    """Per plan §6: if past midpoint and z is so far below k that no remaining
-    iter can recover, abort. Saves GPU on losing duels.
-
-    Setup: chal always fails, king always passes — clearest possible losing
-    chal. Build enough historical evidence so SE drops below the gate (1.0)
-    before midpoint is reached."""
-    store = EvidenceStore(tmp_path / "ev.jsonl")
-    rng = np.random.default_rng(0)
-    # Pre-seed evidence so SE starts tight: 200 paired king-pass/chal-fail rows.
-    for c in range(100):
-        store.append(
-            Row(m=0, r="r", e="E", c=c, p=1, t=0, l=0.01, k="mk"),
-            Row(m=1, r="r", e="E", c=c, p=0, t=0, l=0.01, k="mc"),
-        )
-    rows = store.read()
-
-    chain = Chain(hotkey="V", list_miners=AsyncMock(),
-                  current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
-    king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=50, evidence_path=str(tmp_path / "ev.jsonl"),
-                 k_init=3.0, k_final=3.0, k_halflife=1)
-    async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
-        return slot.model == "mk", 0.01    # king passes, chal fails
-    monkeypatch.setattr("affine.loop.run_one", _run_one)
-    out = await dwell(
-        chain, king, SimpleNamespace(model="mk", base_url="uk"),
-        chal, SimpleNamespace(model="mc", base_url="uc"),
-        [king, chal], list(rows), _env(), ["E"], store, cfg, Priors(),
-        np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
-    )
-    assert out.status is DuelStatus.COMPLETED
-    assert out.rows_added < 2 * cfg.dwell, (
-        f"hopelessness should abort early; got {out.rows_added // 2} iters of {cfg.dwell}"
-    )
-    # Verify the abort is hopeless (z << k), not a dethrone
-    delta, se = out.fit.contrast(1, 0)
-    z = delta / se if se > 0 else 0
-    assert z < 0, f"chal was clearly losing; expected z<0, got z={z:+.2f}"
 
 
 @pytest.mark.asyncio
