@@ -124,15 +124,12 @@ def _apply_json_overrides(cfg: Config, raw: dict) -> Config:
             continue
         v = raw[f.name]
         # Reject silent narrowing: 120.9 → int → 120 is a footgun.
-        if f.type is int or f.type == "int":
-            if isinstance(v, bool) or not isinstance(v, int):
-                raise TypeError(f"config key {f.name!r}: expected int, got {type(v).__name__}={v!r}")
-        elif f.type is float or f.type == "float":
-            if isinstance(v, bool) or not isinstance(v, (int, float)):
-                raise TypeError(f"config key {f.name!r}: expected float, got {type(v).__name__}={v!r}")
-        elif f.type is str or f.type == "str":
-            if not isinstance(v, str):
-                raise TypeError(f"config key {f.name!r}: expected str, got {type(v).__name__}={v!r}")
+        if f.type == "int" and (isinstance(v, bool) or not isinstance(v, int)):
+            raise TypeError(f"config key {f.name!r}: expected int, got {type(v).__name__}={v!r}")
+        if f.type == "float" and (isinstance(v, bool) or not isinstance(v, (int, float))):
+            raise TypeError(f"config key {f.name!r}: expected float, got {type(v).__name__}={v!r}")
+        if f.type == "str" and not isinstance(v, str):
+            raise TypeError(f"config key {f.name!r}: expected str, got {type(v).__name__}={v!r}")
         overrides[f.name] = type(getattr(cfg, f.name))(v)
     return replace(cfg, environments=_apply_env_overrides(cfg.environments, raw), **overrides)
 

@@ -9,6 +9,9 @@ import logging
 import math
 import os
 from datetime import datetime, timezone
+from pathlib import Path
+
+from .evidence import atomic_append
 
 log = logging.getLogger(__name__)
 
@@ -33,10 +36,7 @@ def audit(**fields) -> None:
         return
     record = {"ts": datetime.now(timezone.utc).isoformat(), **fields}
     try:
-        line = json.dumps(_sanitize(record), allow_nan=False, default=str)
-        with open(path, "a") as f:
-            f.write(line + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        payload = (json.dumps(_sanitize(record), allow_nan=False, default=str) + "\n").encode()
+        atomic_append(Path(path), payload)
     except (OSError, TypeError, ValueError) as e:
         log.warning(f"audit log write failed: {e}")

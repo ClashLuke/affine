@@ -220,8 +220,7 @@ def fisher_env(fit: Fit, i: int, j: int, rng: np.random.Generator,
     log_info = log_f_i + log_f_j - np.logaddexp(log_f_i, log_f_j)
     log_info = np.where(np.isnan(log_info), -np.inf, log_info)
     if excluded:
-        for e in excluded:
-            log_info[e] = -np.inf
+        log_info[list(excluded)] = -np.inf
     if not np.any(np.isfinite(log_info)):
         choices = [e for e in range(fit.n_e) if e not in excluded]
         return int(rng.choice(choices))
