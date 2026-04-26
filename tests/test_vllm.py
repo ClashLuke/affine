@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from affine.vllm import LocalSlots, Slot, SlotProvisionFailed, TargonSlots, health_ping
+from affine.vllm import LocalSlots, Slot, SlotProvisionFailed, TargonSlots, health_ping, inference_ping
+
+HOTKEY = "test-hotkey"
 
 
 class _ClientFactory:
@@ -32,6 +34,9 @@ class _ClientFactory:
             return item
         return SimpleNamespace(status_code=200)
 
+    async def post(self, url, json=None, headers=None):
+        return await self.get(url)
+
 
 @dataclass
 class _FakeHttp:
@@ -40,6 +45,7 @@ class _FakeHttp:
     state_responses: list | None = None
     events_responses: list | None = None
     delete_resp: dict | None = None
+    list_resp: dict | Exception | None = None
 
     def __post_init__(self):
         self.posts: list[tuple[str, dict | None]] = []
@@ -61,6 +67,10 @@ class _FakeHttp:
             if isinstance(item, Exception):
                 raise item
             return item
+        if path == "/tha/v2/workloads":
+            if isinstance(self.list_resp, Exception):
+                raise self.list_resp
+            return self.list_resp or {"items": []}
         if not self.state_responses:
             return {"urls": []}
         item = self.state_responses.pop(0)
@@ -92,6 +102,53 @@ async def test_health_ping_exception_returns_false():
     factory = _ClientFactory([RuntimeError("boom")])
     with patch("affine.vllm.httpx.AsyncClient", factory):
         assert await health_ping("http://svc", timeout=1) is False
+
+
+@pytest.mark.asyncio
+async def test_inference_ping_success():
+    factory = _ClientFactory([SimpleNamespace(status_code=200)])
+    with patch("affine.vllm.httpx.AsyncClient", factory):
+        assert await inference_ping("http://svc", "m") is True
+
+
+@pytest.mark.asyncio
+async def test_inference_ping_gateway_5xx_is_false():
+    """Targon's failure mode: /models returns 200 but /chat/completions returns 502.
+    With retries enabled, three consecutive 502s confirm the slot is dead."""
+    factory = _ClientFactory([SimpleNamespace(status_code=502)] * 3)
+    with patch("affine.vllm.httpx.AsyncClient", factory), \
+         patch("affine.vllm.asyncio.sleep", AsyncMock()):
+        assert await inference_ping("http://svc", "m") is False
+
+
+@pytest.mark.asyncio
+async def test_inference_ping_exception_returns_false():
+    factory = _ClientFactory([RuntimeError("net down")] * 3)
+    with patch("affine.vllm.httpx.AsyncClient", factory), \
+         patch("affine.vllm.asyncio.sleep", AsyncMock()):
+        assert await inference_ping("http://svc", "m") is False
+
+
+@pytest.mark.asyncio
+async def test_inference_ping_429_then_success():
+    """Transient Targon throttle should not tear down a healthy slot."""
+    factory = _ClientFactory([
+        SimpleNamespace(status_code=429),
+        SimpleNamespace(status_code=200),
+    ])
+    with patch("affine.vllm.httpx.AsyncClient", factory), \
+         patch("affine.vllm.asyncio.sleep", AsyncMock()):
+        assert await inference_ping("http://svc", "m") is True
+
+
+@pytest.mark.asyncio
+async def test_inference_ping_4xx_no_retry():
+    """Non-throttle 4xx (e.g. bad model name) is fatal — no point retrying."""
+    factory = _ClientFactory([SimpleNamespace(status_code=400)])
+    with patch("affine.vllm.httpx.AsyncClient", factory), \
+         patch("affine.vllm.asyncio.sleep", AsyncMock()):
+        assert await inference_ping("http://svc", "m") is False
+    assert factory.calls == 1
 
 
 @pytest.mark.asyncio
@@ -142,7 +199,7 @@ async def test_targon_provision_registers_deploys_and_returns_slot_when_ready():
     with patch("affine.vllm._http", return_value=http), patch(
         "affine.vllm.httpx.AsyncClient", factory
     ), patch("affine.vllm.asyncio.sleep", AsyncMock()):
-        slot = await TargonSlots(SimpleNamespace()).provision("model/a", "rev1", timeout=10)
+        slot = await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).provision("model/a", "rev1", timeout=10)
 
     assert slot.slot_id == "wl-123"
     assert slot.base_url == "http://rental.host/v1"
@@ -162,7 +219,7 @@ async def test_targon_provision_missing_uid_raises_runtime_error():
     http = _FakeHttp(register_resp={})
     with patch("affine.vllm._http", return_value=http):
         with pytest.raises(RuntimeError, match="no uid"):
-            await TargonSlots(SimpleNamespace()).provision("model/a", "rev1", timeout=1)
+            await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).provision("model/a", "rev1", timeout=1)
 
 
 @pytest.mark.asyncio
@@ -175,7 +232,7 @@ async def test_targon_provision_crashloop_raises_slot_provision_failed_and_delet
         "affine.vllm.asyncio.sleep", AsyncMock()
     ):
         with pytest.raises(SlotProvisionFailed, match="crashlooping"):
-            await TargonSlots(SimpleNamespace()).provision("model/a", "rev1", timeout=10)
+            await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).provision("model/a", "rev1", timeout=10)
     assert http.deletes == ["/tha/v2/workloads/wl-123"]
 
 
@@ -186,7 +243,7 @@ async def test_targon_provision_timeout_raises_timeout_error_and_deletes():
         "affine.vllm.asyncio.sleep", AsyncMock()
     ), patch("affine.vllm.time.monotonic", side_effect=[0.0, 0.1, 999.0] + [999.0] * 20):
         with pytest.raises(TimeoutError, match="not ready"):
-            await TargonSlots(SimpleNamespace()).provision("model/a", "rev1", timeout=1)
+            await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).provision("model/a", "rev1", timeout=1)
     assert http.deletes == ["/tha/v2/workloads/wl-123"]
 
 
@@ -203,7 +260,7 @@ async def test_targon_provision_deploy_failure_deletes_workload():
     http._async_post = _boom
     with patch("affine.vllm._http", return_value=http):
         with pytest.raises(RuntimeError, match="deploy failed"):
-            await TargonSlots(SimpleNamespace()).provision("model/a", "rev1", timeout=1)
+            await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).provision("model/a", "rev1", timeout=1)
     assert http.deletes == ["/tha/v2/workloads/wl-123"]
 
 
@@ -233,7 +290,7 @@ async def test_wait_for_ready_detects_crashloop_after_models_returns_ok_first():
 async def test_targon_teardown_deletes_workload():
     http = _FakeHttp()
     with patch("affine.vllm._http", return_value=http):
-        await TargonSlots(SimpleNamespace()).teardown(
+        await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).teardown(
             Slot(model="m", revision="r", base_url="http://x/v1", slot_id="wl-abc")
         )
     assert http.deletes == ["/tha/v2/workloads/wl-abc"]
@@ -243,9 +300,52 @@ async def test_targon_teardown_deletes_workload():
 async def test_targon_teardown_ignores_local_slots():
     http = _FakeHttp()
     with patch("affine.vllm._http", return_value=http):
-        await TargonSlots(SimpleNamespace()).teardown(
+        await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).teardown(
             Slot(model="m", revision="r", base_url="http://x", slot_id="local-http://x")
         )
+    assert http.deletes == []
+
+
+@pytest.mark.asyncio
+async def test_targon_reconcile_scoped_to_hotkey_prefix():
+    """Two validators on a shared Targon API key must not delete each other's
+    workloads. Hotkey-derived prefix scopes reconcile."""
+    me = TargonSlots(SimpleNamespace(), hotkey="5HotkeyA")
+    them = TargonSlots(SimpleNamespace(), hotkey="5HotkeyB")
+    assert me._prefix != them._prefix
+    http = _FakeHttp(list_resp={"items": [
+        {"uid": "mine-1",  "name": f"{me._prefix}-aaa-1"},
+        {"uid": "mine-2",  "name": f"{me._prefix}-bbb-2"},
+        {"uid": "their-1", "name": f"{them._prefix}-ccc-3"},
+        {"uid": "old-af",  "name": "af-legacy-4"},
+    ]})
+    with patch("affine.vllm._http", return_value=http):
+        n = await me.reconcile()
+    assert n == 2
+    assert sorted(http.deletes) == ["/tha/v2/workloads/mine-1", "/tha/v2/workloads/mine-2"]
+
+
+def test_targon_prefix_targon_safe():
+    """Targon names: lowercase alphanumeric + hyphens only. Substrate hotkeys
+    contain uppercase, so the prefix must hash to lowercase hex."""
+    import re
+    s = TargonSlots(SimpleNamespace(), hotkey="5C4iP8XYZ")
+    assert re.fullmatch(r"af[0-9a-f]{6}", s._prefix), s._prefix
+
+
+@pytest.mark.asyncio
+async def test_targon_reconcile_noop_when_nothing_stale():
+    http = _FakeHttp(list_resp={"items": []})
+    with patch("affine.vllm._http", return_value=http):
+        assert await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).reconcile() == 0
+    assert http.deletes == []
+
+
+@pytest.mark.asyncio
+async def test_targon_reconcile_tolerates_list_failure():
+    http = _FakeHttp(list_resp=RuntimeError("API down"))
+    with patch("affine.vllm._http", return_value=http):
+        assert await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).reconcile() == 0
     assert http.deletes == []
 
 
@@ -258,6 +358,6 @@ async def test_targon_teardown_swallows_errors():
 
     http._async_delete = _boom
     with patch("affine.vllm._http", return_value=http):
-        await TargonSlots(SimpleNamespace()).teardown(
+        await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).teardown(
             Slot(model="m", revision="r", base_url="http://x/v1", slot_id="wl-xyz")
         )

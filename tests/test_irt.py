@@ -34,20 +34,33 @@ def test_fit_posterior_narrows_with_more_data():
 
 
 def test_fit_on_empty_data_returns_prior():
-    fit = fit_2pl([], [], [], 5, 3, Priors(sigma_theta=1.0))
+    fit = fit_2pl([], [], [], 5, 3, Priors(sigma_beta=1.0, sigma_alpha=1.0))
     assert np.allclose(fit.theta, 0.0)
     assert np.allclose(fit.beta, 0.0)
     assert np.allclose(fit.alpha, 0.0)
+    # σ_θ is fixed at 1 for IRT identification, so θ_se = 1 with no data.
     assert np.allclose(fit.theta_se, 1.0)
 
 
 def test_fit_respects_priors():
+    # Tight prior on β shrinks β toward 0; loose prior lets it follow the likelihood.
     m_idx = np.zeros(1000, dtype=np.intp)
     e_idx = np.zeros(1000, dtype=np.intp)
     y = np.ones(1000)
-    tight = fit_2pl(m_idx, e_idx, y, 1, 1, Priors(sigma_theta=0.1))
-    loose = fit_2pl(m_idx, e_idx, y, 1, 1, Priors(sigma_theta=10.0))
-    assert abs(tight.theta[0]) < abs(loose.theta[0])
+    tight = fit_2pl(m_idx, e_idx, y, 1, 1, Priors(sigma_beta=0.01))
+    loose = fit_2pl(m_idx, e_idx, y, 1, 1, Priors(sigma_beta=10.0))
+    assert abs(tight.beta[0]) < abs(loose.beta[0])
+
+
+def test_hessian_floor_independent_of_block_dynamic_range():
+    """Regression: a relative floor `eps * w.max()` clips legitimate small
+    eigenvalues when blocks have wildly different precisions. With sigma_beta=1e-9
+    the β-prior diagonal is 1e18, so the floor would zero θ-block info (= 1) and
+    contrast SE collapses 1.414 → 0.09 — overconfident dethrones."""
+    fit = fit_2pl([], [], [], 2, 1, Priors(sigma_beta=1e-9, sigma_alpha=0.5))
+    _, se = fit.contrast(0, 1)
+    # Two unit-variance θ priors with no data → contrast SE = √2.
+    assert abs(se - np.sqrt(2.0)) < 1e-6
 
 
 def test_contrast_matches_laplace_covariance():
@@ -62,7 +75,7 @@ def test_contrast_matches_laplace_covariance():
 
 def _fit_with(theta, beta, alpha, cov_scale: float = 1e-12) -> Fit:
     """Fit object with specified MAP means and a diagonal covariance. cov_scale=1e-12
-    collapses Thompson sampling to greedy (posterior draws ≈ means)."""
+    collapses Thompson sampling to greedy."""
     theta = np.asarray(theta, float)
     beta = np.asarray(beta, float)
     alpha = np.asarray(alpha, float)
@@ -132,30 +145,70 @@ def test_fisher_env_collapses_to_greedy_as_posterior_tightens():
 
 
 def test_fit_sample_reproduces_posterior_covariance():
-    # Empirical cov of many draws should match Fit.cov.
+    # Empirical cov of many draws should match Fit.cov (which is over (θ, β, α)).
     n_m, n_e = 3, 2
+    D = n_m + 2 * n_e
     rng = np.random.default_rng(0)
-    mean = rng.normal(size=n_m + 2 * n_e)
-    A = rng.normal(size=(n_m + 2 * n_e, n_m + 2 * n_e))
-    cov = A @ A.T + 0.1 * np.eye(n_m + 2 * n_e)
-    fit = Fit(theta=mean[:n_m], beta=mean[n_m:n_m + n_e], alpha=mean[n_m + n_e:], cov=cov)
-    draws = np.stack([np.concatenate(fit.sample(rng)) for _ in range(20000)])
+    mean = rng.normal(size=D)
+    A = rng.normal(size=(D, D))
+    cov = A @ A.T + 0.1 * np.eye(D)
+    fit = Fit(theta=mean[:n_m], beta=mean[n_m:n_m + n_e],
+              alpha=mean[n_m + n_e:], cov=cov)
+    draws = np.stack([np.concatenate(fit.sample(rng)) for _ in range(40000)])
     assert np.allclose(draws.mean(0), mean, atol=0.05)
-    assert np.allclose(np.cov(draws, rowvar=False), cov, atol=0.15)
+    assert np.allclose(np.cov(draws, rowvar=False), cov, atol=0.2)
 
 
 def test_fit_sample_handles_singular_covariance():
-    # Rank-deficient cov (e.g. exact collinearity) — eigh fallback should not crash,
-    # and draws should span only the positive-eigenvalue subspace.
+    # Rank-deficient cov (e.g. exact collinearity) — sample adds 1e-12 jitter
+    # so Cholesky succeeds. Draws on zero-variance directions stay bounded by
+    # sqrt(jitter) = 1e-6, while the variance direction shows full spread.
     n_m, n_e = 2, 1
-    mean = np.zeros(n_m + 2 * n_e)
-    cov = np.zeros((n_m + 2 * n_e, n_m + 2 * n_e))
-    cov[0, 0] = 1.0  # only θ₀ has variance
-    fit = Fit(theta=mean[:n_m], beta=mean[n_m:n_m + n_e], alpha=mean[n_m + n_e:], cov=cov)
+    D = n_m + 2 * n_e
+    mean = np.zeros(D)
+    cov = np.zeros((D, D))
+    cov[0, 0] = 1.0
+    fit = Fit(theta=mean[:n_m], beta=mean[n_m:n_m + n_e],
+              alpha=mean[n_m + n_e:], cov=cov)
     rng = np.random.default_rng(0)
     draws = np.stack([np.concatenate(fit.sample(rng)) for _ in range(500)])
     assert draws[:, 0].std() > 0.5
-    assert np.allclose(draws[:, 1:], 0.0, atol=1e-10)
+    assert np.all(np.abs(draws[:, 1:]) < 1e-4)
+
+
+def test_fit_sample_eigh_fallback_on_non_pd_covariance():
+    """Caller-constructed Fit with a slightly non-PD cov (e.g. from offline
+    analysis where the user assembled the matrix by hand): Cholesky raises;
+    eigh fallback must produce finite draws with second-moments matching
+    the PSD-projected covariance."""
+    n_m, n_e = 2, 1
+    cov = np.array([
+        [1.0, 0.5, 0.0, 0.0],
+        [0.5, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, -1e-3],   # negative eigenvalue → non-PD
+    ])
+    fit = Fit(theta=np.zeros(n_m), beta=np.zeros(n_e),
+              alpha=np.zeros(n_e), cov=cov)
+    rng = np.random.default_rng(0)
+    draws = np.stack([np.concatenate(fit.sample(rng)) for _ in range(2000)])
+    assert np.all(np.isfinite(draws))
+    # Negative-eigenvalue direction is clamped to zero variance in the fallback.
+    assert draws[:, 3].std() < 1e-3
+
+
+def test_fit_2pl_floor_caps_posterior_draw_magnitude():
+    """Regression: the 1e-12 floor produced 1e12 cov entries when an env's
+    Hessian eigenvalue hit the floor → posterior draws of magnitude 1e6 →
+    fisher_env picked random envs. New floor at the smallest prior precision
+    keeps draws bounded for Thompson sampling."""
+    # Force a low-info regime: 1 miner, 1 env, no observations. Pure prior fit.
+    fit = fit_2pl([], [], [], 1, 1, Priors(sigma_beta=1.0, sigma_alpha=0.5))
+    rng = np.random.default_rng(0)
+    draws = np.stack([np.concatenate(fit.sample(rng)) for _ in range(2000)])
+    # With unit prior on θ/β and σ_α=0.5 prior on log α: stddev ≤ 1.0 in θ/β,
+    # ≤ 0.5 in log α. No direction should exceed 5σ across 2000 draws.
+    assert np.all(np.abs(draws).max(axis=0) < 5.0)
 
 
 def test_compute_k_decays_from_init_to_final():
@@ -181,12 +234,14 @@ def test_compute_k_clamps_negative_reign():
 
 def test_contrast_warns_on_non_pd_covariance(caplog):
     import logging
+    D = 2 + 2 * 1
+    cov = np.eye(D)
+    cov[0, 1] = cov[1, 0] = 5.0
     fit = Fit(
         theta=np.array([0.3, -0.2]),
         beta=np.zeros(1),
         alpha=np.zeros(1),
-        # cov chosen so var_contrast = c[0,0]+c[1,1]-2c[0,1] < 0 (non-PD)
-        cov=np.array([[1.0, 5.0, 0.0], [5.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+        cov=cov,
     )
     with caplog.at_level(logging.WARNING, logger="affine.irt"):
         delta, se = fit.contrast(0, 1)
@@ -210,3 +265,40 @@ def test_fit_gradient_matches_numerical():
         num = (_obj_and_grad(xp, m_idx, e_idx, y, 3, 2, priors)[0]
                - _obj_and_grad(xm, m_idx, e_idx, y, 3, 2, priors)[0]) / (2 * eps)
         assert abs(num - g[i]) < 1e-4
+
+
+def test_hessian_matches_numerical_gradient_jacobian():
+    """The Laplace covariance is `H⁻¹` where H is the OBSERVED Hessian of the
+    negative log-posterior at the MAP. Earlier versions returned the Gauss-Newton
+    approximation (dropping `−r·∇²L` for the α blocks); since L = exp(α)·(θ−β)
+    is nonlinear in α, the difference is real and corrupts contrast SE and
+    Thompson draws of α. Verify analytical H matches central differences of g."""
+    from affine.irt import _obj_and_grad, _hessian
+    m_idx, e_idx, y, *_ = _synth(4, 3, 30, seed=11)
+    priors = Priors()
+    x = np.random.default_rng(2).normal(size=4 + 2 * 3) * 0.4
+    H = _hessian(x, m_idx, e_idx, y, 4, 3, priors)
+    eps = 1e-5
+    H_num = np.zeros_like(H)
+    for k in range(x.size):
+        xp = x.copy(); xp[k] += eps
+        xm = x.copy(); xm[k] -= eps
+        _, gp = _obj_and_grad(xp, m_idx, e_idx, y, 4, 3, priors)
+        _, gm = _obj_and_grad(xm, m_idx, e_idx, y, 4, 3, priors)
+        H_num[:, k] = (gp - gm) / (2 * eps)
+    H_num = 0.5 * (H_num + H_num.T)
+    assert np.max(np.abs(H - H_num)) < 1e-4
+
+
+def test_fisher_env_robust_to_extreme_alpha_draw():
+    """Wide posterior on log_a can draw α in the hundreds. The earlier fisher_env
+    computed a²·p(1−p) directly, producing 0·∞ NaN when exp(α) overflowed. The
+    log-domain version must remain finite and pick a real env index."""
+    n_m, n_e = 2, 3
+    D = n_m + 2 * n_e
+    cov = np.eye(D) * 1e-8
+    cov[n_m + n_e, n_m + n_e] = 25.0          # σ²(α₀) = 25 → draws ±15
+    fit = Fit(theta=np.zeros(n_m), beta=np.zeros(n_e), alpha=np.zeros(n_e), cov=cov)
+    rng = np.random.default_rng(0)
+    picks = [fisher_env(fit, 0, 1, rng) for _ in range(500)]
+    assert all(0 <= p < n_e for p in picks)

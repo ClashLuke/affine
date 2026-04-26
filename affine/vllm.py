@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -35,8 +36,43 @@ async def health_ping(base_url: str, timeout: float = 5) -> bool:
         return False
 
 
+async def inference_ping(base_url: str, model: str, timeout: float = 30,
+                         attempts: int = 3) -> bool:
+    """Confirm the slot can actually serve inference, not just `/models`.
+
+    Gateways (Targon, CDN proxies) often return 200 on `/models` while the
+    underlying workers 5xx on `/chat/completions`. A 1-token completion is the
+    cheapest unambiguous signal that the full inference path works.
+
+    Retries transient gateway errors (429, 5xx, network) before declaring the
+    slot dead — a single Targon throttle would otherwise tear down a healthy
+    cached king and force a full re-provision.
+    """
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1, "temperature": 0.0,
+    }
+    backoff = 1.0
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for i in range(attempts):
+            try:
+                r = await client.post(f"{base_url}/chat/completions", json=payload)
+                if r.status_code == 200: return True
+                if r.status_code < 500 and r.status_code != 429: return False
+            except Exception:
+                pass
+            if i < attempts - 1:
+                await asyncio.sleep(backoff); backoff *= 2
+    return False
+
+
 def _docker_host_ip() -> str | None:
-    """Docker bridge gateway IP, allowing containers to reach the host."""
+    """Docker bridge gateway IP — only meaningful when affine runs inside a container
+    that needs to reach a vLLM on the host. On the host itself, localhost works and
+    the bridge IP would break a 127.0.0.1-bound vLLM."""
+    if not os.path.exists("/.dockerenv"):
+        return None
     try:
         import docker as _docker
         gw = _docker.from_env().networks.get("bridge").attrs["IPAM"]["Config"][0]["Gateway"]
@@ -68,16 +104,27 @@ class LocalSlots:
             self._free.append(slot.base_url)
 
 
+class FixedSlots:
+    """Map (model, revision) → pre-existing vLLM URL. Local dev."""
+    def __init__(self, urls: dict[tuple[str, str], str]):
+        self._urls = urls
+
+    async def provision(self, model: str, revision: str) -> Slot:
+        url = self._urls.get((model, revision))
+        if url is None:
+            raise SlotProvisionFailed(f"no url for {model}@{revision}")
+        if not await health_ping(url):
+            raise SlotProvisionFailed(f"unhealthy: {url}")
+        return Slot(model=model, revision=revision, base_url=url, slot_id=f"fixed-{url}")
+
+    async def teardown(self, slot: Slot) -> None:
+        pass
+
+
 _VLLM_IMAGE = os.getenv("AFFINE_VLLM_IMAGE", "vllm/vllm-openai:latest-cu130-ubuntu2404")
 _RESOURCE = os.getenv("AFFINE_TARGON_RESOURCE", "h200-small")
 _WORKLOADS = "/tha/v2/workloads"
 _CRASH_EVENTS = {"POD_CRASHLOOP_BACKOFF", "POD_BACK_OFF", "POD_FAILED", "POD_OOM_KILLED"}
-
-
-def _slot_name(model: str, revision: str) -> str:
-    import hashlib
-    h = hashlib.sha256(f"{model}\0{revision}".encode()).hexdigest()[:8]
-    return f"af-{h}-{int(time.time()) % 1_000_000}"
 
 
 def _http():
@@ -144,11 +191,43 @@ async def _wait_for_ready(uid: str, timeout: int, interval: float = 5.0) -> str:
 
 
 class TargonSlots:
-    def __init__(self, config):
+    def __init__(self, config, hotkey: str):
         self._config = config
+        # Lowercase-hex prefix scopes reconcile() to our own workloads when
+        # multiple validators share a Targon API key. (Targon names are
+        # lowercase-alphanumeric-plus-hyphens only; Substrate hotkeys aren't.)
+        self._prefix = f"af{hashlib.sha256(hotkey.encode()).hexdigest()[:6]}"
 
-    async def provision(self, model: str, revision: str, timeout: int = 900) -> Slot:
-        name = _slot_name(model, revision)
+    async def reconcile(self) -> int:
+        """Delete stale workloads we own — matched by `{prefix}-` so a second
+        validator on the same API key is untouched. Defends against leaks from
+        prior SIGKILL/OOM/crash: the surviving validator cleans up its predecessor.
+        """
+        try:
+            resp = await _http()._async_get(_WORKLOADS)
+        except Exception as e:
+            log.warning(f"reconcile: list workloads failed: {e}")
+            return 0
+        items = resp.get("items", []) if isinstance(resp, dict) else resp
+        tag = f"{self._prefix}-"
+        victims = [w["uid"] for w in (items or [])
+                   if isinstance(w, dict) and str(w.get("name", "")).startswith(tag)
+                   and w.get("uid")]
+        if not victims:
+            log.info(f"reconcile: no stale workloads ({tag}*)")
+            return 0
+        log.warning(f"reconcile: tearing down {len(victims)} stale workloads ({tag}*): {victims}")
+        await asyncio.gather(*(self._delete(uid) for uid in victims))
+        return len(victims)
+
+    async def provision(self, model: str, revision: str, timeout: int | None = None) -> Slot:
+        if timeout is None:
+            timeout = int(getattr(self._config, "provision_timeout", 900))
+        # Concurrent provisions of the same artifact (king & challenger sharing a
+        # popular model) collide on artifact-hash + epoch-second. Mix in a process-
+        # local nanosecond counter so siblings within one epoch second still differ.
+        h = hashlib.sha256(f"{model}\0{revision}".encode()).hexdigest()[:8]
+        name = f"{self._prefix}-{h}-{time.monotonic_ns() % 1_000_000_000:09d}"
         args = [
             "--model", model,
             "--revision", revision,
@@ -188,7 +267,10 @@ class TargonSlots:
             log.info(f"targon rental uid={uid}; waiting for ready (timeout {timeout}s)")
             base_url = await _wait_for_ready(uid, timeout=timeout)
         except BaseException:
-            await self._delete(uid)
+            # Shield: if the outer task is being cancelled (SIGTERM during a
+            # parallel provision, _cancellable timeout), still finish deletion
+            # so the Targon rental doesn't leak. _delete has its own 30s budget.
+            await asyncio.shield(self._delete(uid))
             raise
         log.info(f"targon slot ready: uid={uid} base_url={base_url}")
         return Slot(model=model, revision=revision, base_url=base_url, slot_id=uid)

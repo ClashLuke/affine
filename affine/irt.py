@@ -1,7 +1,15 @@
-"""2PL IRT: MAP fit + Laplace posterior + active-sampling primitives.
+"""2PL IRT: joint MAP + Laplace posterior + active-sampling primitives.
 
 Model:   P(pass | m, e) = σ(a_e · (θ_m − β_e))
-Priors:  θ ~ N(0, σ_θ²),  β ~ N(0, σ_β²),  log a ~ N(0, σ_α²)
+Prior:   θ_m ~ N(0, 1)             (σ_θ pinned for IRT identification)
+         β_e ~ N(0, σ_β²)          σ_β fixed
+         log a_e ~ N(0, σ_α²)      σ_α fixed
+
+Fixed-σ rather than hierarchical Half-Cauchy: MAP estimation for hierarchical
+hyperpriors hits Neal's funnel (σ → 0 with β → 0 jointly diverges the joint
+density). On real evidence the hierarchical fit drove log σ_β to its numerical
+floor and α to ~10 (a ≈ 5e3, unphysical) with 37 negative Hessian eigenvalues.
+Fixed σ converges identically across random starts to ||grad|| < 1e-3.
 
 Pure math. No I/O, no chain, no slots.
 """
@@ -14,15 +22,20 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy.optimize import minimize
+from scipy.special import expit, log_expit
 
 log = logging.getLogger(__name__)
+
+# Cap |α| in posterior draws used for Fisher-info computation. exp(50) ≈ 5e21 is
+# already past any meaningful discrimination; without a cap, draws from a wide
+# posterior produce 0·∞ NaNs in the harmonic-mean info.
+_ALPHA_DRAW_CAP = 50.0
 
 
 @dataclass(frozen=True)
 class Priors:
-    sigma_theta: float = 1.0
-    sigma_beta: float = 1.0
-    sigma_alpha: float = 0.5
+    sigma_beta: float = 1.0    # std of β prior; ±2 logits at 1.96σ covers env-difficulty range
+    sigma_alpha: float = 0.5   # std of log α prior; a ∈ [0.38, 2.66] at 1.96σ — typical IRT discrimination
 
 
 @dataclass
@@ -30,7 +43,7 @@ class Fit:
     theta: np.ndarray
     beta: np.ndarray
     alpha: np.ndarray
-    cov: np.ndarray
+    cov: np.ndarray         # (n_m + 2 n_e)² joint Laplace posterior
 
     @property
     def a(self) -> np.ndarray: return np.exp(self.alpha)
@@ -45,7 +58,6 @@ class Fit:
         return np.sqrt(np.clip(np.diag(self.theta_cov), 0.0, None))
 
     def contrast(self, i: int, j: int) -> tuple[float, float]:
-        """Posterior mean and std of θ_i − θ_j from the joint Laplace covariance."""
         delta = float(self.theta[i] - self.theta[j])
         var = float(self.cov[i, i] + self.cov[j, j] - 2.0 * self.cov[i, j])
         if var < 0.0:
@@ -54,65 +66,84 @@ class Fit:
         return delta, math.sqrt(var)
 
     def sample(self, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """One draw from the joint Laplace posterior. Returns (θ, β, α) samples.
-        Cholesky when PD; eigh with non-negative clipping when only PSD (singular
-        Hessian, fit_2pl's pinv fallback)."""
+        """One draw from the joint Laplace posterior over (θ, β, α). fit_2pl floors
+        Hessian eigenvalues, so the cov is PSD modulo roundoff; Cholesky succeeds
+        on the jittered matrix in the common case. Caller-constructed Fits (tests,
+        offline analysis) can be non-PD — fall back to symmetric eigh sqrt, which
+        accepts any symmetric matrix (negative eigenvalues clamped to 0)."""
         mean = np.concatenate([self.theta, self.beta, self.alpha])
+        cov = self.cov + 1e-12 * np.eye(mean.size)
         try:
-            L = np.linalg.cholesky(self.cov)
+            L = np.linalg.cholesky(cov)
         except np.linalg.LinAlgError:
-            w, V = np.linalg.eigh(self.cov)
+            w, V = np.linalg.eigh(0.5 * (cov + cov.T))
             L = V * np.sqrt(np.clip(w, 0.0, None))
         x = mean + L @ rng.standard_normal(mean.size)
         n_m, n_e = self.n_m, self.n_e
         return x[:n_m], x[n_m:n_m + n_e], x[n_m + n_e:]
 
 
+def _unpack(x, n_m, n_e):
+    return x[:n_m], x[n_m:n_m + n_e], x[n_m + n_e:n_m + 2 * n_e]
+
+
+def _data_terms(theta, beta, alpha, m_idx, e_idx, y):
+    """Per-sample Bernoulli + linear-predictor terms shared by obj/grad/Hessian."""
+    a = np.exp(alpha[e_idx])
+    L = a * (theta[m_idx] - beta[e_idx])
+    p = expit(L)
+    return a, L, p, p * (1.0 - p), y - p   # a, L, p, w=p(1-p), r=y-p
+
+
 def _obj_and_grad(x, m_idx, e_idx, y, n_m, n_e, priors):
-    theta, beta, alpha = x[:n_m], x[n_m:n_m + n_e], x[n_m + n_e:]
-    a_e = np.exp(alpha[e_idx])
-    L = a_e * (theta[m_idx] - beta[e_idx])
+    theta, beta, alpha = _unpack(x, n_m, n_e)
+    a, L, _, _, r = _data_terms(theta, beta, alpha, m_idx, e_idx, y)
+    inv_sb2 = 1.0 / (priors.sigma_beta ** 2)
+    inv_sa2 = 1.0 / (priors.sigma_alpha ** 2)
 
-    ll = (y * L - np.logaddexp(0.0, L)).sum()
-    lp = -0.5 * ((theta / priors.sigma_theta) ** 2).sum() \
-         - 0.5 * ((beta / priors.sigma_beta) ** 2).sum() \
-         - 0.5 * ((alpha / priors.sigma_alpha) ** 2).sum()
+    # log p(y|θ,β,α) = y·L − softplus(L), via stable log_expit so |L|≫1 is safe.
+    ll = (y * L + log_expit(-L)).sum()
+    lp = -0.5 * ((theta * theta).sum()
+                 + (beta * beta).sum() * inv_sb2
+                 + (alpha * alpha).sum() * inv_sa2)
 
-    r = y - 1.0 / (1.0 + np.exp(-L))
-    g_theta = np.zeros(n_m); np.add.at(g_theta, m_idx, a_e * r)
-    g_beta = np.zeros(n_e);  np.add.at(g_beta,  e_idx, -a_e * r)
-    g_alpha = np.zeros(n_e); np.add.at(g_alpha, e_idx, L * r)
-    g_theta -= theta / priors.sigma_theta ** 2
-    g_beta  -= beta  / priors.sigma_beta ** 2
-    g_alpha -= alpha / priors.sigma_alpha ** 2
+    g_theta = np.zeros(n_m); np.add.at(g_theta, m_idx,  a * r); g_theta -= theta
+    g_beta  = np.zeros(n_e); np.add.at(g_beta,  e_idx, -a * r); g_beta  -= beta * inv_sb2
+    g_alpha = np.zeros(n_e); np.add.at(g_alpha, e_idx,  L * r); g_alpha -= alpha * inv_sa2
 
     return -(ll + lp), -np.concatenate([g_theta, g_beta, g_alpha])
 
 
-def _hessian(x, m_idx, e_idx, n_m, n_e, priors):
-    theta, beta, alpha = x[:n_m], x[n_m:n_m + n_e], x[n_m + n_e:]
-    a_e = np.exp(alpha[e_idx])
-    L = a_e * (theta[m_idx] - beta[e_idx])
-    w = 1.0 / (2.0 + np.exp(L) + np.exp(-L))
+def _hessian(x, m_idx, e_idx, y, n_m, n_e, priors):
+    """Observed Hessian of the negative log posterior at x.
+
+    NLL = −y·L + softplus(L), L = exp(α)·(θ−β). Each block follows
+    H_pq = w·L_p·L_q − r·L_pq, with (w, r) = (p(1−p), y−p). Only α-blocks see
+    nonzero L_pq: L_θα = a, L_βα = −a, L_αα = L.
+    """
+    theta, beta, alpha = _unpack(x, n_m, n_e)
+    a, L, _, w, r = _data_terms(theta, beta, alpha, m_idx, e_idx, y)
+    inv_sb2 = 1.0 / (priors.sigma_beta ** 2)
+    inv_sa2 = 1.0 / (priors.sigma_alpha ** 2)
+
+    h_tt = w * a * a                         # H_θθ = w·a² (L_θθ = 0)
+    h_tb = -h_tt                             # H_θβ = -w·a²
+    h_ta = w * a * L - r * a                 # H_θα = w·a·L − r·a
+    h_ba = -h_ta                             # H_βα = -w·a·L + r·a
+    h_aa = w * L * L - r * L                 # H_αα = w·L² − r·L
 
     N = n_m + 2 * n_e
     H = np.zeros((N, N))
-    b, c = e_idx + n_m, e_idx + n_m + n_e
-    w_a2, w_aL, w_L2 = w * a_e ** 2, w * a_e * L, w * L ** 2
+    bj, cj = e_idx + n_m, e_idx + n_m + n_e
+    np.add.at(H, (m_idx, m_idx), h_tt)
+    np.add.at(H, (bj, bj),       h_tt)
+    np.add.at(H, (cj, cj),       h_aa)
+    np.add.at(H, (m_idx, bj),    h_tb); np.add.at(H, (bj, m_idx), h_tb)
+    np.add.at(H, (m_idx, cj),    h_ta); np.add.at(H, (cj, m_idx), h_ta)
+    np.add.at(H, (bj, cj),       h_ba); np.add.at(H, (cj, bj),    h_ba)
 
-    np.add.at(H, (m_idx, m_idx), w_a2)
-    np.add.at(H, (b, b), w_a2)
-    np.add.at(H, (c, c), w_L2)
-    np.add.at(H, (m_idx, b), -w_a2); np.add.at(H, (b, m_idx), -w_a2)
-    np.add.at(H, (m_idx, c),  w_aL); np.add.at(H, (c, m_idx),  w_aL)
-    np.add.at(H, (b, c), -w_aL);     np.add.at(H, (c, b), -w_aL)
-
-    prior = np.concatenate([
-        np.full(n_m, priors.sigma_theta ** -2),
-        np.full(n_e, priors.sigma_beta ** -2),
-        np.full(n_e, priors.sigma_alpha ** -2),
-    ])
-    H[np.arange(N), np.arange(N)] += prior
+    diag = np.concatenate([np.ones(n_m), np.full(n_e, inv_sb2), np.full(n_e, inv_sa2)])
+    H[np.arange(N), np.arange(N)] += diag
     return H
 
 
@@ -120,40 +151,78 @@ def fit_2pl(m_idx, e_idx, y, n_m, n_e, priors: Priors = Priors()) -> Fit:
     m_idx = np.asarray(m_idx, dtype=np.intp)
     e_idx = np.asarray(e_idx, dtype=np.intp)
     y = np.asarray(y, dtype=np.float64)
-    x = np.zeros(n_m + 2 * n_e)
+    N = n_m + 2 * n_e
+    x = np.zeros(N)
     if m_idx.size:
-        x = minimize(_obj_and_grad, x, args=(m_idx, e_idx, y, n_m, n_e, priors),
-                     method="L-BFGS-B", jac=True).x
-    H = _hessian(x, m_idx, e_idx, n_m, n_e, priors)
-    try:
-        cov = np.linalg.inv(H)
-    except np.linalg.LinAlgError:
-        log.warning("fit_2pl: Hessian singular; falling back to pseudoinverse")
-        cov = np.linalg.pinv(H)
+        # Bound α to keep exp(α) finite. L-BFGS-B's line search can excursively
+        # evaluate at α ≈ 700+ where exp overflows, producing NaN obj/grad and
+        # killing the fit. ±100 is ~200σ under priors.sigma_alpha=0.5 — far past
+        # any realistic discrimination, but safe under any sigma_alpha < 50.
+        bounds = [(None, None)] * (n_m + n_e) + [(-100.0, 100.0)] * n_e
+        result = minimize(_obj_and_grad, x, args=(m_idx, e_idx, y, n_m, n_e, priors),
+                          method="L-BFGS-B", jac=True, bounds=bounds,
+                          options={"ftol": 1e-12, "gtol": 1e-7, "maxiter": 10000})
+        if not np.all(np.isfinite(result.x)) or not np.isfinite(result.fun):
+            log.warning("fit_2pl: optimizer produced non-finite state (status=%s); using prior", result.message)
+        else:
+            x = result.x
+            if not result.success:
+                log.warning("fit_2pl: optimizer did not converge: %s", result.message)
+    H = _hessian(x, m_idx, e_idx, y, n_m, n_e, priors)
+    H = 0.5 * (H + H.T)
+    w, V = np.linalg.eigh(H)
+    # Floor at the smallest prior precision. At a true MAP the joint H eigenvalue
+    # is ≥ min(prior precisions) along every eigenvector — the prior alone provides
+    # that much curvature on its diagonal, and data only adds PSD terms. Anything
+    # below means the optimizer failed to converge or the observed Hessian (r·L_pq
+    # term) is locally indefinite at a saddle. Flooring is correct in both cases:
+    # the true cov is bounded above by 1/floor.  A relative floor (eps·w.max())
+    # would clip legitimate curvature when block scales differ — e.g. tiny σ_β
+    # blows up 1/σ_β² and zeros the θ block.
+    floor = min(1.0, 1.0 / priors.sigma_beta ** 2, 1.0 / priors.sigma_alpha ** 2)
+    if (w < floor).any():
+        log.warning("fit_2pl: %d Hessian eigenvalues < expected floor %.3f (min=%.3e) — MAP suspect",
+                    int((w < floor).sum()), floor, float(w.min()))
+    w = np.maximum(w, floor)
+    cov = (V / w) @ V.T
     return Fit(theta=x[:n_m].copy(), beta=x[n_m:n_m + n_e].copy(),
                alpha=x[n_m + n_e:].copy(), cov=cov)
 
 
-def fisher_env(fit: Fit, i: int, j: int, rng: np.random.Generator) -> int:
+def fisher_env(fit: Fit, i: int, j: int, rng: np.random.Generator,
+               excluded: frozenset[int] = frozenset()) -> int:
     """Thompson-sampled env for the contrast θ_i − θ_j.
 
     Draw (θ, β, α) once from the joint Laplace posterior and pick the env that
-    maximizes harmonic-mean Fisher info on that draw. Harmonic mean is the
-    contrast-variance objective for one Bernoulli per player: var(θ_i − θ_j)
-    = 1/f_i + 1/f_j, so info = f_i·f_j / (f_i + f_j).
+    maximizes harmonic-mean Fisher info on that draw: var(θ_i − θ_j) = 1/f_i + 1/f_j,
+    so info = f_i f_j / (f_i + f_j).
 
-    Thompson sampling makes exploration emerge from posterior uncertainty —
-    envs with few samples have wide draws and get selected whenever the draw
-    beats the incumbent. No ε, no UCB constant, no schedule. Collapses to
-    greedy as the posterior tightens.
+    Exploration emerges from posterior uncertainty — envs with few samples have
+    wide draws and get selected whenever the draw beats the incumbent. No ε, no
+    UCB constant. Collapses to greedy as the posterior tightens.
+
+    `excluded`: env indices quarantined by the caller (e.g., repeated infra
+    failures). They are never picked. Raises ValueError if all envs are excluded.
     """
+    if len(excluded) >= fit.n_e:
+        raise ValueError("all envs excluded")
     theta, beta, alpha = fit.sample(rng)
+    alpha = np.clip(alpha, -_ALPHA_DRAW_CAP, _ALPHA_DRAW_CAP)
     a = np.exp(alpha)
-    p_i = 1.0 / (1.0 + np.exp(-a * (theta[i] - beta)))
-    p_j = 1.0 / (1.0 + np.exp(-a * (theta[j] - beta)))
-    f_i = a * a * p_i * (1.0 - p_i)
-    f_j = a * a * p_j * (1.0 - p_j)
-    return int(np.argmax((f_i * f_j) / (f_i + f_j + 1e-18)))
+    L_i = a * (theta[i] - beta)
+    L_j = a * (theta[j] - beta)
+    # log f(L) = 2α + log p + log(1−p) = 2α − softplus(L) − softplus(−L); stable for |L|≫1.
+    log_f_i = 2.0 * alpha + log_expit(L_i) + log_expit(-L_i)
+    log_f_j = 2.0 * alpha + log_expit(L_j) + log_expit(-L_j)
+    log_info = log_f_i + log_f_j - np.logaddexp(log_f_i, log_f_j)
+    log_info = np.where(np.isnan(log_info), -np.inf, log_info)
+    if excluded:
+        for e in excluded:
+            log_info[e] = -np.inf
+    if not np.any(np.isfinite(log_info)):
+        choices = [e for e in range(fit.n_e) if e not in excluded]
+        return int(rng.choice(choices))
+    return int(np.argmax(log_info))
 
 
 def compute_k(reign_blocks: int, k_init: float, k_final: float, halflife: int) -> float:
@@ -162,5 +231,3 @@ def compute_k(reign_blocks: int, k_init: float, k_final: float, halflife: int) -
     reconnect/fork reporting an older block) clamps to 0 so k never exceeds k_init."""
     reign_blocks = max(reign_blocks, 0)
     return k_final + (k_init - k_final) * math.exp(-math.log(2) * reign_blocks / halflife)
-
-

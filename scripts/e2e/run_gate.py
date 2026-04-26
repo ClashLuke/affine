@@ -12,16 +12,19 @@ from pathlib import Path
 
 
 RE_CONNECTED = re.compile(r"subtensor connected:")
-RE_QUEUE = re.compile(r"challenger queue:\s*(\d+)\s+candidates")
-RE_HEALTH = re.compile(r"slot healthy after")
+RE_MINERS = re.compile(r"miners:\s*(\d+)\s+registered")
+RE_HEALTH = re.compile(r"slot ready after")
 RE_WEIGHTS = re.compile(r"weights set:\s*uid")
 RE_WEIGHTS_UID = re.compile(r"weights set:\s*uid\s+(\d+)")
-RE_DUEL_SUMMARY = re.compile(r"duel:\s*(CHALLENGER_WINS|CHAMPION_HOLDS)")
-RE_ENV_SUMMARY = re.compile(r"\b(affine:ded|affine:abd|game|distill):\s*W=")
-RE_DECISIVE = re.compile(r"W=(\d+)\s+L=(\d+)")
-RE_DETHRONE = re.compile(r"DETHRONED:")
+RE_DUEL_START = re.compile(r"duel:\s*king\s+uid(\d+)\s+vs\s+chal\s+uid(\d+)")
+RE_VERDICT = re.compile(r"verdict:\s*Δθ̂=")
+RE_ENV_LOADED = re.compile(r"env:\s*(affine:ded|affine:abd|game|distill)\b")
+RE_DETHRONE = re.compile(r"DETHRONE:\s*uid\s+(\d+)\s*(?:→|->)")
 RE_QUEUE_EXHAUSTED = re.compile(r"queue exhausted")
-RE_SHUTDOWN = re.compile(r"shutting down")
+RE_SHUTDOWN = re.compile(r"^shutdown$|\bshutdown\s*$")
+
+
+EXPECTED_ENVS = {"affine:ded", "affine:abd", "game", "distill"}
 
 
 @dataclass(frozen=True)
@@ -95,19 +98,19 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
         raise RuntimeError("failed to capture process stdout")
 
     connected = False
-    queue_seen = False
+    miners_seen = False
     weights_set = False
-    duel_seen = False
+    duel_start_seen = False
+    verdict_seen = False
     shutdown_seen = False
     health_count = 0
-    envs_seen: set[str] = set()
+    envs_loaded: set[str] = set()
     requested_shutdown = False
     deadline = start + stage.timeout
 
     # dethrone-stage tracking
     dethrone_seen = False
-    duel_count = 0
-    decisive_seen = False
+    duel_start_count = 0
     queue_exhausted_seen = False
     weights_uids: list[int] = []
 
@@ -138,9 +141,9 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
 
             if RE_CONNECTED.search(line):
                 connected = True
-            m_queue = RE_QUEUE.search(line)
-            if m_queue and int(m_queue.group(1)) > 0:
-                queue_seen = True
+            m_miners = RE_MINERS.search(line)
+            if m_miners and int(m_miners.group(1)) > 0:
+                miners_seen = True
             if RE_HEALTH.search(line):
                 health_count += 1
             if RE_WEIGHTS.search(line):
@@ -148,15 +151,14 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
             m_wuid = RE_WEIGHTS_UID.search(line)
             if m_wuid:
                 weights_uids.append(int(m_wuid.group(1)))
-            if RE_DUEL_SUMMARY.search(line):
-                duel_seen = True
-                duel_count += 1
-            m_env = RE_ENV_SUMMARY.search(line)
+            if RE_DUEL_START.search(line):
+                duel_start_seen = True
+                duel_start_count += 1
+            if RE_VERDICT.search(line):
+                verdict_seen = True
+            m_env = RE_ENV_LOADED.search(line)
             if m_env:
-                envs_seen.add(m_env.group(1))
-            m_dec = RE_DECISIVE.search(line)
-            if m_dec and (int(m_dec.group(1)) > 0 or int(m_dec.group(2)) > 0):
-                decisive_seen = True
+                envs_loaded.add(m_env.group(1))
             if RE_DETHRONE.search(line):
                 dethrone_seen = True
             if RE_QUEUE_EXHAUSTED.search(line):
@@ -167,23 +169,24 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
             if stage.name == "dethrone":
                 should_stop = (
                     connected
-                    and queue_seen
+                    and miners_seen
                     and health_count >= 2
                     and dethrone_seen
-                    and duel_count >= 2
-                    and decisive_seen
+                    and duel_start_count >= 2
+                    and verdict_seen
                     and len(weights_uids) >= 2
                     and queue_exhausted_seen
-                    and envs_seen == {"affine:ded", "affine:abd", "game", "distill"}
+                    and envs_loaded == EXPECTED_ENVS
                 )
             else:
                 should_stop = (
                     connected
-                    and queue_seen
+                    and miners_seen
                     and health_count >= 2
                     and weights_set
-                    and duel_seen
-                    and envs_seen == {"affine:ded", "affine:abd", "game", "distill"}
+                    and duel_start_seen
+                    and verdict_seen
+                    and envs_loaded == EXPECTED_ENVS
                 )
             if should_stop and not requested_shutdown:
                 proc.send_signal(signal.SIGINT)
@@ -196,7 +199,7 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
 
     base_ok = (
         connected
-        and queue_seen
+        and miners_seen
         and health_count >= 2
         and shutdown_seen
         and proc.returncode in (0, -2, 130)
@@ -205,35 +208,36 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
         stage_ok = (
             base_ok
             and dethrone_seen
-            and duel_count >= 2
-            and decisive_seen
+            and duel_start_count >= 2
+            and verdict_seen
             and len(weights_uids) >= 2
             and weights_uids[0] != weights_uids[-1]
             and queue_exhausted_seen
-            and envs_seen == {"affine:ded", "affine:abd", "game", "distill"}
+            and envs_loaded == EXPECTED_ENVS
         )
     else:
         stage_ok = (
             base_ok
             and weights_set
-            and duel_seen
-            and envs_seen == {"affine:ded", "affine:abd", "game", "distill"}
+            and duel_start_seen
+            and verdict_seen
+            and envs_loaded == EXPECTED_ENVS
         )
 
     result = {
         "stage": stage.name,
         "config_spec": stage.spec,
         "connected": connected,
-        "queue_seen": queue_seen,
+        "miners_seen": miners_seen,
         "health_count": health_count,
         "weights_set": weights_set,
         "weights_uids": weights_uids,
-        "duel_seen": duel_seen,
-        "duel_count": duel_count,
-        "decisive_seen": decisive_seen,
+        "duel_start_seen": duel_start_seen,
+        "duel_start_count": duel_start_count,
+        "verdict_seen": verdict_seen,
         "dethrone_seen": dethrone_seen,
         "queue_exhausted_seen": queue_exhausted_seen,
-        "envs_seen": sorted(envs_seen),
+        "envs_loaded": sorted(envs_loaded),
         "shutdown_seen": shutdown_seen,
         "exit_code": proc.returncode,
         "duration_seconds": round(time.time() - start, 2),
