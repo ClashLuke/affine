@@ -106,7 +106,7 @@ def test_skiplist_durable_write_fsyncs(tmp_path, monkeypatch):
     """Regression: a SIGKILL between buffered f.write and OS flush would lose
     the durable mark, re-admitting a known-crashloop model on restart and burning
     Targon credits. The write must be a single os.write + fsync, mirroring
-    EvidenceStore.append_pair."""
+    EvidenceStore.append."""
     import os
     s = Skiplist(path=tmp_path / "skip.jsonl")
     written = []
@@ -118,6 +118,37 @@ def test_skiplist_durable_write_fsyncs(tmp_path, monkeypatch):
     assert len(written) == 1
     assert written[0] == (json.dumps({"model": "m", "revision": "r"}) + "\n").encode()
     assert len(fsynced) == 1
+
+
+def test_skiplist_durable_short_write_truncates_to_pre_size(tmp_path, monkeypatch):
+    """Regression: a short os.write would leave a partial line on disk and raise.
+    Without ftruncate-back, the next load parses the orphan as JSON, drops it as
+    malformed, and the artifact is silently re-admitted. Mirror EvidenceStore.append's
+    pre-size + truncate-on-failure pattern."""
+    import os
+    s = Skiplist(path=tmp_path / "skip.jsonl")
+    s.add("first", "rev-a", durable=True)
+    pre_size = (tmp_path / "skip.jsonl").stat().st_size
+
+    real_write, real_open = os.write, os.open
+    target_fd = [None]
+    def open_capture(path, *a, **kw):
+        fd = real_open(path, *a, **kw)
+        if str(path) == str(s.path): target_fd[0] = fd
+        return fd
+    def short_write(fd, data):
+        if fd == target_fd[0]:
+            return real_write(fd, data[: len(data) // 2])
+        return real_write(fd, data)
+    monkeypatch.setattr(os, "open", open_capture)
+    monkeypatch.setattr(os, "write", short_write)
+    with pytest.raises(OSError, match="short write"):
+        s.add("second", "rev-b", durable=True)
+    # File rolled back: no partial line, the still-good line stays loadable.
+    assert (tmp_path / "skip.jsonl").stat().st_size == pre_size
+    reload = Skiplist(path=tmp_path / "skip.jsonl")
+    assert _miner(0, model="first", rev="rev-a") in reload
+    assert _miner(0, model="second", rev="rev-b") not in reload
 
 
 def test_skiplist_durable_disk_failure_does_not_mutate_memory(tmp_path):
@@ -419,7 +450,7 @@ async def test_provision_pair_fail_fast_cancels_sibling(tmp_path):
     orig_h, orig_i = loop_mod.health_ping, loop_mod.inference_ping
     loop_mod.health_ping = _ok; loop_mod.inference_ping = _ok
     try:
-        k_slot, c_slot, king_failed = await _provision_pair(_Slots(),
+        k_slot, c_slot, king_failed, _ = await _provision_pair(_Slots(),
                                                _miner(0, model="king"), _miner(1, model="chal"),
                                                skip, stop)
     finally:
@@ -459,7 +490,7 @@ async def test_provision_pair_chal_fails_first_does_not_blame_king(tmp_path):
     orig_h, orig_i = loop_mod.health_ping, loop_mod.inference_ping
     loop_mod.health_ping = _ok; loop_mod.inference_ping = _ok
     try:
-        k_slot, c_slot, king_failed = await _provision_pair(_Slots(),
+        k_slot, c_slot, king_failed, _ = await _provision_pair(_Slots(),
                                                             _miner(0, model="king"), _miner(1, model="chal"),
                                                             skip, stop)
     finally:
@@ -499,7 +530,7 @@ async def test_provision_pair_king_succeeds_chal_fails_retains_king(tmp_path):
     orig_h, orig_i = loop_mod.health_ping, loop_mod.inference_ping
     loop_mod.health_ping = _ok; loop_mod.inference_ping = _ok
     try:
-        k_slot, c_slot, king_failed = await _provision_pair(_Slots(),
+        k_slot, c_slot, king_failed, _ = await _provision_pair(_Slots(),
                                                              _miner(0, model="king"), _miner(1, model="chal"),
                                                              skip, stop)
     finally:
@@ -533,7 +564,7 @@ async def test_provision_pair_king_fails_chal_succeeds_tears_chal(tmp_path):
     orig_h, orig_i = loop_mod.health_ping, loop_mod.inference_ping
     loop_mod.health_ping = _ok; loop_mod.inference_ping = _ok
     try:
-        k_slot, c_slot, king_failed = await _provision_pair(_Slots(),
+        k_slot, c_slot, king_failed, _ = await _provision_pair(_Slots(),
                                                              _miner(0, model="king"), _miner(1, model="chal"),
                                                              skip, stop)
     finally:
@@ -800,6 +831,29 @@ async def test_elect_falls_back_to_baseline_when_fit_is_degenerate(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_elect_falls_back_when_rows_are_uninformative():
+    """Regression: rows can be non-empty while every env is all-pass or all-fail.
+    _fit drops uninformative envs from the fit data, so the optimizer runs on
+    zero observations, theta stays at the prior mean (all zeros), and argmax
+    deterministically picks index 0 — the lowest-uid miner — regardless of who
+    actually got the (uniform) outcomes. Behaviorally identical to cold start;
+    must route to the baseline/lowest-block fallback."""
+    from affine.loop import _elect
+    miners = [
+        Miner(uid=5, hotkey="h5", model="off-A", revision="r5", block=200),
+        Miner(uid=2, hotkey="h2", model="off-B", revision="r2", block=100),
+        Miner(uid=9, hotkey="h9", model="off-C", revision="r9", block=300),
+    ]
+    # All-pass on every env — no env has both 0 and 1 outcomes, so _fit drops
+    # all of them and the fit collapses to the prior. Without the fallback,
+    # argmax(theta) would publish uid 5 (index 0).
+    rows = [Row(m=m.uid, r=m.revision, e=e, c=c, p=1, t=0, l=0.1, i=c)
+            for m in miners for e in ("E", "F") for c in range(5)]
+    uid, rev = await _elect(rows, miners, ["E", "F"], Priors())
+    assert (uid, rev) == (2, "r2")   # lowest-block fallback, not argmax(theta)=uid 5
+
+
+@pytest.mark.asyncio
 async def test_elect_uses_argmax_theta_when_fit_is_healthy():
     """Sanity: with non-degenerate evidence, election still picks argmax(θ̂)."""
     from affine.loop import _elect
@@ -990,11 +1044,12 @@ async def test_dwell_quarantines_broken_env_keeps_sampling_healthy(tmp_path):
 
 @pytest.mark.asyncio
 async def test_dwell_aborts_with_chal_broken_when_only_chal_returns_none(tmp_path, monkeypatch):
-    """Regression: when chal is bad (every sample → None) but king is fine, env_fails
-    used to count toward quarantine. After ENV_FAIL_QUARANTINE × n_envs picks, the
-    dwell aborts with no rows and the broken chal stays on the queue. Now it
-    attributes failure to chal-side and aborts after SIDE_FAIL_THRESHOLD picks
-    across diverse envs."""
+    """When chal is bad (every sample → None) but king is fine, dwell attributes
+    failure to chal-side and aborts after SIDE_FAIL_THRESHOLD picks across diverse
+    envs. The king's outcomes from those picks ARE real evidence about the king's
+    ability and must be preserved — the IRT fit is per-miner global, not
+    matched-pair, so unpaired king rows tighten king's posterior. Discarding
+    them on every transient chal blip would silently lose signal."""
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
         return (True if slot.model == "mk" else None), 0.01
     monkeypatch.setattr("affine.loop.run_one", split)
@@ -1012,7 +1067,9 @@ async def test_dwell_aborts_with_chal_broken_when_only_chal_returns_none(tmp_pat
         np.random.default_rng(0), asyncio.Event(),
     )
     assert abort == "chal_broken"
-    assert rows == []   # no successful pairs
+    assert all(r.m == king.uid for r in rows)
+    assert len(rows) >= 1
+    assert rows == store.read()
 
 
 @pytest.mark.asyncio
@@ -1037,7 +1094,12 @@ async def test_dwell_aborts_with_king_broken_when_only_king_returns_none(tmp_pat
         np.random.default_rng(0), asyncio.Event(),
     )
     assert abort == "king_broken"
-    assert rows == []
+    # Mirror of the chal_broken case: chal's real outcomes are preserved,
+    # though the verdict path will skip on king_broken so they don't dethrone
+    # the (slot-broken, artifact-healthy) king.
+    assert all(r.m == chal.uid for r in rows)
+    assert len(rows) >= 1
+    assert rows == store.read()
 
 
 @pytest.mark.asyncio
@@ -1364,6 +1426,54 @@ async def test_publish_failure_retries_next_iteration(tmp_path, monkeypatch):
     # Failures 1+2 must not update last_published_uid; call 3 re-publishes the
     # same uid. All three calls target the cold-start champion (uid 0).
     assert calls == [0, 0, 0]
+
+
+@pytest.mark.asyncio
+async def test_dry_run_does_not_persist_last_published_uid(tmp_path, monkeypatch):
+    """AFFINE_DRY_RUN=1 means set_weights returns True without mutating chain
+    state. Persisting last_published_uid in dry-run would silently break a
+    later real run sharing the same reign-state file: _maybe_publish would
+    short-circuit on uid==last_published_uid and skip the actual on-chain write."""
+    from affine.loop import _load_reign_state, run
+
+    monkeypatch.setenv("AFFINE_DRY_RUN", "1")
+    monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
+        "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
+    }))
+    monkeypatch.setattr("affine.loop.health_ping", AsyncMock(return_value=True))
+    monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
+    async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
+        return slot.model == "mk", 0.01
+    monkeypatch.setattr("affine.loop.run_one", _run_one)
+    monkeypatch.setattr("affine.loop.asyncio.sleep", AsyncMock())
+
+    miners = [_miner(0, model="mk"), _miner(1, model="mc")]
+    blocks = iter(range(10**6))
+    published: list[int] = []
+
+    async def list_miners(): return miners
+    async def current_block(): return next(blocks)
+    async def publish(uid, hk=""):
+        published.append(uid)
+        if len(published) >= 1:
+            import os, signal
+            os.kill(os.getpid(), signal.SIGINT)
+        return True   # dry-run mode in chain.set_weights also returns True
+
+    chain = Chain(hotkey="V", list_miners=list_miners,
+                  current_block=current_block, publish_winner=publish)
+    cfg = Config(dwell=2, evidence_path=str(tmp_path / "ev.jsonl"),
+                 environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
+                 k_init=10.0, k_final=10.0, k_halflife=1)
+
+    await run(cfg, chain, slots=_FakeSlots())
+    assert published, "dry-run should still call publish (audit/log path)"
+
+    _, _, last_published = _load_reign_state(tmp_path / "reign-V.json")
+    assert last_published is None, (
+        "dry-run must NOT persist last_published_uid — a subsequent real run "
+        "would short-circuit and silently skip the on-chain write"
+    )
 
 
 @pytest.mark.asyncio

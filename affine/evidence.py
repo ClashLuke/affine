@@ -21,17 +21,6 @@ def _reject_constant(c: str):
     raise ValueError(f"non-finite JSON constant: {c}")
 
 
-def _rollback(fd: int, pre: int) -> None:
-    """Truncate back to pre-write size and durably commit the truncation. Without
-    the trailing fsync, a power loss after rollback can journal-replay the partial
-    bytes the rollback was meant to discard."""
-    os.ftruncate(fd, pre)
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-
-
 @dataclass(frozen=True)
 class Row:
     m: int    # miner uid
@@ -79,52 +68,40 @@ class EvidenceStore:
         rebuild regresses the counter and the same SHA-derived seed gets reused."""
         return self._counters.get((m, r, e), 0)
 
-    def append(self, row: Row) -> None:
-        with self.path.open("a") as f:
-            f.write(json.dumps(asdict(row)) + "\n")
-        k = (row.m, row.r, row.e)
-        self._counters[k] = max(self._counters.get(k, 0), row.c + 1)
-
-    def append_pair(self, row_a: Row, row_b: Row) -> None:
-        """Single-syscall + fsync dual append for matched-task duels. Three failure
-        modes the asymmetry would create:
-          - Buffered text I/O can split a 'one-call' write into multiple
-            syscalls. Use os.write directly to keep it one.
-          - The kernel may return success on write() while only some bytes have
-            reached disk. fsync forces durability *before* we update in-memory
-            counters; without it, a power loss after the first row hits disk
-            but the second doesn't would leave the king's c persisted while
-            the challenger's c is replayed from a fresh-looking counter on
-            restart — same SHA seed, deterministic-replay invariant violated.
-          - ENOSPC mid-write can leave row A complete on disk and row B partial.
-            On restart that's heal_torn_tail-completed, row A loads, row B is
-            dropped — and the challenger's counter regresses while the king's
-            advances. Truncate back to pre-write size on any short/failed write
-            so the pair stays atomic at the file level.
+    def append(self, *rows: Row) -> None:
+        """Atomic append for one or more rows. Both/all rows land in one write+fsync,
+        or none do. Three failure modes the file-level atomicity defends against:
+          - Buffered text I/O can split a single write into multiple syscalls.
+            os.write keeps it atomic.
+          - Kernel may return success on write() before bytes reach disk. fsync
+            forces durability *before* in-memory counters advance — without it,
+            a power loss after partial flush leaves disk inconsistent with the
+            counter rebuild on restart, replaying the same SHA seed.
+          - ENOSPC mid-write of a duel pair (king + challenger) can leave row A
+            complete and row B partial. heal_torn_tail would then load A and
+            drop B, regressing the challenger's counter while king's advanced.
+            ftruncate-on-failure keeps the batch atomic at the file level.
         """
-        payload = (json.dumps(asdict(row_a)) + "\n"
-                   + json.dumps(asdict(row_b)) + "\n").encode()
+        if not rows:
+            return
+        payload = "".join(json.dumps(asdict(r)) + "\n" for r in rows).encode()
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
             pre = os.fstat(fd).st_size
             try:
                 n = os.write(fd, payload)
             except OSError:
-                _rollback(fd, pre); raise
+                os.ftruncate(fd, pre); raise
             if n != len(payload):
-                _rollback(fd, pre)
+                os.ftruncate(fd, pre)
                 raise OSError(f"short write: {n}/{len(payload)} bytes; truncated to {pre}")
             try:
                 os.fsync(fd)
             except OSError:
-                # fsync failure (ENOSPC late, EIO, hardware fault) means durability
-                # is unconfirmed. Roll back so counters and disk stay consistent;
-                # the rollback itself must be durable, otherwise journal replay
-                # after power loss can resurrect the partial pair we just truncated.
-                _rollback(fd, pre); raise
+                os.ftruncate(fd, pre); raise
         finally:
             os.close(fd)
-        for row in (row_a, row_b):
+        for row in rows:
             k = (row.m, row.r, row.e)
             self._counters[k] = max(self._counters.get(k, 0), row.c + 1)
 

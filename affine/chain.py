@@ -21,15 +21,9 @@ def _truthy_env(name: str) -> bool:
     return v not in ("", "0", "false", "no", "off")
 
 
-async def _invoke(sub, name, args, kwargs):
-    result = getattr(sub, name)(*args, **kwargs)
-    return await result if inspect.isawaitable(result) else result
-
-
-# Methods safe to auto-retry on transport errors. Excludes mutations: a transport
-# error after a successful broadcast would silently double-submit on reconnect,
-# either burning weight quota (duplicate set_weights) or corrupting state. Writes
-# must own their own retry loop with idempotency (nonce / version_key).
+# Auto-retried on transport errors. Mutations are excluded: a transport drop after
+# a successful broadcast would silently double-submit on reconnect, burning weight
+# quota. Writes own their own retry loop with idempotency (nonce / version_key).
 _RETRY_SAFE = frozenset({
     "metagraph",
     "get_all_revealed_commitments", "get_all_commitments",
@@ -86,14 +80,16 @@ class Subtensor:
     def __getattr__(self, name: str):
         async def _call(*args, **kwargs):
             sub = await self._ensure()
+            async def _invoke(s):
+                r = getattr(s, name)(*args, **kwargs)
+                return await r if inspect.isawaitable(r) else r
             try:
-                return await _invoke(sub, name, args, kwargs)
+                return await _invoke(sub)
             except Exception as e:
                 if name not in _RETRY_SAFE:
                     raise
                 log.warning(f"subtensor.{name} failed ({type(e).__name__}: {e}); reconnecting")
-                sub = await self._reconnect(stale=sub)
-                return await _invoke(sub, name, args, kwargs)
+                return await _invoke(await self._reconnect(stale=sub))
         return _call
 
     async def close(self):

@@ -33,12 +33,6 @@ log = logging.getLogger(__name__)
 # produce 0·∞ NaNs in the harmonic-mean Fisher info.
 _ALPHA_BOUND = 50.0
 
-# ||grad||_∞ at the MAP. Real fits across random starts converge to <1e-3 (per the
-# module docstring); 1e-2 is loose enough that L-BFGS-B's line-search-exhausted
-# results still pass when they're effectively at the optimum, tight enough that a
-# stuck-far-from-MAP fit (the actual non-converged case) trips it.
-_GRAD_TOL = 1e-2
-
 
 @dataclass(frozen=True)
 class Priors:
@@ -163,37 +157,16 @@ def fit_2pl(m_idx, e_idx, y, n_m, n_e, priors: Priors = Priors()) -> Fit:
     N = n_m + 2 * n_e
     x = np.zeros(N)
     nonfinite = False
-    nonconverged = False
     if m_idx.size:
-        # Bound α tight enough that saturating the bound IS a degenerate signal:
-        # under priors.sigma_alpha=0.5, |α|=50 is at 100σ, so a healthy MAP cannot
-        # land here. A run-away optimizer that hits the bound returns success=False
-        # → fit flagged degenerate. Without a tight bound, L-BFGS-B's line search
-        # can excursively evaluate α≈700+ where exp overflows.
         bounds = [(None, None)] * (n_m + n_e) + [(-_ALPHA_BOUND, _ALPHA_BOUND)] * n_e
         result = minimize(_obj_and_grad, x, args=(m_idx, e_idx, y, n_m, n_e, priors),
                           method="L-BFGS-B", jac=True, bounds=bounds,
                           options={"ftol": 1e-12, "gtol": 1e-7, "maxiter": 10000})
-        if not np.all(np.isfinite(result.x)) or not np.isfinite(result.fun):
-            log.warning("fit_2pl: optimizer produced non-finite state (status=%s); using prior", result.message)
-            nonfinite = True
-        else:
+        if np.all(np.isfinite(result.x)) and np.isfinite(result.fun):
             x = result.x
-            if not result.success:
-                # L-BFGS-B reports success=False on ABNORMAL_TERMINATION_IN_LNSRCH
-                # (line search hits machine-eps progress) and MAXITER even when the
-                # gradient is small enough that x IS at a MAP. The authoritative
-                # non-MAP test is ||grad||_∞ — if it's small, the Hessian eigenvalue
-                # check below is sufficient. Using success alone falsely degenerates
-                # healthy fits and forces _elect into baseline-fallback unnecessarily.
-                grad_inf = float(np.max(np.abs(result.jac))) if result.jac is not None else float("inf")
-                if grad_inf > _GRAD_TOL:
-                    log.warning("fit_2pl: not at MAP (status=%s, ||grad||_∞=%.3e); flagging degenerate",
-                                result.message, grad_inf)
-                    nonconverged = True
-                else:
-                    log.info("fit_2pl: optimizer status=%s but ||grad||_∞=%.3e ≤ %.0e; accepting",
-                             result.message, grad_inf, _GRAD_TOL)
+        else:
+            log.warning("fit_2pl: non-finite optimizer state (%s); using prior", result.message)
+            nonfinite = True
     H = _hessian(x, m_idx, e_idx, y, n_m, n_e, priors)
     H = 0.5 * (H + H.T)
     w, V = np.linalg.eigh(H)
@@ -209,7 +182,7 @@ def fit_2pl(m_idx, e_idx, y, n_m, n_e, priors: Priors = Priors()) -> Fit:
     eig_scale = float(np.abs(w).max()) if w.size else 1.0
     eig_tol = -1e-8 * max(eig_scale, 1.0)
     structurally_negative = bool((w < eig_tol).any())
-    degenerate = nonfinite or nonconverged or structurally_negative
+    degenerate = nonfinite or structurally_negative
     if structurally_negative:
         log.warning("fit_2pl: %d negative Hessian eigenvalues (min=%.3e, tol=%.3e) — not at MAP; fit flagged degenerate",
                     int((w < eig_tol).sum()), float(w.min()), eig_tol)

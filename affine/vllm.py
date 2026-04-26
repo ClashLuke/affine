@@ -224,11 +224,8 @@ class TargonSlots:
     async def provision(self, model: str, revision: str, timeout: int | None = None) -> Slot:
         if timeout is None:
             timeout = int(getattr(self._config, "provision_timeout", 900))
-        # Concurrent provisions of the same artifact (king & challenger sharing a
-        # popular model) collide on artifact-hash alone. monotonic_ns wraps every
-        # second after the modulo so two siblings dispatched within 1ns of each
-        # other could still collide; a 32-bit random suffix is collision-free for
-        # the few-per-loop call rate and avoids the wall-clock dependence entirely.
+        # Random suffix so concurrent provisions of the same (model, revision) —
+        # king & challenger sharing a popular base — don't collide on the workload name.
         h = hashlib.sha256(f"{model}\0{revision}".encode()).hexdigest()[:8]
         name = f"{self._prefix}-{h}-{secrets.token_hex(4)}"
         args = [

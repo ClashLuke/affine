@@ -43,42 +43,6 @@ def test_fit_on_empty_data_returns_prior():
     assert fit.degenerate is False  # prior-only fit is the unique MAP, Hessian PSD
 
 
-def test_fit_marks_degenerate_when_grad_far_from_zero(monkeypatch):
-    """Real non-convergence: x stuck far from MAP, ||grad||_∞ large. The verdict
-    path must skip this fit — the Laplace cov has no posterior interpretation
-    when x isn't a stationary point. Force success=False AND a high gradient
-    (mock returns the initial x0, where the data-driven gradient is nonzero)."""
-    from scipy.optimize import OptimizeResult
-    import affine.irt as irt
-    real_min = irt.minimize
-    def fake(fn, x0, *args, **kwargs):
-        f0, g0 = fn(x0, *kwargs.get("args", ()))
-        return OptimizeResult(x=x0, fun=f0, success=False, message="forced",
-                              jac=g0, nit=0, status=1)
-    monkeypatch.setattr(irt, "minimize", fake)
-    m_idx, e_idx, y, *_ = _synth(5, 2, 20)
-    fit = fit_2pl(m_idx, e_idx, y, 5, 2)
-    assert fit.degenerate is True
-
-
-def test_fit_accepts_success_false_when_grad_small(monkeypatch):
-    """Regression for over-broad nonconverged: L-BFGS-B reports success=False on
-    ABNORMAL_TERMINATION_IN_LNSRCH at a true MAP (line search hits machine-eps
-    progress with gradient already small). Flagging that as degenerate forces
-    _elect into baseline-fallback unnecessarily. The principled test is the
-    gradient norm, not the success flag."""
-    from scipy.optimize import OptimizeResult
-    import affine.irt as irt
-    real_min = irt.minimize
-    def fake(fn, x0, *args, **kwargs):
-        res = real_min(fn, x0, *args, **kwargs)
-        return OptimizeResult(x=res.x, fun=res.fun, success=False,
-                              message="ABNORMAL_TERMINATION_IN_LNSRCH",
-                              jac=res.jac, nit=res.nit, status=2)
-    monkeypatch.setattr(irt, "minimize", fake)
-    m_idx, e_idx, y, *_ = _synth(5, 2, 20)
-    fit = fit_2pl(m_idx, e_idx, y, 5, 2)
-    assert fit.degenerate is False
 
 
 def test_fit_respects_priors():

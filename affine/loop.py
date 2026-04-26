@@ -29,7 +29,7 @@ import logging
 import os
 import secrets
 import signal
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -93,18 +93,26 @@ class Skiplist:
                 return
             # Write disk first, mutate memory only on success — otherwise a failed
             # write leaves in-memory marked as skipped while disk knows nothing,
-            # so a restart silently re-admits the artifact. Single os.write +
-            # fsync: a SIGKILL between buffered write and OS flush would lose the
-            # mark and re-admit a known-crashloop model on restart.
+            # so a restart silently re-admits the artifact. Truncate back to the
+            # pre-write size on any failure so a partial line never lands on disk
+            # to be re-parsed (and dropped) on the next load.
             if self.path:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 payload = (json.dumps({"model": model, "revision": revision}) + "\n").encode()
                 fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
                 try:
-                    n = os.write(fd, payload)
+                    pre = os.fstat(fd).st_size
+                    try:
+                        n = os.write(fd, payload)
+                    except OSError:
+                        os.ftruncate(fd, pre); raise
                     if n != len(payload):
-                        raise OSError(f"short write: {n}/{len(payload)} bytes")
-                    os.fsync(fd)
+                        os.ftruncate(fd, pre)
+                        raise OSError(f"short write: {n}/{len(payload)} bytes; truncated to {pre}")
+                    try:
+                        os.fsync(fd)
+                    except OSError:
+                        os.ftruncate(fd, pre); raise
                 finally:
                     os.close(fd)
             self._durable.add(key)
@@ -184,9 +192,8 @@ def _rows_per_env(rows: list[Row], challenger_uid: int, king_uid: int) -> dict[s
 
 async def _load_envs(cfg: Config) -> dict[str, tuple]:
     # Dedupe by image: load each unique image once, share across envs that use it.
-    # params are call-time (passed in /call body), so they may differ; env_vars and
-    # mem_limit are container-init, so they MUST match — silently sharing a wrapper
-    # under conflicting container config would deploy one env's settings to both.
+    # params are call-time (passed in /call body) so each env carries its own;
+    # env_vars and mem_limit are container-init so they MUST match across shared envs.
     loaded: dict[str, tuple] = {}
     out = {}
     try:
@@ -198,8 +205,7 @@ async def _load_envs(cfg: Config) -> dict[str, tuple]:
                         f"env '{spec.name}' shares image {spec.image} with '{shared_spec.name}' "
                         f"but env_vars/mem_limit differ — split into distinct images or align config"
                     )
-                merged_params = {**shared_spec.params, **spec.params}
-                out[spec.name] = (wrapper, replace(spec, params=merged_params))
+                out[spec.name] = (wrapper, spec)
                 log.info(f"env: {spec.name} ({spec.image}) [shared]")
                 continue
             env_vars = dict(spec.env_vars)
@@ -366,16 +372,16 @@ def _apply_skip(skip: Skiplist, miner: Miner, status: str, *,
 async def _provision_pair(slots, king: Miner, chal: Miner, skip: Skiplist,
                           stop: asyncio.Event,
                           quarantined_chals: set[tuple[int, str]] | None = None,
-                          ) -> tuple[Slot | None, Slot | None, bool]:
+                          ) -> tuple[Slot | None, Slot | None, bool, str | None]:
     """Provision king and challenger concurrently with fail-fast cancellation.
 
-    Returns `(king_slot, chal_slot, king_attempt_failed)`. `king_attempt_failed`
-    is True iff king's provision ran to completion with a non-ok status; False
-    if king was cancelled because chal failed first. The caller uses this to
-    distinguish king-fail backoff from "advance to next challenger": without
-    the bool, a chal with a persistent provision error trips the king-fail
-    backoff path which `attempted.discard`s the chal — and the next iteration
-    re-picks the same broken chal, looping forever.
+    Returns `(king_slot, chal_slot, king_attempt_failed, chal_status)`.
+    `king_attempt_failed` is True iff king's provision ran to completion with a
+    non-ok status; False if king was cancelled because chal failed first. The
+    caller uses this to distinguish king-fail backoff from "advance to next
+    challenger". `chal_status` is the chal task's status string (`"ok"`,
+    `"transient"`, `"crashloop"`, ...) or None if chal was cancelled — the
+    caller uses it to decide whether to mark the chal as attempted.
 
     If the first finisher fails to produce a slot, the duel is dead — cancel the
     sibling immediately rather than wait out a 15-min Targon provision we'll
@@ -450,7 +456,7 @@ async def _provision_pair(slots, king: Miner, chal: Miner, skip: Skiplist,
 
     if outer_cancelled:
         for s in slots_got:
-            if s is not None: await _safe_teardown(slots, s, "pair-cancelled")
+            if s is not None: await asyncio.shield(_safe_teardown(slots, s, "pair-cancelled"))
         raise asyncio.CancelledError()
     # king_attempt_failed: king's task ran to completion AND failed to produce a
     # slot. False when king was cancelled (fail_fast by chal, or outer cancel).
@@ -461,19 +467,22 @@ async def _provision_pair(slots, king: Miner, chal: Miner, skip: Skiplist,
         king_attempt_failed = True   # unexpected exception leaking out of _provision
     else:
         king_attempt_failed = slots_got[0] is None
+    chal_status: str | None = None
+    if not (t_c.cancelled() or t_c.exception() is not None):
+        _, chal_status = t_c.result()
     if fail_fast:
         for s in slots_got:
-            if s is not None: await _safe_teardown(slots, s, "pair-fail-fast")
-        return None, None, king_attempt_failed
+            if s is not None: await asyncio.shield(_safe_teardown(slots, s, "pair-fail-fast"))
+        return None, None, king_attempt_failed, chal_status
     king_slot, chal_slot = slots_got
     # If only the chal failed, retain the king slot — it's the long-lived 600GB
     # download we cache across duels. Tearing it down on every chal-only failure
     # would force a fresh download per challenger when a churn of bad chals arrives.
     # Caller's `if chal_slot is None: continue` handles the chal absence.
     if king_slot is None and chal_slot is not None:
-        await _safe_teardown(slots, chal_slot, "king-failed-chal-orphan")
-        return None, None, king_attempt_failed
-    return king_slot, chal_slot, king_attempt_failed
+        await asyncio.shield(_safe_teardown(slots, chal_slot, "king-failed-chal-orphan"))
+        return None, None, king_attempt_failed, chal_status
+    return king_slot, chal_slot, king_attempt_failed, chal_status
 
 
 def _seed(uid: int, rev: str, env: str, c: int, salt: str = "") -> int:
@@ -615,15 +624,24 @@ async def _dwell(chain: Chain, king: Miner, king_slot: Slot, challenger: Miner,
                 log.warning(f"quarantine env '{env_name}' after {env_fails[e]} consecutive fails (king={king.uid} chal={challenger.uid})")
             continue
         # Single-side None below: env produced a valid result for at least one side,
-        # so env_fails resets — env is fine, the issue is side-attributable.
+        # so env_fails resets — env is fine, the issue is side-attributable. The
+        # surviving side's outcome IS real evidence about that miner — append it
+        # even if the partner failed. The IRT fit is global per-miner, not
+        # matched-pair, so unpaired rows tighten the surviving side's posterior
+        # and preserve signal that would otherwise be discarded on every
+        # transient infra blip on the other side.
         if k_row is None:
             king_streak += 1; chal_streak = 0; env_fails[e] = 0
+            store.append(c_row); rows.append(c_row)
+            fit = _fit(rows, miners, env_names, priors)
             if king_streak >= SIDE_FAIL_THRESHOLD:
                 log.warning(f"king uid{king.uid} appears broken: {king_streak} consecutive king-only Nones across envs; aborting dwell")
                 return rows, fit, "king_broken"
             continue
         if c_row is None:
             chal_streak += 1; king_streak = 0; env_fails[e] = 0
+            store.append(k_row); rows.append(k_row)
+            fit = _fit(rows, miners, env_names, priors)
             if chal_streak >= SIDE_FAIL_THRESHOLD:
                 log.warning(f"chal uid{challenger.uid} appears broken: {chal_streak} consecutive chal-only Nones across envs; aborting dwell")
                 return rows, fit, "chal_broken"
@@ -631,7 +649,7 @@ async def _dwell(chain: Chain, king: Miner, king_slot: Slot, challenger: Miner,
         chal_streak = king_streak = 0
         env_fails[e] = 0
 
-        store.append_pair(k_row, c_row)
+        store.append(k_row, c_row)
         rows.extend((k_row, c_row))
         fit = _fit(rows, miners, env_names, priors)
     return rows, fit, None
@@ -654,6 +672,19 @@ async def _elect(rows: list[Row], miners: list[Miner], env_names: list[str],
         return m.uid, m.revision
     if not rows:
         return _seat_baseline_or_lowest("cold start")
+    # Uninformative rows (every env all-pass or all-fail) get fully dropped by
+    # _fit's filter — the fit then runs on zero observations, theta stays at
+    # the prior mean (zero), argmax breaks ties to index 0. Functionally
+    # identical to cold start, so route there. Must mirror _fit's `r.e in env_names`
+    # filter: a retired-env row with both outcomes would otherwise pass this check
+    # while _fit drops it, leaving the fit with zero active observations.
+    active = set(env_names)
+    outcomes: dict[str, set[int]] = {}
+    for r in rows:
+        if r.e in active:
+            outcomes.setdefault(r.e, set()).add(r.p)
+    if not any(len(s) >= 2 for s in outcomes.values()):
+        return _seat_baseline_or_lowest("elect: no informative env (all-pass or all-fail)")
     fit = _fit(rows, miners, env_names, priors)
     if fit.degenerate:
         # argmax(θ̂) on a non-MAP fit can publish a winner from a fabricated
@@ -730,14 +761,10 @@ async def run(cfg: Config, chain: Chain, slots=None):
             path=skiplist_path,
         )
         priors = Priors(cfg.sigma_beta, cfg.sigma_alpha)
-        # Mix hotkey with OS entropy so fisher_env's Thompson stream isn't replayed
-        # across restarts. Hotkey-only seeding makes a tight crashloop deterministically
-        # repick the same env that triggered the crash; entropy breaks the cycle and
-        # gives fresh exploration on each restart. Determinism we DO need (per-sample
-        # task seeds, counter monotonicity) is anchored elsewhere — in evidence rows
-        # and SHA(uid||rev||env||counter) — and is unaffected by rng-state choice.
-        hotkey_int = int.from_bytes(chain.hotkey.encode()[:8].ljust(8, b"\0"), "big")
-        rng = np.random.default_rng(np.random.SeedSequence([hotkey_int, secrets.randbits(64)]))
+        # OS entropy so a crashloop doesn't deterministically replay the env that
+        # triggered the crash. Per-sample task determinism is anchored on the
+        # SHA(uid||rev||env||counter) seed elsewhere, not on this rng.
+        rng = np.random.default_rng(secrets.randbits(64))
 
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -777,13 +804,20 @@ async def run(cfg: Config, chain: Chain, slots=None):
             nonlocal last_published_uid
             if uid == last_published_uid:
                 return
-            audit(type="weight_intent", netuid=cfg.netuid, winner_uid=uid,
-                  dry_run=_truthy_env("AFFINE_DRY_RUN"))
+            dry = _truthy_env("AFFINE_DRY_RUN")
+            audit(type="weight_intent", netuid=cfg.netuid, winner_uid=uid, dry_run=dry)
             # Don't wrap in _cancellable: cancelling between broadcast and inclusion-wait
             # leaves the extrinsic on-chain but `last_published_uid` unset, so a restart
             # double-submits and burns weight quota. set_weights owns its own retry budget.
             if not await chain.publish_winner(uid, expected_hotkey):
                 log.warning(f"publish_winner uid={uid} failed; will retry next iteration")
+                return
+            # In dry-run, set_weights returns True without mutating chain state. Persisting
+            # last_published_uid here would make a later real run think it had already
+            # published — silently skipping the on-chain write. Mutate memory so within
+            # the dry session we don't re-log; never persist.
+            if dry:
+                last_published_uid = uid
                 return
             # Persist BEFORE mutating in-memory: if _save raises (disk full, etc.) and we'd
             # already advanced last_published_uid in memory, we'd skip the next idempotent
@@ -834,7 +868,6 @@ async def run(cfg: Config, chain: Chain, slots=None):
                     await _cancellable(asyncio.sleep(120), stop); continue
 
                 challenger = queue[0]
-                attempted.add((challenger.uid, challenger.revision))
 
                 if king_slot is not None and not (
                     await _cancellable(health_ping(king_slot.base_url), stop)
@@ -845,9 +878,10 @@ async def run(cfg: Config, chain: Chain, slots=None):
 
                 chal_slot: Slot | None = None
                 king_attempt_failed = False
+                chal_status: str | None = None
                 try:
                     if king_slot is None:
-                        king_slot, chal_slot, king_attempt_failed = await _provision_pair(
+                        king_slot, chal_slot, king_attempt_failed, chal_status = await _provision_pair(
                             slots, king, challenger, skip, stop, quarantined_chals)
                     else:
                         chal_slot, chal_status = await _provision(slots, challenger, stop)
@@ -858,20 +892,25 @@ async def run(cfg: Config, chain: Chain, slots=None):
                     if stop.is_set(): break
                     raise
 
+                # Mark attempted only when chal genuinely got tested. Skiplisted/quarantined
+                # chals get filtered out of the queue anyway; transient failures need to retry
+                # next iter rather than be locked out for the rest of the reign.
+                if chal_slot is not None:
+                    attempted.add((challenger.uid, challenger.revision))
+
                 if king_slot is None:
                     if chal_slot is not None: await _safe_teardown(slots, chal_slot, "king-failed")
                     if king_attempt_failed:
                         log.warning(f"king uid {king.uid} provision failed; sleeping {king_fail_backoff}s before retry")
                         # Keep champion identity — only reset if chain says they're gone. Don't
                         # re-elect just because Targon hiccuped, or we burn `set_weights` quota.
-                        attempted.discard((challenger.uid, challenger.revision))
                         await _cancellable(asyncio.sleep(king_fail_backoff), stop)
                         king_fail_backoff = min(king_fail_backoff * 2, 600)
                     else:
-                        # King was cancelled by chal-fail-fast. Chal already got
-                        # session-skipped via _apply_skip; advance to next challenger
-                        # without backing off the king.
-                        log.info(f"chal uid {challenger.uid} provision failed; advancing without king backoff")
+                        # King was cancelled by chal-fail-fast. Chal got skiplisted via
+                        # _apply_skip if status was definitive; transient leaves chal in
+                        # the queue for next-iter retry. Either way: advance.
+                        log.info(f"chal uid {challenger.uid} provision failed ({chal_status}); advancing without king backoff")
                     continue
                 king_fail_backoff = 60
                 if chal_slot is None:
@@ -917,13 +956,16 @@ async def run(cfg: Config, chain: Chain, slots=None):
                         await _drop_king()
 
                     skip_verdict = (len(rows) == rows_before
-                                    or abort_reason == "chal_broken"
+                                    or abort_reason in ("chal_broken", "king_broken")
                                     or fit.degenerate)
                     if skip_verdict:
                         # chal_broken: side-broken streak hit threshold AND artifact is session-skipped.
                         # Computing a verdict on partial rows + then promoting the same artifact we just
-                        # quarantined is incoherent. degenerate: Hessian non-PD → optimizer didn't reach
-                        # a MAP, posterior cov is fabricated → z untrustworthy. Champion holds.
+                        # quarantined is incoherent. king_broken: king's *slot* is broken, not the
+                        # artifact — chal-side rows collected this duel would unfairly tilt theta_chal
+                        # vs theta_king (king didn't get to respond). degenerate: Hessian non-PD →
+                        # optimizer didn't reach a MAP, posterior cov is fabricated → z untrustworthy.
+                        # Champion holds.
                         reason = ("degenerate_fit" if fit.degenerate
                                   else (abort_reason or "no_rows"))
                         log.info(f"duel aborted ({reason}, rows={len(rows) - rows_before}); skipping verdict")
@@ -958,16 +1000,20 @@ async def run(cfg: Config, chain: Chain, slots=None):
                         elif (challenger.uid, challenger.revision) not in fresh:
                             log.warning(f"verdict skipped: challenger uid{challenger.uid}@{challenger.revision} no longer registered")
                         else:
+                            # Save-first matches the election path: if persistence raises
+                            # we leave king cached, chal not promoted, memory unchanged —
+                            # the duel retries on the next iter rather than half-applying.
                             new_reign_start = await chain.current_block()
+                            new_champion = (challenger.uid, challenger.revision)
+                            _save_reign_state(reign_state_path, new_champion, new_reign_start, None)
                             await _drop_king()
                             king_slot = chal_slot
                             promoted = True
-                            champion = (challenger.uid, challenger.revision)
+                            champion = new_champion
                             reign_start = new_reign_start
                             attempted = set()
                             quarantined_chals.clear()
                             last_published_uid = None
-                            _save_reign_state(reign_state_path, champion, reign_start, None)
                             await _maybe_publish(challenger.uid, challenger.hotkey)
                             log.info(f"DETHRONE: uid {king.uid} → uid {challenger.uid}")
                 finally:
@@ -982,7 +1028,10 @@ async def run(cfg: Config, chain: Chain, slots=None):
         if king_slot is not None:
             try: await asyncio.shield(_safe_teardown(slots, king_slot, "shutdown"))
             except Exception as e: log.warning(f"king teardown on shutdown: {e}")
+        seen: set[int] = set()
         for wrapper, _ in envs.values():
+            if id(wrapper) in seen: continue
+            seen.add(id(wrapper))
             try: await asyncio.wait_for(wrapper.cleanup(), timeout=30.0)
             except (Exception, asyncio.TimeoutError) as e:
                 log.warning(f"env cleanup: {e}")

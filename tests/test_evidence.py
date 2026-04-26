@@ -124,7 +124,7 @@ def test_append_pair_writes_both_rows_in_one_syscall(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "open", counting_open)
     monkeypatch.setattr(os, "write", counting_write)
     monkeypatch.setattr(os, "fsync", counting_fsync)
-    store.append_pair(_row(m=1, c=0, p=1), _row(m=2, c=0, p=0))
+    store.append(_row(m=1, c=0, p=1), _row(m=2, c=0, p=0))
     assert write_calls[0] == 1
     assert fsync_calls[0] == 1
     rows = EvidenceStore(tmp_path / "ev.jsonl").read()
@@ -139,7 +139,7 @@ def test_append_pair_truncates_on_short_write(tmp_path, monkeypatch):
     pairing broken. Fix: truncate to pre-write size on any short/failed write."""
     import os
     store = EvidenceStore(tmp_path / "ev.jsonl")
-    store.append_pair(_row(m=1, c=0, p=1), _row(m=2, c=0, p=0))
+    store.append(_row(m=1, c=0, p=1), _row(m=2, c=0, p=0))
     pre_size = store.path.stat().st_size
 
     real_write = os.write
@@ -157,7 +157,7 @@ def test_append_pair_truncates_on_short_write(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "open", open_capture)
     monkeypatch.setattr(os, "write", short_write)
     with pytest.raises(OSError, match="short write"):
-        store.append_pair(_row(m=1, c=1, p=1), _row(m=2, c=1, p=0))
+        store.append(_row(m=1, c=1, p=1), _row(m=2, c=1, p=0))
     # File is rolled back: no torn tail, no orphan partial row.
     assert store.path.stat().st_size == pre_size
     rows = EvidenceStore(tmp_path / "ev.jsonl").read()
@@ -172,7 +172,7 @@ def test_append_pair_rolls_back_on_fsync_failure(tmp_path, monkeypatch):
     so counters and disk agree."""
     import os
     store = EvidenceStore(tmp_path / "ev.jsonl")
-    store.append_pair(_row(m=1, c=0, p=1), _row(m=2, c=0, p=0))
+    store.append(_row(m=1, c=0, p=1), _row(m=2, c=0, p=0))
     pre_size = store.path.stat().st_size
 
     real_open, real_fsync = os.open, os.fsync
@@ -189,7 +189,7 @@ def test_append_pair_rolls_back_on_fsync_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "open", open_capture)
     monkeypatch.setattr(os, "fsync", fail_fsync)
     with pytest.raises(OSError, match="fsync failed"):
-        store.append_pair(_row(m=1, c=1, p=1), _row(m=2, c=1, p=0))
+        store.append(_row(m=1, c=1, p=1), _row(m=2, c=1, p=0))
     # File is rolled back to pre-failure size.
     assert store.path.stat().st_size == pre_size
     # Counters didn't advance (the failed pair shouldn't be considered written).
@@ -201,7 +201,7 @@ def test_append_pair_rolls_back_on_fsync_failure(tmp_path, monkeypatch):
 
 def test_append_pair_advances_both_counters(tmp_path):
     store = EvidenceStore(tmp_path / "ev.jsonl")
-    store.append_pair(_row(m=1, r="r1", c=0), _row(m=2, r="r2", c=0))
+    store.append(_row(m=1, r="r1", c=0), _row(m=2, r="r2", c=0))
     assert store.next_counter(1, "r1", "ded") == 1
     assert store.next_counter(2, "r2", "ded") == 1
 
