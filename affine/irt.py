@@ -171,19 +171,18 @@ def fit_2pl(m_idx, e_idx, y, n_m, n_e, priors: Priors = Priors()) -> Fit:
     H = _hessian(x, m_idx, e_idx, y, n_m, n_e, priors)
     H = 0.5 * (H + H.T)
     w, V = np.linalg.eigh(H)
-    # Floor at the smallest prior precision. At a true MAP the joint H eigenvalue
-    # is ≥ min(prior precisions) along every eigenvector — the prior alone provides
-    # that much curvature on its diagonal, and data only adds PSD terms. Anything
-    # below means the optimizer failed to converge or the observed Hessian (r·L_pq
-    # term) is locally indefinite at a saddle. Flooring is correct in both cases:
-    # the true cov is bounded above by 1/floor.  A relative floor (eps·w.max())
-    # would clip legitimate curvature when block scales differ — e.g. tiny σ_β
-    # blows up 1/σ_β² and zeros the θ block.
-    floor = min(1.0, 1.0 / priors.sigma_beta ** 2, 1.0 / priors.sigma_alpha ** 2)
-    if (w < floor).any():
-        log.warning("fit_2pl: %d Hessian eigenvalues < expected floor %.3f (min=%.3e) — MAP suspect",
-                    int((w < floor).sum()), floor, float(w.min()))
-    w = np.maximum(w, floor)
+    # Floor at numerical-PSD only. The earlier prior-precision floor was unsafe in
+    # the wrong direction: at a true MAP the data Hessian's −r·L_pq α-block term
+    # is sign-indefinite, so eigenvalues of (P+D) are NOT bounded below by the
+    # smallest prior precision (Weyl applies only when D is PSD). Flooring upward
+    # *shrinks* cov, which *shrinks* SE, which *grows* z = Δθ̂/SE — overconfident
+    # in the dethrone direction. The right policy is: keep the true small
+    # eigenvalues (cov correspondingly large → SE large → z low → conservative).
+    # Negative eigenvalues mean we did not actually find a MAP — log loudly.
+    if (w < 0).any():
+        log.warning("fit_2pl: %d negative Hessian eigenvalues (min=%.3e) — not at MAP",
+                    int((w < 0).sum()), float(w.min()))
+    w = np.maximum(w, 1e-12)
     cov = (V / w) @ V.T
     return Fit(theta=x[:n_m].copy(), beta=x[n_m:n_m + n_e].copy(),
                alpha=x[n_m + n_e:].copy(), cov=cov)

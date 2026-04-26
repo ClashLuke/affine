@@ -53,14 +53,15 @@ def test_fit_respects_priors():
 
 
 def test_hessian_floor_independent_of_block_dynamic_range():
-    """Regression: a relative floor `eps * w.max()` clips legitimate small
-    eigenvalues when blocks have wildly different precisions. With sigma_beta=1e-9
-    the β-prior diagonal is 1e18, so the floor would zero θ-block info (= 1) and
-    contrast SE collapses 1.414 → 0.09 — overconfident dethrones."""
+    """Regression: an absolute floor on Hessian eigenvalues (vs a relative
+    `eps*w.max()`) preserves block scale when one block has a huge prior precision.
+    With sigma_beta=1e-9 the β-prior diagonal is 1e18; a relative floor would clip
+    θ-block info (= 1) and collapse contrast SE 1.414 → 0.09 — overconfident."""
     fit = fit_2pl([], [], [], 2, 1, Priors(sigma_beta=1e-9, sigma_alpha=0.5))
     _, se = fit.contrast(0, 1)
-    # Two unit-variance θ priors with no data → contrast SE = √2.
     assert abs(se - np.sqrt(2.0)) < 1e-6
+
+
 
 
 def test_contrast_matches_laplace_covariance():

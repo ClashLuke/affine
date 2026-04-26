@@ -182,40 +182,46 @@ def _rows_per_env(rows: list[Row], challenger_uid: int, king_uid: int) -> dict[s
     return {e: (c, k) for e, (c, k) in out.items()}
 
 
-def _load_envs(cfg: Config) -> dict[str, tuple]:
+async def _load_envs(cfg: Config) -> dict[str, tuple]:
     # Dedupe by image: load each unique image once, share across envs that use it.
     # params are call-time (passed in /call body), so they may differ; env_vars and
     # mem_limit are container-init, so they MUST match — silently sharing a wrapper
     # under conflicting container config would deploy one env's settings to both.
     loaded: dict[str, tuple] = {}
     out = {}
-    for spec in cfg.environments:
-        if spec.image in loaded:
-            wrapper, shared_spec = loaded[spec.image]
-            if spec.env_vars != shared_spec.env_vars or spec.mem_limit != shared_spec.mem_limit:
-                raise ValueError(
-                    f"env '{spec.name}' shares image {spec.image} with '{shared_spec.name}' "
-                    f"but env_vars/mem_limit differ — split into distinct images or align config"
-                )
-            merged_params = {**shared_spec.params, **spec.params}
-            out[spec.name] = (wrapper, replace(spec, params=merged_params))
-            log.info(f"env: {spec.name} ({spec.image}) [shared]")
-            continue
-        env_vars = dict(spec.env_vars)
-        for k in ("CHUTES_API_KEY", "HF_TOKEN"):
-            if (v := os.environ.get(k)):
-                env_vars.setdefault(k, v)
-        env_vars.setdefault("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", "vllm"))
-        # pull=False: rely on cached images (significant startup speedup)
-        wrapper = af.load_env(image=spec.image, mode="docker", env_vars=env_vars or None,
-                              mem_limit=spec.mem_limit, pull=False, cleanup=True)
-        backend = getattr(wrapper, "_backend", None)
-        if backend is not None and hasattr(backend, "_check_container_restart"):
-            backend._check_container_restart = lambda: False
-        loaded[spec.image] = (wrapper, spec)
-        out[spec.name] = (wrapper, spec)
-        log.info(f"env: {spec.name} ({spec.image})")
-    return out
+    try:
+        for spec in cfg.environments:
+            if spec.image in loaded:
+                wrapper, shared_spec = loaded[spec.image]
+                if spec.env_vars != shared_spec.env_vars or spec.mem_limit != shared_spec.mem_limit:
+                    raise ValueError(
+                        f"env '{spec.name}' shares image {spec.image} with '{shared_spec.name}' "
+                        f"but env_vars/mem_limit differ — split into distinct images or align config"
+                    )
+                merged_params = {**shared_spec.params, **spec.params}
+                out[spec.name] = (wrapper, replace(spec, params=merged_params))
+                log.info(f"env: {spec.name} ({spec.image}) [shared]")
+                continue
+            env_vars = dict(spec.env_vars)
+            for k in ("CHUTES_API_KEY", "HF_TOKEN"):
+                if (v := os.environ.get(k)):
+                    env_vars.setdefault(k, v)
+            env_vars.setdefault("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", "vllm"))
+            # pull=False: rely on cached images (significant startup speedup)
+            wrapper = af.load_env(image=spec.image, mode="docker", env_vars=env_vars or None,
+                                  mem_limit=spec.mem_limit, pull=False, cleanup=True)
+            backend = getattr(wrapper, "_backend", None)
+            if backend is not None and hasattr(backend, "_check_container_restart"):
+                backend._check_container_restart = lambda: False
+            loaded[spec.image] = (wrapper, spec)
+            out[spec.name] = (wrapper, spec)
+            log.info(f"env: {spec.name} ({spec.image})")
+        return out
+    except BaseException:
+        for wrapper, _ in loaded.values():
+            try: await wrapper.cleanup()
+            except Exception: pass
+        raise
 
 
 async def _cancellable(coro, stop: asyncio.Event, on_orphan=None):
@@ -411,14 +417,20 @@ async def _provision_pair(slots, king: Miner, chal: Miner, skip: Skiplist,
                 slots_got.append(None); continue
             slot, _ = t.result()
             slots_got.append(slot)
+        # King's status is known once both tasks have completed; if king is "ok"
+        # by then it IS "proven healthy" for this iteration, so the chal exemption
+        # applies. The earlier policy of unconditionally passing king_artifact=None
+        # session-skipped (model, rev) on every chal failure, which on the next
+        # filter pass also removed the (now-cached) king and forced a re-elect.
+        king_status = None
+        if not (t_k.cancelled() or t_k.exception() is not None):
+            _, king_status = t_k.result()
+        king_artifact = (king.model, king.revision) if king_status == "ok" else None
         for (t, m, is_king), slot in zip(pairs, slots_got):
             if t.cancelled() or t.exception() is not None:
                 continue
             _, status = t.result()
-            # No king_artifact: in this path king is being provisioned alongside
-            # challenger; nothing has been "proven healthy" yet. The exemption is
-            # only safe when the caller already holds a working cached king slot.
-            _apply_skip(skip, m, status, is_king=is_king)
+            _apply_skip(skip, m, status, is_king=is_king, king_artifact=king_artifact)
     except BaseException:
         for s in slots_got:
             if s is not None: await asyncio.shield(_safe_teardown(slots, s, "pair-error"))
@@ -652,12 +664,25 @@ def _load_reign_state(path: Path) -> tuple[tuple[int, str] | None, int, int | No
 
 def _save_reign_state(path: Path, champion: tuple[int, str], reign_start: int,
                        last_published_uid: int | None = None) -> None:
+    # fsync the tmp before rename: without it, power loss between rename commit
+    # and the data flush can leave an empty/partial file. _load_reign_state would
+    # then return None and the loop re-elects, resetting reign_start and undoing
+    # all k(reign) decay that had accumulated.
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps({
+    payload = json.dumps({
         "uid": int(champion[0]), "revision": str(champion[1]),
         "reign_start": int(reign_start),
         "last_published_uid": (int(last_published_uid) if last_published_uid is not None else None),
-    }))
+    }).encode()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        n = os.write(fd, payload)
+        if n != len(payload):
+            raise OSError(f"short write: {n}/{len(payload)} bytes")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     os.replace(tmp, path)
 
 
@@ -665,7 +690,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
     slots = slots or TargonSlots(cfg, hotkey=chain.hotkey)
     if hasattr(slots, "reconcile"):
         await slots.reconcile()
-    envs = _load_envs(cfg)
+    envs = await _load_envs(cfg)
     env_names = [spec.name for spec in cfg.environments]
     store = EvidenceStore(cfg.evidence_path)
     reign_state_path = Path(cfg.evidence_path).parent / f"reign-{chain.hotkey[:8]}.json"
@@ -726,12 +751,17 @@ async def run(cfg: Config, chain: Chain, slots=None):
         # Don't wrap in _cancellable: cancelling between broadcast and inclusion-wait
         # leaves the extrinsic on-chain but `last_published_uid` unset, so a restart
         # double-submits and burns weight quota. set_weights owns its own retry budget.
-        if await chain.publish_winner(uid, expected_hotkey):
-            last_published_uid = uid
-            if champion is not None:
-                _save_reign_state(reign_state_path, champion, reign_start, last_published_uid)
-        else:
+        if not await chain.publish_winner(uid, expected_hotkey):
             log.warning(f"publish_winner uid={uid} failed; will retry next iteration")
+            return
+        # Persist BEFORE mutating in-memory: if _save raises (disk full, etc.) and we'd
+        # already advanced last_published_uid in memory, we'd skip the next idempotent
+        # retry but the disk would still say "not published" — restart would re-submit
+        # and burn weight quota. Save-first means a save failure leaves both memory and
+        # disk un-advanced; the next iteration retries publish (idempotent on chain).
+        if champion is not None:
+            _save_reign_state(reign_state_path, champion, reign_start, uid)
+        last_published_uid = uid
 
     try:
         while not stop.is_set():
@@ -832,10 +862,17 @@ async def run(cfg: Config, chain: Chain, slots=None):
                                                             priors, rng, stop)
 
                     if abort_reason == "chal_broken":
-                        # Chal session-skipped so this artifact won't be retried until restart.
-                        # The artifact-vs-king-cache exemption doesn't apply here: we wouldn't
-                        # have entered _dwell if chal shared the cached king's artifact.
-                        skip.add(challenger.model, challenger.revision, durable=False)
+                        # Session-skip the chal artifact UNLESS it's the same as king's:
+                        # chal_broken implies king was sampling successfully, so the king
+                        # is healthy on this artifact. Skipping it would filter king on
+                        # the next iteration. (Cached-king + chal sharing king's
+                        # artifact CAN reach _dwell — two miners committing the same
+                        # popular base model, second uid as challenger.)
+                        if (challenger.model, challenger.revision) != (king.model, king.revision):
+                            skip.add(challenger.model, challenger.revision, durable=False)
+                        else:
+                            log.info(f"chal_broken on king-shared artifact {king.model}@{king.revision}; "
+                                     f"not session-skipping to preserve king cache")
                     elif abort_reason == "king_broken":
                         # Drop the slot. Re-provision next iter — Targon may give a different
                         # host. Don't re-elect: a transient leak shouldn't flip the throne, and
@@ -845,6 +882,9 @@ async def run(cfg: Config, chain: Chain, slots=None):
 
                     if len(rows) == rows_before:
                         log.info(f"duel aborted with no evidence (king uid{king.uid} vs chal uid{challenger.uid}); skipping verdict")
+                        audit(type="duel_aborted", reason=abort_reason or "no_rows",
+                              king={"uid": king.uid, "model": king.model, "revision": king.revision},
+                              challenger={"uid": challenger.uid, "model": challenger.model, "revision": challenger.revision})
                         continue
 
                     delta, se = fit.contrast(_index(miners, challenger.uid, challenger.revision),
@@ -855,7 +895,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
                     log.info(f"verdict: Δθ̂={delta:+.3f}±{se:.3f} z={z:+.2f} k={k:.2f} reign={reign}b")
 
                     verdict = "CHALLENGER_WINS" if z > k else "CHAMPION_HOLDS"
-                    audit(type="duel", verdict=verdict,
+                    audit(type="duel", verdict=verdict, abort_reason=abort_reason,
                           king={"uid": king.uid, "model": king.model, "revision": king.revision},
                           challenger={"uid": challenger.uid, "model": challenger.model, "revision": challenger.revision},
                           delta=float(delta), se=float(se), z=float(z), k=float(k),
@@ -895,8 +935,9 @@ async def run(cfg: Config, chain: Chain, slots=None):
         log.info("shutdown")
         await _drop_king()
         for wrapper, _ in envs.values():
-            try: await wrapper.cleanup()
-            except Exception: pass
+            try: await asyncio.wait_for(wrapper.cleanup(), timeout=30.0)
+            except (Exception, asyncio.TimeoutError) as e:
+                log.warning(f"env cleanup: {e}")
 
 
 def bittensor_chain(cfg: Config) -> tuple[Chain, Subtensor]:

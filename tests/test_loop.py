@@ -646,7 +646,8 @@ def test_task_id_depends_on_salt():
     assert a != b
 
 
-def test_load_envs_injects_openai_api_key(monkeypatch):
+@pytest.mark.asyncio
+async def test_load_envs_injects_openai_api_key(monkeypatch):
     """Env containers need OPENAI_API_KEY set (vLLM ignores the value but the
     openai SDK refuses to instantiate without it). Regression: without this,
     every evaluate() failed instantly with OpenAIError and every duel aborted."""
@@ -660,12 +661,13 @@ def test_load_envs_injects_openai_api_key(monkeypatch):
         EnvSpec(name="a", image="img-a"),
         EnvSpec(name="b", image="img-b", env_vars={"OPENAI_API_KEY": "override"}),
     ))
-    _load_envs(cfg)
+    await _load_envs(cfg)
     assert calls[0]["OPENAI_API_KEY"] == "vllm"
     assert calls[1]["OPENAI_API_KEY"] == "override"
 
 
-def test_load_envs_shares_wrapper_for_duplicate_images(monkeypatch):
+@pytest.mark.asyncio
+async def test_load_envs_shares_wrapper_for_duplicate_images(monkeypatch):
     """Two envs with the same image (eg affine:ded + affine:abd on affine-env:v4)
     must share one container wrapper but keep per-env params.
 
@@ -681,7 +683,7 @@ def test_load_envs_shares_wrapper_for_duplicate_images(monkeypatch):
         EnvSpec(name="abd", image="shared", params={"task_type": "abd"}),
         EnvSpec(name="other", image="distinct"),
     ))
-    envs = _load_envs(cfg)
+    envs = await _load_envs(cfg)
     assert built == ["shared", "distinct"]                 # one wrapper per unique image
     assert envs["ded"][0] is envs["abd"][0]                # shared wrapper
     assert envs["ded"][1].params["task_type"] == "ded"     # but per-env params kept
@@ -689,7 +691,8 @@ def test_load_envs_shares_wrapper_for_duplicate_images(monkeypatch):
     assert envs["other"][0].image == "distinct"
 
 
-def test_load_envs_rejects_shared_image_with_different_env_vars(monkeypatch):
+@pytest.mark.asyncio
+async def test_load_envs_rejects_shared_image_with_different_env_vars(monkeypatch):
     """Same image but different env_vars/mem_limit must NOT silently share a
     wrapper — the second env's container-init config would be lost."""
     monkeypatch.setattr("affinetes.load_env",
@@ -699,10 +702,11 @@ def test_load_envs_rejects_shared_image_with_different_env_vars(monkeypatch):
         EnvSpec(name="b", image="shared", env_vars={"K": "2"}),
     ))
     with pytest.raises(ValueError, match="env_vars/mem_limit differ"):
-        _load_envs(cfg)
+        await _load_envs(cfg)
 
 
-def test_load_envs_rejects_shared_image_with_different_mem_limit(monkeypatch):
+@pytest.mark.asyncio
+async def test_load_envs_rejects_shared_image_with_different_mem_limit(monkeypatch):
     monkeypatch.setattr("affinetes.load_env",
         lambda image, mode, env_vars, mem_limit, pull, cleanup: SimpleNamespace(_backend=None))
     cfg = Config(environments=(
@@ -710,7 +714,32 @@ def test_load_envs_rejects_shared_image_with_different_mem_limit(monkeypatch):
         EnvSpec(name="b", image="shared", mem_limit="8g"),
     ))
     with pytest.raises(ValueError, match="env_vars/mem_limit differ"):
-        _load_envs(cfg)
+        await _load_envs(cfg)
+
+
+@pytest.mark.asyncio
+async def test_load_envs_cleans_up_wrappers_on_partial_init_failure(monkeypatch):
+    """If af.load_env raises mid-loop, already-loaded wrappers must be cleaned
+    up — otherwise their Docker containers leak."""
+    cleaned: list[str] = []
+    def make_wrapper(image):
+        async def cleanup(): cleaned.append(image)
+        return SimpleNamespace(_backend=None, image=image, cleanup=cleanup)
+    call_count = [0]
+    def fake_load_env(image, mode, env_vars, mem_limit, pull, cleanup):
+        call_count[0] += 1
+        if call_count[0] == 3:
+            raise RuntimeError("docker daemon vanished")
+        return make_wrapper(image)
+    monkeypatch.setattr("affinetes.load_env", fake_load_env)
+    cfg = Config(environments=(
+        EnvSpec(name="a", image="img-a"),
+        EnvSpec(name="b", image="img-b"),
+        EnvSpec(name="c", image="img-c"),
+    ))
+    with pytest.raises(RuntimeError, match="docker daemon"):
+        await _load_envs(cfg)
+    assert sorted(cleaned) == ["img-a", "img-b"]
 
 
 @pytest.mark.asyncio
@@ -1033,9 +1062,9 @@ async def test_run_cold_starts_and_dethrones(tmp_path, monkeypatch):
     from affine.loop import run
 
     # Patch env loader and health_ping (neither exercise real containers).
-    monkeypatch.setattr("affine.loop._load_envs", lambda cfg: {
+    monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
-    })
+    }))
     monkeypatch.setattr("affine.loop.health_ping", AsyncMock(return_value=True))
     monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
 
@@ -1082,9 +1111,9 @@ async def test_dethrone_resilient_to_king_teardown_error(tmp_path, monkeypatch):
     retries the same broken teardown, and the dethrone never publishes."""
     from affine.loop import run
 
-    monkeypatch.setattr("affine.loop._load_envs", lambda cfg: {
+    monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
-    })
+    }))
     monkeypatch.setattr("affine.loop.health_ping", AsyncMock(return_value=True))
     monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
 
@@ -1141,9 +1170,9 @@ async def test_run_caches_king_across_duels_in_reign(tmp_path, monkeypatch):
     a 600GB model download between every challenger was the dominant live-mode cost."""
     from affine.loop import run
 
-    monkeypatch.setattr("affine.loop._load_envs", lambda cfg: {
+    monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
-    })
+    }))
     monkeypatch.setattr("affine.loop.health_ping", AsyncMock(return_value=True))
     monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
 
@@ -1193,9 +1222,9 @@ async def test_publish_failure_retries_next_iteration(tmp_path, monkeypatch):
     set weights when the chain never accepted them."""
     from affine.loop import run
 
-    monkeypatch.setattr("affine.loop._load_envs", lambda cfg: {
+    monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
-    })
+    }))
     monkeypatch.setattr("affine.loop.health_ping", AsyncMock(return_value=True))
     monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):

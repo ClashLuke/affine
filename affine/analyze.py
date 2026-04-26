@@ -38,7 +38,8 @@ def _load(path: Path, drop_fast_fail_s: float | None) -> list[Row]:
         try:
             d = json.loads(line, parse_constant=_reject_constant)
             r = Row(m=int(d["m"]), r=d["r"], e=d["e"], c=int(d["c"]),
-                    p=int(d["p"]), t=int(d["t"]), l=float(d["l"]))
+                    p=int(d["p"]), t=int(d["t"]), l=float(d["l"]),
+                    i=int(d.get("i", 0)))
         except (json.JSONDecodeError, KeyError, ValueError, TypeError):
             skipped += 1
             continue

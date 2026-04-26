@@ -36,5 +36,7 @@ def audit(**fields) -> None:
         line = json.dumps(_sanitize(record), allow_nan=False, default=str)
         with open(path, "a") as f:
             f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
     except (OSError, TypeError, ValueError) as e:
         log.warning(f"audit log write failed: {e}")
