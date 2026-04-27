@@ -285,6 +285,15 @@ async def _safe_teardown(slots, slot: Slot, ctx: str) -> None:
     except Exception as e: log.warning(f"teardown error ({ctx}): {e}")
 
 
+def _slot_from_task(t: asyncio.Task) -> Slot | None:
+    """Extract the slot from a task wrapping `_provision`. Returns None for any
+    not-clean state (still running, cancelled, raised). The not-done guard is
+    load-bearing: t.exception() raises InvalidStateError on a running task,
+    which can happen if `_cleanup`'s drain await is interrupted."""
+    if not t.done() or t.cancelled() or t.exception() is not None: return None
+    return t.result()[0]
+
+
 async def _provision(slots, miner: Miner, stop: asyncio.Event) -> tuple[Slot | None, str]:
     """Returns (slot|None, status). `crashloop` is the only miner-fault signal —
     vLLM crashed loading the artifact. `timeout`/`transient`/`error` are our
@@ -344,10 +353,6 @@ async def _provision_pair(slots, king: Miner, chal: Miner, states: MinerStates,
     t_c = asyncio.create_task(_provision(slots, chal, stop))
     tasks = (t_k, t_c)
 
-    def _slot_of(t):
-        if t.cancelled() or t.exception() is not None: return None
-        return t.result()[0]
-
     async def _cleanup(reason: str, drain: bool = False) -> None:
         if drain:
             for t in tasks:
@@ -357,7 +362,7 @@ async def _provision_pair(slots, king: Miner, chal: Miner, states: MinerStates,
                 except BaseException as e:
                     log.warning(f"_provision_pair drain interrupted ({type(e).__name__}); rental may leak")
         for t in tasks:
-            if (slot := _slot_of(t)) is not None:
+            if (slot := _slot_from_task(t)) is not None:
                 await _safe_teardown(slots, slot, reason)
 
     pending = set(tasks)
@@ -393,7 +398,7 @@ async def _provision_pair(slots, king: Miner, chal: Miner, states: MinerStates,
         await _cleanup("pair-cancelled")
         raise asyncio.CancelledError()
 
-    king_slot, chal_slot = _slot_of(t_k), _slot_of(t_c)
+    king_slot, chal_slot = _slot_from_task(t_k), _slot_from_task(t_c)
     king_attempt_failed = not t_k.cancelled() and king_slot is None
     if fail_fast:
         await _cleanup("pair-fail-fast")

@@ -15,7 +15,7 @@ from affine.irt import Priors
 from affine.loop import (
     ENV_FAIL_QUARANTINE, Chain, MinerStates, Reign, _apply_skip, _cancellable,
     art_key, dwell, _fit, _load_envs, _provision, _provision_pair, _respondents, _seed,
-    static_chain,
+    _slot_from_task, static_chain,
 )
 from affine.verdict import DuelStatus
 from affine.vllm import SlotProvisionFailed
@@ -568,6 +568,51 @@ async def test_provision_pair_partial_failure_tears_down_survivor(tmp_path):
                               states, stop)
     await fire_task
     assert teardowns == ["king"]
+
+
+@pytest.mark.asyncio
+async def test_slot_from_task_handles_running_task():
+    """Regression: t.exception() raises InvalidStateError on a running task.
+    The not-done guard prevents _cleanup's drain teardown loop from crashing
+    if a drain await is interrupted before the task completes."""
+    async def hang(): await asyncio.sleep(60)
+    t = asyncio.create_task(hang())
+    await asyncio.sleep(0)
+    try:
+        assert _slot_from_task(t) is None
+    finally:
+        t.cancel()
+        try: await t
+        except asyncio.CancelledError: pass
+
+
+@pytest.mark.asyncio
+async def test_slot_from_task_returns_slot_for_clean_completion():
+    async def ok(): return (SimpleNamespace(model="m"), "ok")
+    t = asyncio.create_task(ok())
+    await t
+    slot = _slot_from_task(t)
+    assert slot is not None and slot.model == "m"
+
+
+@pytest.mark.asyncio
+async def test_slot_from_task_returns_none_for_cancelled():
+    async def hang(): await asyncio.sleep(60)
+    t = asyncio.create_task(hang())
+    await asyncio.sleep(0)
+    t.cancel()
+    try: await t
+    except asyncio.CancelledError: pass
+    assert _slot_from_task(t) is None
+
+
+@pytest.mark.asyncio
+async def test_slot_from_task_returns_none_for_exception():
+    async def boom(): raise RuntimeError("boom")
+    t = asyncio.create_task(boom())
+    try: await t
+    except RuntimeError: pass
+    assert _slot_from_task(t) is None
 
 
 def test_respondents_registered_first_then_ghosts():
