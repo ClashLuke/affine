@@ -316,13 +316,9 @@ async def _provision(slots, miner: Miner, stop: asyncio.Event) -> tuple[Slot | N
 
 
 def _apply_skip(states: MinerStates, miner: Miner, status: str, *, is_king: bool) -> None:
-    """`crashloop` is the only miner-fault signal (vLLM crashed loading) → DURABLE.
-    Every other chal outcome — `ok` (will duel), `transient`/`timeout`/`error`
-    (our infra failed) — marks ATTEMPTED: the queue advances, chal is re-picked
-    on reign change or queue exhaustion. Marking at provision time means a chal
-    that successfully provisions is committed to using up its queue slot this
-    reign regardless of duel outcome. King isn't in the queue, so the
-    non-crashloop case is a no-op."""
+    """crashloop → durable (miner fault). Other non-king → attempted at
+    provision time, so the queue advances regardless of duel outcome. King
+    isn't queued; non-crashloop is a no-op."""
     if status == "crashloop":
         states.mark_durable(miner.uid, art_key(miner), reason=status)
     elif not is_king:
@@ -336,87 +332,74 @@ async def _provision_pair(slots, king: Miner, chal: Miner, states: MinerStates,
 
     Returns `(king_slot, chal_slot, king_attempt_failed)`. `king_attempt_failed`
     is True iff king's provision ran to completion with a non-ok status (False
-    if king was cancelled because chal failed first). The caller uses this to
-    decide king-fail backoff vs advancing to the next challenger. `_apply_skip`
-    is called internally for both miners; chal status doesn't propagate.
+    if king was cancelled because chal failed first). `_apply_skip` runs for both
+    miners; chal status doesn't propagate.
 
     If the first finisher fails to produce a slot, the duel is dead — cancel the
-    sibling immediately rather than wait out a 15-min Targon provision we'll
-    discard. On outer cancellation (SIGTERM, parent task) tear down any slot
-    that did complete; gather() otherwise drops survivors and leaks rentals.
+    sibling rather than wait out a 15-min Targon provision we'll discard. On
+    outer cancellation, drain pending tasks and teardown any completed slot;
+    gather() otherwise drops survivors and leaks rentals.
     """
     t_k = asyncio.create_task(_provision(slots, king, stop))
     t_c = asyncio.create_task(_provision(slots, chal, stop))
-    pending = {t_k, t_c}
+    tasks = (t_k, t_c)
 
-    async def _drain_and_teardown(reason: str) -> None:
-        for t in (t_k, t_c):
-            if not t.done(): t.cancel()
-        for t in (t_k, t_c):
-            try: await asyncio.shield(t)
-            except BaseException as e:
-                log.warning(f"_provision_pair drain interrupted ({type(e).__name__}); rental may leak")
-            if t.done() and not t.cancelled() and t.exception() is None:
-                slot, _ = t.result()
-                if slot is not None:
-                    await _safe_teardown(slots, slot, reason)
+    def _slot_of(t):
+        if t.cancelled() or t.exception() is not None: return None
+        return t.result()[0]
 
+    async def _cleanup(reason: str, drain: bool = False) -> None:
+        if drain:
+            for t in tasks:
+                if not t.done(): t.cancel()
+            for t in tasks:
+                try: await asyncio.shield(t)
+                except BaseException as e:
+                    log.warning(f"_provision_pair drain interrupted ({type(e).__name__}); rental may leak")
+        for t in tasks:
+            if (slot := _slot_of(t)) is not None:
+                await _safe_teardown(slots, slot, reason)
+
+    pending = set(tasks)
     fail_fast = False
     try:
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
                 if t.cancelled() or t.exception() is not None: continue
-                slot, _ = t.result()
-                if slot is None and pending:
+                if t.result()[0] is None and pending:
                     fail_fast = True
                     for p in pending: p.cancel()
     except asyncio.CancelledError:
-        await asyncio.shield(_drain_and_teardown("outer-cancelled"))
+        await asyncio.shield(_cleanup("outer-cancelled", drain=True))
         raise
 
-    pairs = [(t_k, king, True), (t_c, chal, False)]
-    slots_got: list[Slot | None] = []
-    outer_cancelled = False
+    # Outer-cancel during inner provision (stop fired): tasks ended cancelled
+    # but we didn't trigger fail_fast.
+    outer_cancelled = not fail_fast and any(t.cancelled() for t in tasks)
 
-    async def _teardown_got(reason: str) -> None:
-        for s in slots_got:
-            if s is not None: await _safe_teardown(slots, s, reason)
-
-    # Collect slots first; only then run state-mark writes that can raise. Any
-    # exception (e.g. disk I/O while persisting a durable skip) must still tear
-    # down whatever provisioned, otherwise the rental leaks.
     try:
-        for t, m, is_king in pairs:
-            if t.cancelled() or isinstance(t.exception(), asyncio.CancelledError):
-                if not fail_fast: outer_cancelled = True
-                slots_got.append(None); continue
-            exc = t.exception()
-            if exc is not None:
+        for t, m, is_king in ((t_k, king, True), (t_c, chal, False)):
+            if t.cancelled(): continue
+            if (exc := t.exception()) is not None:
                 log.error(f"provision-pair unexpected exception uid {m.uid}: {exc}")
-                slots_got.append(None); continue
-            slot, _ = t.result()
-            slots_got.append(slot)
-        for (t, m, is_king), slot in zip(pairs, slots_got):
-            if t.cancelled() or t.exception() is not None:
                 continue
-            _, status = t.result()
-            _apply_skip(states, m, status, is_king=is_king)
+            _apply_skip(states, m, t.result()[1], is_king=is_king)
     except BaseException:
-        await _teardown_got("pair-error")
+        await _cleanup("pair-error")
         raise
 
     if outer_cancelled:
-        await _teardown_got("pair-cancelled")
+        await _cleanup("pair-cancelled")
         raise asyncio.CancelledError()
-    king_attempt_failed = not t_k.cancelled() and slots_got[0] is None
+
+    king_slot, chal_slot = _slot_of(t_k), _slot_of(t_c)
+    king_attempt_failed = not t_k.cancelled() and king_slot is None
     if fail_fast:
-        await _teardown_got("pair-fail-fast")
+        await _cleanup("pair-fail-fast")
         return None, None, king_attempt_failed
-    king_slot, chal_slot = slots_got
-    # King-only failure: tear down the orphan chal slot (it can't duel without a
-    # king). Chal-only failure (king ok, chal None) keeps king cached — the 600GB
-    # model download is reused across challengers.
+    # King-only failure: tear down the orphan chal slot. Chal-only failure
+    # (king ok) keeps king cached — the 600GB model download reuses across chals.
     if king_slot is None and chal_slot is not None:
         await _safe_teardown(slots, chal_slot, "king-failed-chal-orphan")
         return None, None, king_attempt_failed
@@ -867,9 +850,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
                             audit(type="duel_aborted", reason=reason,
                                   king=_miner_pl(king), challenger=_miner_pl(challenger))
                             continue
-                        case Hold(reason="cancelled", evidence=None):
-                            continue
-                        case Hold(reason=_, evidence=ev):
+                        case Hold(evidence=ev):
                             _audit_verdict("CHAMPION_HOLDS", king, challenger, ev)
                             continue
                         case Dethrone(new_champion=new_champion, evidence=ev):
