@@ -98,12 +98,12 @@ def _data_terms(theta, beta, alpha, m_idx, e_idx, y):
     a = np.exp(alpha[e_idx])
     L = a * (theta[m_idx] - beta[e_idx])
     p = expit(L)
-    return a, L, p, p * (1.0 - p), y - p   # a, L, p, w=p(1-p), r=y-p
+    return a, L, p * (1.0 - p), y - p   # a, L, w=p(1-p), r=y-p
 
 
 def _obj_and_grad(x, m_idx, e_idx, y, n_m, n_e, priors):
     theta, beta, alpha = _unpack(x, n_m, n_e)
-    a, L, _, _, r = _data_terms(theta, beta, alpha, m_idx, e_idx, y)
+    a, L, _, r = _data_terms(theta, beta, alpha, m_idx, e_idx, y)
     inv_sb2 = 1.0 / (priors.sigma_beta ** 2)
     inv_sa2 = 1.0 / (priors.sigma_alpha ** 2)
 
@@ -128,7 +128,7 @@ def _hessian(x, m_idx, e_idx, y, n_m, n_e, priors):
     nonzero L_pq: L_θα = a, L_βα = −a, L_αα = L.
     """
     theta, beta, alpha = _unpack(x, n_m, n_e)
-    a, L, _, w, r = _data_terms(theta, beta, alpha, m_idx, e_idx, y)
+    a, L, w, r = _data_terms(theta, beta, alpha, m_idx, e_idx, y)
     inv_sb2 = 1.0 / (priors.sigma_beta ** 2)
     inv_sa2 = 1.0 / (priors.sigma_alpha ** 2)
 

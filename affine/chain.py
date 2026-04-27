@@ -27,7 +27,7 @@ def _truthy_env(name: str) -> bool:
 _RETRY_SAFE = frozenset({
     "metagraph",
     "get_all_revealed_commitments", "get_all_commitments",
-    "get_current_block", "block",
+    "get_current_block",
 })
 
 

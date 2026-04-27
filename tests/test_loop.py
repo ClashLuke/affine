@@ -13,7 +13,7 @@ from affine.config import Config, EnvSpec
 from affine.evidence import EvidenceStore, Row
 from affine.irt import Priors
 from affine.loop import (
-    ENV_FAIL_QUARANTINE, Chain, MinerStates, Reign, State, _apply_skip, _cancellable,
+    ENV_FAIL_QUARANTINE, Chain, MinerStates, Reign, _apply_skip, _cancellable,
     art_key, dwell, _fit, _load_envs, _provision, _provision_pair, _respondents, _seed,
     static_chain,
 )
@@ -34,7 +34,7 @@ def _row(**kw):
 
 def test_states_filters_by_excluded_model_and_per_uid_skip():
     s = MinerStates({"banned"})
-    s.mark(1, ("okmodel", "badrev"), State.DURABLE_SKIP, "crashloop")
+    s.mark_durable(1, ("okmodel", "badrev"), "crashloop")
     kept = s.filter([
         _miner(0, model="banned"),
         _miner(1, model="okmodel", rev="badrev"),
@@ -46,31 +46,22 @@ def test_states_filters_by_excluded_model_and_per_uid_skip():
 def test_states_durable_persists_and_reloads(tmp_path):
     path = tmp_path / "skip.jsonl"
     s = MinerStates(path=path)
-    s.mark(7, ("modelA", "rev1"), State.DURABLE_SKIP, "crashloop")
-    s.mark(8, ("modelB", "rev2"), State.SESSION_SKIP, "timeout")
+    s.mark_durable(7, ("modelA", "rev1"), "crashloop")
+    s.mark_attempted(("modelB", "rev2"))
 
     s2 = MinerStates(path=path)
     assert s2.filter([_miner(7, model="modelA", rev="rev1")]) == []
     keep = _miner(8, model="modelB", rev="rev2")
-    assert s2.filter([keep]) == [keep]   # session skips don't persist
+    assert s2.filter([keep]) == [keep]   # ATTEMPTED is in-memory, doesn't persist
     lines = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
     assert lines == [{"uid": 7, "model": "modelA", "revision": "rev1", "reason": "crashloop"}]
-
-
-def test_states_legacy_durable_format_taints_artifact(tmp_path):
-    """Old skiplist format `{model, revision}` (no uid) imports as art-level
-    durable — any miner committing that art is filtered, regardless of uid."""
-    path = tmp_path / "skip.jsonl"
-    path.write_text(json.dumps({"model": "old", "revision": "r"}) + "\n")
-    s = MinerStates(path=path)
-    assert s.filter([_miner(99, model="old", rev="r")]) == []
 
 
 def test_states_durable_mark_is_idempotent(tmp_path):
     path = tmp_path / "skip.jsonl"
     s = MinerStates(path=path)
-    s.mark(1, ("m", "r"), State.DURABLE_SKIP, "crashloop")
-    s.mark(1, ("m", "r"), State.DURABLE_SKIP, "crashloop")
+    s.mark_durable(1, ("m", "r"), "crashloop")
+    s.mark_durable(1, ("m", "r"), "crashloop")
     assert len(path.read_text().splitlines()) == 1
 
 
@@ -130,7 +121,7 @@ def test_states_durable_write_fsyncs(tmp_path, monkeypatch):
     real_write, real_fsync = os.write, os.fsync
     monkeypatch.setattr(os, "write", lambda fd, data: (written.append(data), real_write(fd, data))[1])
     monkeypatch.setattr(os, "fsync", lambda fd: (fsynced.append(fd), real_fsync(fd))[1])
-    s.mark(7, ("m", "r"), State.DURABLE_SKIP, "crashloop")
+    s.mark_durable(7, ("m", "r"), "crashloop")
     assert len(written) == 1
     assert written[0] == (json.dumps({"uid": 7, "model": "m", "revision": "r", "reason": "crashloop"}) + "\n").encode()
     assert len(fsynced) == 1
@@ -142,7 +133,7 @@ def test_states_durable_short_write_truncates_to_pre_size(tmp_path, monkeypatch)
     and the artifact is silently re-admitted."""
     import os
     s = MinerStates(path=tmp_path / "skip.jsonl")
-    s.mark(1, ("first", "rev-a"), State.DURABLE_SKIP, "crashloop")
+    s.mark_durable(1, ("first", "rev-a"), "crashloop")
     pre_size = (tmp_path / "skip.jsonl").stat().st_size
 
     real_write, real_open = os.write, os.open
@@ -158,11 +149,11 @@ def test_states_durable_short_write_truncates_to_pre_size(tmp_path, monkeypatch)
     monkeypatch.setattr(os, "open", open_capture)
     monkeypatch.setattr(os, "write", short_write)
     with pytest.raises(OSError, match="short write"):
-        s.mark(2, ("second", "rev-b"), State.DURABLE_SKIP, "crashloop")
+        s.mark_durable(2, ("second", "rev-b"), "crashloop")
     assert (tmp_path / "skip.jsonl").stat().st_size == pre_size
     reload = MinerStates(path=tmp_path / "skip.jsonl")
-    assert reload.state(1, ("first", "rev-a")) is State.DURABLE_SKIP
-    assert reload.state(2, ("second", "rev-b")) is State.UNTRIED
+    assert reload.is_durable(1, ("first", "rev-a"))
+    assert not reload.is_attempted(("second", "rev-b")) and not reload.is_durable(2, ("second", "rev-b"))
 
 
 def test_states_durable_disk_failure_does_not_mutate_memory(tmp_path):
@@ -172,8 +163,8 @@ def test_states_durable_disk_failure_does_not_mutate_memory(tmp_path):
     path.parent.write_text("not-a-dir")
     s = MinerStates(path=path)
     with pytest.raises((FileExistsError, NotADirectoryError, OSError)):
-        s.mark(7, ("m", "r"), State.DURABLE_SKIP, "crashloop")
-    assert s.state(7, ("m", "r")) is State.UNTRIED
+        s.mark_durable(7, ("m", "r"), "crashloop")
+    assert not s.is_attempted(("m", "r")) and not s.is_durable(7, ("m", "r"))
 
 
 @pytest.mark.asyncio
@@ -290,110 +281,111 @@ def test_apply_skip_crashloop_durable(tmp_path):
     s = MinerStates(path=tmp_path / "skip.jsonl")
     m = _miner(7, model="m", rev="r")
     _apply_skip(s, m, "crashloop", is_king=False)
-    assert s.state(7, ("m", "r")) is State.DURABLE_SKIP
+    assert s.is_durable(7, ("m", "r"))
     assert (tmp_path / "skip.jsonl").read_text().strip() != ""
 
 
-def test_apply_skip_timeout_session_for_non_king(tmp_path):
+def test_apply_skip_timeout_attempted_for_non_king(tmp_path):
+    """A single Targon hiccup must NOT lock the chal out for the process
+    lifetime — mark ATTEMPTED so they're re-tried on reign change or queue
+    exhaustion. Disk write is for DURABLE only."""
     skip_path = tmp_path / "skip.jsonl"
     s = MinerStates(path=skip_path)
     _apply_skip(s, _miner(7, model="m", rev="r"), "timeout", is_king=False)
-    assert s.state(7, ("m", "r")) is State.SESSION_SKIP
+    assert s.is_attempted(("m", "r"))
     assert not skip_path.exists() or skip_path.read_text().strip() == ""
 
 
 def test_apply_skip_timeout_noop_for_king(tmp_path):
-    """The current king cannot be session-skipped on timeout; that would force
+    """The current king cannot be marked on timeout; that would force
     re-election on every Targon hiccup and burn the weight quota."""
     s = MinerStates(path=tmp_path / "skip.jsonl")
     _apply_skip(s, _miner(7, model="m", rev="r"), "timeout", is_king=True)
-    assert s.state(7, ("m", "r")) is State.UNTRIED
+    assert not s.is_attempted(("m", "r")) and not s.is_durable(7, ("m", "r"))
 
 
-def test_apply_skip_error_session_for_non_king(tmp_path):
+def test_apply_skip_error_attempted_for_non_king(tmp_path):
     skip_path = tmp_path / "skip.jsonl"
     s = MinerStates(path=skip_path)
     _apply_skip(s, _miner(7, model="m", rev="r"), "error", is_king=False)
-    assert s.state(7, ("m", "r")) is State.SESSION_SKIP
+    assert s.is_attempted(("m", "r"))
     assert not skip_path.exists() or skip_path.read_text().strip() == ""
 
 
-def test_apply_skip_transient_noop_for_chal(tmp_path):
-    """Transient httpx errors must not skip — they'd empty the queue during a
-    Targon outage. Retry next iter."""
+def test_apply_skip_transient_attempts_chal(tmp_path):
+    """Any non-king failure (including transient) marks ATTEMPTED so the queue
+    advances. Targon outage is handled by the queue-exhaustion 120s sleep, not
+    by a per-chal special case."""
     skip_path = tmp_path / "skip.jsonl"
     s = MinerStates(path=skip_path)
     _apply_skip(s, _miner(7, model="m", rev="r"), "transient", is_king=False)
-    assert s.state(7, ("m", "r")) is State.UNTRIED
+    assert s.is_attempted(("m", "r"))
     assert not skip_path.exists() or skip_path.read_text().strip() == ""
 
 
 def test_apply_skip_error_noop_for_king(tmp_path):
     s = MinerStates(path=tmp_path / "skip.jsonl")
     _apply_skip(s, _miner(7, model="m", rev="r"), "error", is_king=True)
-    assert s.state(7, ("m", "r")) is State.UNTRIED
+    assert not s.is_attempted(("m", "r")) and not s.is_durable(7, ("m", "r"))
 
 
-def test_apply_skip_unhealthy_session_for_non_king(tmp_path):
-    skip_path = tmp_path / "skip.jsonl"
-    s = MinerStates(path=skip_path)
-    _apply_skip(s, _miner(7, model="m", rev="r"), "unhealthy", is_king=False)
-    assert s.state(7, ("m", "r")) is State.SESSION_SKIP
-    assert not skip_path.exists() or skip_path.read_text().strip() == ""
-
-
-def test_apply_skip_unhealthy_noop_for_king(tmp_path):
+def test_apply_skip_attempted_dedupes_across_uids_sharing_artifact(tmp_path):
+    """Two uids sharing (model, revision) must not each pay a separate Targon
+    provision. ATTEMPTED is keyed by art_key so a successful chal duel locks
+    out all sibling uids on the same artifact this reign — IRT pools their
+    evidence anyway, so one duel is sufficient."""
     s = MinerStates(path=tmp_path / "skip.jsonl")
-    _apply_skip(s, _miner(7, model="m", rev="r"), "unhealthy", is_king=True)
-    assert s.state(7, ("m", "r")) is State.UNTRIED
+    uid1 = _miner(1, model="shared", rev="r")
+    uid2 = _miner(2, model="shared", rev="r")
+    _apply_skip(s, uid1, "ok", is_king=False)
+    assert s.is_attempted(("shared", "r"))
+    # uid2 with the same art_key inherits ATTEMPTED — would otherwise be queued
+    # again for a redundant duel against the same provisioned model.
 
 
-def test_states_chal_durable_on_shared_artifact_does_not_filter_king(tmp_path):
-    """Phase B: the shared-artifact exemption that used to live in _apply_skip
-    is now a property of the art_durable rollup — chal's DURABLE on a king-shared
-    art does not filter the king because the rollup requires every committing
-    uid to be DURABLE, and the king is UNTRIED."""
+def test_states_durable_filters_per_uid_not_per_artifact(tmp_path):
+    """Two miners share an artifact; chal crashloops, king is UNTRIED. Filter
+    durable-skips chal but keeps king — durability is per-(uid, art_key), not
+    per-art_key. A new uid committing the same broken artifact gets re-tested
+    once before being marked durable itself."""
     s = MinerStates(path=tmp_path / "skip.jsonl")
     king = _miner(7, model="shared", rev="r1")
     chal = _miner(8, model="shared", rev="r1")
     _apply_skip(s, chal, "crashloop", is_king=False)
-    kept = s.filter([king, chal])
-    assert kept == [king]                          # chal filtered, king passes
-    assert s.art_durable(("shared", "r1"), [king, chal]) is False
+    assert s.filter([king, chal]) == [king]
 
 
 def test_states_king_crashloop_still_durable(tmp_path):
-    """A king itself crashlooping is recorded — though `is_king=True` won't
-    fire here because `_apply_skip` only writes DURABLE for `crashloop`, which
-    applies to either side: a broken king must still be removable."""
+    """A king itself crashlooping is recorded — `_apply_skip` writes DURABLE for
+    `crashloop` regardless of is_king; a broken king must still be removable."""
     s = MinerStates(path=tmp_path / "skip.jsonl")
     king = _miner(7, model="shared", rev="r1")
     _apply_skip(s, king, "crashloop", is_king=True)
-    assert s.state(7, ("shared", "r1")) is State.DURABLE_SKIP
+    assert s.is_durable(7, ("shared", "r1"))
     assert s.filter([king]) == []
-
-
-def test_states_art_durable_rollup_when_all_committing_uids_durable(tmp_path):
-    """art_durable(k) is true iff every uid currently committing k is DURABLE_SKIP.
-    Two uids on the same art, both crashlooping → art is durable; either alone is not."""
-    s = MinerStates(path=tmp_path / "skip.jsonl")
-    a = _miner(1, model="shared", rev="r")
-    b = _miner(2, model="shared", rev="r")
-    s.mark(1, ("shared", "r"), State.DURABLE_SKIP, "crashloop")
-    assert s.art_durable(("shared", "r"), [a, b]) is False    # b is UNTRIED
-    s.mark(2, ("shared", "r"), State.DURABLE_SKIP, "crashloop")
-    assert s.art_durable(("shared", "r"), [a, b]) is True
 
 
 def test_states_clear_attempted_only_clears_attempted(tmp_path):
     s = MinerStates(path=tmp_path / "skip.jsonl")
-    s.mark(1, ("a", "r"), State.ATTEMPTED, "tested")
-    s.mark(2, ("b", "r"), State.SESSION_SKIP, "timeout")
-    s.mark(3, ("c", "r"), State.DURABLE_SKIP, "crashloop")
+    s.mark_attempted(("a", "r"))
+    s.mark_durable(3, ("c", "r"), "crashloop")
     s.clear_attempted()
-    assert s.state(1, ("a", "r")) is State.UNTRIED
-    assert s.state(2, ("b", "r")) is State.SESSION_SKIP
-    assert s.state(3, ("c", "r")) is State.DURABLE_SKIP
+    assert not s.is_attempted(("a", "r")) and not s.is_durable(1, ("a", "r"))
+    assert s.is_durable(3, ("c", "r"))
+
+
+def test_states_filter_keeps_attempted_so_irt_still_sees_them(tmp_path):
+    """ATTEMPTED is queue-only filtering; the IRT and election must still see
+    these miners. A chal locked out of THIS reign's queue must still contribute
+    historical evidence to the global fit and remain an election candidate."""
+    s = MinerStates(path=tmp_path / "skip.jsonl")
+    m_attempted = _miner(1, model="m1", rev="r")
+    m_durable = _miner(2, model="m2", rev="r")
+    m_clean = _miner(3, model="m3", rev="r")
+    s.mark_attempted(("m1", "r"))
+    s.mark_durable(2, ("m2", "r"), "crashloop")
+    kept = s.filter([m_attempted, m_durable, m_clean])
+    assert [m.uid for m in kept] == [1, 3], "ATTEMPTED stays in miners; only DURABLE_SKIP filters out"
 
 
 @pytest.mark.asyncio
@@ -415,25 +407,16 @@ async def test_provision_pair_skips_shared_artifact_on_chal_crashloop(tmp_path):
         async def teardown(self, slot):
             pass
 
-    from affine import loop as loop_mod
-    async def _ok(*a, **kw): return True
-    orig_i = loop_mod.inference_ping
-    loop_mod.inference_ping = _ok
-    try:
-        await _provision_pair(_Slots(),
-                              _miner(0, model="shared", rev="r1"),
-                              _miner(1, model="shared", rev="r1"),
-                              states, stop)
-    finally:
-        loop_mod.inference_ping = orig_i
+    await _provision_pair(_Slots(),
+                          _miner(0, model="shared", rev="r1"),
+                          _miner(1, model="shared", rev="r1"),
+                          states, stop)
 
     # Whichever side completes its provision call writes DURABLE for its (uid, art).
     # The other may be cancelled by fail-fast and stay UNTRIED — but next iter will
     # exercise it. Either way, at least one side must record DURABLE so progress
     # is made instead of infinite-retrying the same pair (the prior bug).
-    s0 = states.state(0, ("shared", "r1"))
-    s1 = states.state(1, ("shared", "r1"))
-    assert State.DURABLE_SKIP in (s0, s1)
+    assert states.is_durable(0, ("shared", "r1")) or states.is_durable(1, ("shared", "r1"))
 
 
 @pytest.mark.asyncio
@@ -460,22 +443,15 @@ async def test_provision_pair_fail_fast_cancels_sibling(tmp_path):
         async def teardown(self, slot):
             teardowns.append(slot.model)
 
-    from affine import loop as loop_mod
-    async def _ok(*a, **kw): return True
-    orig_i = loop_mod.inference_ping
-    loop_mod.inference_ping = _ok
-    try:
-        k_slot, c_slot, king_failed, _ = await _provision_pair(_Slots(),
-                                               _miner(0, model="king"), _miner(1, model="chal"),
-                                               states, stop)
-    finally:
-        loop_mod.inference_ping = orig_i
+    k_slot, c_slot, king_failed = await _provision_pair(_Slots(),
+                                           _miner(0, model="king"), _miner(1, model="chal"),
+                                           states, stop)
 
     assert k_slot is None and c_slot is None
     assert king_failed, "king's task ran to completion with crashloop status"
     assert chal_finished.is_set(), "challenger task should have terminated (cancelled)"
     assert teardowns == [], "no slot was produced, nothing to tear down"
-    assert states.state(0, ("king", "r")) is State.DURABLE_SKIP
+    assert states.is_durable(0, ("king", "r"))
 
 
 @pytest.mark.asyncio
@@ -483,9 +459,9 @@ async def test_provision_pair_chal_fails_first_does_not_blame_king(tmp_path):
     """Regression: chal raises a generic Exception (status='error'), fail-fast
     cancels king mid-download. Caller must distinguish this from a real king
     failure: blaming king triggers a 60→600s sleep that delays advancing to the
-    next challenger and `attempted.discard`s the broken chal so it gets re-picked
-    forever. Returning king_attempt_failed=False lets the caller skip the backoff
-    and rely on chal's session-skip (status='error' now writes one) to advance."""
+    next challenger. Returning king_attempt_failed=False lets the caller skip the
+    backoff and rely on chal's ATTEMPTED mark (status='error' now writes one) to
+    advance to the next chal in the queue."""
     states = MinerStates(path=tmp_path / "skip.jsonl")
     stop = asyncio.Event()
 
@@ -499,21 +475,14 @@ async def test_provision_pair_chal_fails_first_does_not_blame_king(tmp_path):
         async def teardown(self, slot):
             pass
 
-    from affine import loop as loop_mod
-    async def _ok(*a, **kw): return True
-    orig_i = loop_mod.inference_ping
-    loop_mod.inference_ping = _ok
-    try:
-        k_slot, c_slot, king_failed, _ = await _provision_pair(_Slots(),
-                                                            _miner(0, model="king"), _miner(1, model="chal"),
-                                                            states, stop)
-    finally:
-        loop_mod.inference_ping = orig_i
+    k_slot, c_slot, king_failed = await _provision_pair(_Slots(),
+                                                        _miner(0, model="king"), _miner(1, model="chal"),
+                                                        states, stop)
 
     assert k_slot is None and c_slot is None
     assert king_failed is False, "king was cancelled by chal-fail-fast, not a real king failure"
-    # chal status='error' session-skips so the loop can advance to the next chal.
-    assert states.state(1, ("chal", "r")) is State.SESSION_SKIP
+    # chal status='error' marks ATTEMPTED so the loop advances to the next chal.
+    assert states.is_attempted(("chal", "r"))
 
 
 @pytest.mark.asyncio
@@ -539,16 +508,9 @@ async def test_provision_pair_king_succeeds_chal_fails_retains_king(tmp_path):
         async def teardown(self, slot):
             teardowns.append(slot.model)
 
-    from affine import loop as loop_mod
-    async def _ok(*a, **kw): return True
-    orig_i = loop_mod.inference_ping
-    loop_mod.inference_ping = _ok
-    try:
-        k_slot, c_slot, king_failed, _ = await _provision_pair(_Slots(),
-                                                             _miner(0, model="king"), _miner(1, model="chal"),
-                                                             states, stop)
-    finally:
-        loop_mod.inference_ping = orig_i
+    k_slot, c_slot, king_failed = await _provision_pair(_Slots(),
+                                                         _miner(0, model="king"), _miner(1, model="chal"),
+                                                         states, stop)
 
     assert k_slot is not None and k_slot.model == "king"
     assert c_slot is None
@@ -573,16 +535,9 @@ async def test_provision_pair_king_fails_chal_succeeds_tears_chal(tmp_path):
         async def teardown(self, slot):
             teardowns.append(slot.model)
 
-    from affine import loop as loop_mod
-    async def _ok(*a, **kw): return True
-    orig_i = loop_mod.inference_ping
-    loop_mod.inference_ping = _ok
-    try:
-        k_slot, c_slot, king_failed, _ = await _provision_pair(_Slots(),
-                                                             _miner(0, model="king"), _miner(1, model="chal"),
-                                                             states, stop)
-    finally:
-        loop_mod.inference_ping = orig_i
+    k_slot, c_slot, king_failed = await _provision_pair(_Slots(),
+                                                         _miner(0, model="king"), _miner(1, model="chal"),
+                                                         states, stop)
 
     assert k_slot is None and c_slot is None
     assert king_failed is True
@@ -604,23 +559,14 @@ async def test_provision_pair_partial_failure_tears_down_survivor(tmp_path):
             await asyncio.sleep(60)
         async def teardown(self, slot):
             teardowns.append(slot.model)
-    # Patch _cancellable's view: we want one to succeed, the other to be cancelled
-    # on stop. health_ping/inference_ping would otherwise block — patch them too.
-    from affine import loop as loop_mod
-    async def _ok(*a, **kw): return True
-    orig_i = loop_mod.inference_ping
-    loop_mod.inference_ping = _ok
-    try:
-        async def fire():
-            await asyncio.sleep(0.05); stop.set()
-        fire_task = asyncio.create_task(fire())
-        with pytest.raises(asyncio.CancelledError):
-            await _provision_pair(_MixedSlots(),
-                                  _miner(0, model="king"), _miner(1, model="chal"),
-                                  states, stop)
-        await fire_task
-    finally:
-        loop_mod.inference_ping = orig_i
+    async def fire():
+        await asyncio.sleep(0.05); stop.set()
+    fire_task = asyncio.create_task(fire())
+    with pytest.raises(asyncio.CancelledError):
+        await _provision_pair(_MixedSlots(),
+                              _miner(0, model="king"), _miner(1, model="chal"),
+                              states, stop)
+    await fire_task
     assert teardowns == ["king"]
 
 
@@ -1108,13 +1054,12 @@ async def test_dwell_quarantines_broken_env_keeps_sampling_healthy(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dwell_aborts_with_chal_broken_records_synthetic_loss(tmp_path, monkeypatch):
-    """Per notes/plan.md: failure to deliver a verdict is a loss for that miner.
-    With chal returning None on every pick and king delivering, dwell records
-    BOTH a synthetic chal-loss row (p=0, l=0) and the real king row, then aborts
-    after SIDE_FAIL_THRESHOLD picks. Recording the loss is what makes
-    'first functioning challenger wins by default' eventually surface — without
-    it, a chronically-broken endpoint paid no statistical cost."""
+async def test_dwell_records_synthetic_loss_for_persistently_failing_chal(tmp_path, monkeypatch):
+    """Failure-to-deliver is recorded as a synthetic-loss row (p=0, l=0). With
+    chal returning None every pick and king delivering, the dwell appends both
+    a synthetic chal-loss and the real king row each iter — accumulated synthetic
+    losses pin chal's θ̂ low and Hold via z<<-k. There is no CHAL_BROKEN abort:
+    that was an arbitrary-K=3 heuristic conflating our infra with miner fault."""
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
         return (True if slot.model == "mk" else None), 0.01
     monkeypatch.setattr("affine.loop.run_one", split)
@@ -1124,21 +1069,24 @@ async def test_dwell_aborts_with_chal_broken_records_synthetic_loss(tmp_path, mo
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=30, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(dwell=10, evidence_path=str(tmp_path / "ev.jsonl"))
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
         [king, chal], [], envs, list(envs), store, cfg, Priors(),
         np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
     )
-    rows, _, abort = out.rows, out.fit, out.status
-    assert abort is DuelStatus.CHAL_BROKEN
+    rows = out.rows
+    assert out.status is DuelStatus.COMPLETED
     king_rows = [r for r in rows if r.m == king.uid]
     chal_rows = [r for r in rows if r.m == chal.uid]
-    assert len(king_rows) == len(chal_rows) > 0      # paired
+    assert len(king_rows) == len(chal_rows) == cfg.dwell      # all iters paired
     assert all(r.p == 1 for r in king_rows)
-    assert all(r.p == 0 and r.l == 0.0 for r in chal_rows)   # synthetic loss
+    assert all(r.p == 0 and r.l == 0.0 for r in chal_rows)    # synthetic losses
     assert rows == store.read()
+    delta, se = out.fit.contrast(1, 0)
+    z = delta / se if se > 0 else 0
+    assert z < 0, f"chal failing every iter must yield negative z; got {z:+.2f}"
 
 
 @pytest.mark.asyncio
@@ -1175,40 +1123,6 @@ async def test_dwell_dethrones_broken_king_via_synthetic_loss(tmp_path, monkeypa
     assert all(r.p == 1 for r in chal_rows)
 
 
-@pytest.mark.asyncio
-async def test_dwell_streak_resets_on_ambiguous_both_none(tmp_path, monkeypatch):
-    """Both-None is *ambiguous* evidence: the env failed, can't attribute to a side.
-    Without resetting side streaks on both-None, a chal-None / both-None alternation
-    spuriously trips chal_broken even though the side signal is interleaved with
-    env-side noise. Fix: reset streaks on ambiguous evidence; let env_fails carry
-    the ambiguous signal."""
-    counter = {"n": 0}
-    async def alternating(wrapper, params, timeout, slot, seed, task_id=0):
-        counter["n"] += 1
-        # Per call (king and chal each call run_one): odd picks chal-None / king-ok,
-        # even picks both-None. We tag by slot.model so each side decides on its own.
-        # Pick index from king's call count: floor((n+1)/2).
-        pick = (counter["n"] + 1) // 2
-        if pick % 2 == 1:                                                 # odd: chal-only fail
-            return (True if slot.model == "mk" else None), 0.01
-        return None, 0.01                                                 # even: both-None
-    monkeypatch.setattr("affine.loop.run_one", alternating)
-    envs = {"X": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="X", image="i", params={"timeout": 5}))}
-    store = EvidenceStore(tmp_path / "ev.jsonl")
-    chain = Chain(hotkey="V", list_miners=AsyncMock(),
-                  current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
-    king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=20, evidence_path=str(tmp_path / "ev.jsonl"))
-    out = await dwell(
-        chain, king, SimpleNamespace(model="mk", base_url="uk"),
-        chal, SimpleNamespace(model="mc", base_url="uc"),
-        [king, chal], [], envs, list(envs), store, cfg, Priors(),
-        np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
-    )
-    rows, _, abort = out.rows, out.fit, out.status
-    # Before fix: chal_streak grows 1,1,2,2,3 → "chal_broken". After fix: streak
-    # resets on both-None, env_fails carries the ambiguous signal → "envs_quarantined".
-    assert abort is not DuelStatus.CHAL_BROKEN, "ambiguous both-None must not feed side-broken signal"
 
 
 @pytest.mark.asyncio
@@ -1299,8 +1213,8 @@ async def test_dwell_synthetic_loss_drives_dethrone_against_broken_king(tmp_path
 
 @pytest.mark.asyncio
 async def test_dwell_intermittent_one_side_does_not_abort(tmp_path, monkeypatch):
-    """Verify the streak resets on success: alternating None / pass on chal
-    must NOT trigger chal_broken because the streak never reaches threshold."""
+    """Dwell must complete normally with intermittent chal failures — no early
+    abort. Synthetic losses on chal-fail iters drive the contrast naturally."""
     counter = {"n": 0}
     async def alternating(wrapper, params, timeout, slot, seed, task_id=0):
         if slot.model == "mk":
@@ -1322,7 +1236,7 @@ async def test_dwell_intermittent_one_side_does_not_abort(tmp_path, monkeypatch)
         np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
     )
     rows, _, abort = out.rows, out.fit, out.status
-    assert abort is DuelStatus.COMPLETED, "intermittent chal failures must not flip to chal_broken"
+    assert abort is DuelStatus.COMPLETED
     assert len(rows) > 0, "successful pairs must accumulate"
 
 
@@ -1348,11 +1262,10 @@ async def test_run_cold_starts_and_dethrones(tmp_path, monkeypatch):
     after enough samples, loop exits when no further challengers remain."""
     from affine.loop import run
 
-    # Patch env loader and health_ping (neither exercise real containers).
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
     }))
-    monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
+
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
         return (slot.model == "mc"), 0.01   # mc always wins, mk always loses
@@ -1390,6 +1303,58 @@ async def test_run_cold_starts_and_dethrones(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dethrone_skipped_when_chal_deregisters_mid_dwell(tmp_path, monkeypatch):
+    """If the challenger deregisters between duel start and verdict, the
+    re-fetched `fresh` set must reject the dethrone — without this guard the
+    validator publishes weights to a uid whose hotkey may have been recycled
+    to a different operator. The cold-start publish for uid 0 must still
+    happen; only the (would-be) dethrone publish for uid 1 must be suppressed."""
+    from affine.loop import run
+
+    monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
+        "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
+    }))
+
+    async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
+        return (slot.model == "mc"), 0.01
+    monkeypatch.setattr("affine.loop.run_one", _run_one)
+
+    full = [_miner(0, model="mk"), _miner(1, model="mc")]
+    after_dereg = [_miner(0, model="mk")]
+    list_calls = {"n": 0}
+    async def list_miners():
+        list_calls["n"] += 1
+        # First call (top of iter) returns both — duel starts. Second call (fresh
+        # check at verdict) returns only king — chal deregistered mid-duel.
+        return full if list_calls["n"] <= 1 else after_dereg
+
+    blocks = iter(range(10**6))
+    async def current_block(): return next(blocks)
+    published: list[int] = []
+    async def publish(uid, hk=""):
+        published.append(uid)
+        # SIGINT after we've seen the cold-start publish — that's enough to verify
+        # behavior. If a spurious dethrone publish lands, it lands BEFORE this.
+        if len(published) >= 1:
+            import os, signal
+            os.kill(os.getpid(), signal.SIGINT)
+        return True
+
+    chain = Chain(hotkey="V", list_miners=list_miners,
+                  current_block=current_block, publish_winner=publish)
+    cfg = Config(dwell=8, evidence_path=str(tmp_path / "ev.jsonl"),
+                 environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
+                 k_init=0.5, k_final=0.5, k_halflife=1)
+    try:
+        await asyncio.wait_for(run(cfg, chain, slots=_FakeSlots()), timeout=2.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+
+    # Cold start published uid 0; the dethrone publish for uid 1 was suppressed.
+    assert 1 not in published, f"deregistered chal must not be published; got {published}"
+
+
+@pytest.mark.asyncio
 async def test_dethrone_resilient_to_king_teardown_error(tmp_path, monkeypatch):
     """Regression: if slots.teardown(king_slot) raises during dethrone, the loop
     must still promote the challenger and publish the new champion. Without this
@@ -1400,7 +1365,7 @@ async def test_dethrone_resilient_to_king_teardown_error(tmp_path, monkeypatch):
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
     }))
-    monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
+
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
         return slot.model == "mc", 0.01
@@ -1458,7 +1423,7 @@ async def test_run_caches_king_across_duels_in_reign(tmp_path, monkeypatch):
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
     }))
-    monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
+
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
         return slot.model == "mk", 0.01   # king always wins → no dethrone
@@ -1500,24 +1465,24 @@ async def test_run_caches_king_across_duels_in_reign(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_chal_transient_triggers_exponential_backoff(tmp_path, monkeypatch):
-    """Regression: chal-side `transient` (httpx error) must engage the same
-    exponential backoff as king-side failures. Without symmetric backoff, a
-    Targon-API outage tight-loops on the same UNTRIED chal hammering the API."""
+async def test_chal_transient_advances_queue_then_exhaustion_sleeps(tmp_path, monkeypatch):
+    """Targon-side chal failure: chal marked ATTEMPTED → queue empties →
+    queue-exhaustion 120s sleep. No per-chal exponential backoff, no tight loop
+    on a single chal. The same chal is re-tried after clear_attempted."""
     from affine.loop import run
     import httpx
 
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
     }))
-    monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
+
     async def _run_one(*a, **kw): return True, 0.01
     monkeypatch.setattr("affine.loop.run_one", _run_one)
 
     sleep_durations: list[float] = []
     async def capture_sleep(d, *a, **kw):
         sleep_durations.append(d)
-        if len(sleep_durations) >= 4:
+        if len(sleep_durations) >= 3:
             import os, signal
             os.kill(os.getpid(), signal.SIGINT)
     monkeypatch.setattr("affine.loop.asyncio.sleep", capture_sleep)
@@ -1539,10 +1504,9 @@ async def test_chal_transient_triggers_exponential_backoff(tmp_path, monkeypatch
             return await super().provision(model, revision)
 
     await run(cfg, chain, slots=_ChalTransientSlots())
-    # Backoff doubles each retry; ±25% jitter de-syncs validators on a shared
-    # Targon API key. Bounds: base ∈ {60, 120, 240}, multiplier ∈ [0.75, 1.25).
-    for d, base in zip(sleep_durations[:3], [60, 120, 240]):
-        assert base * 0.75 <= d <= base * 1.25, f"expected {base}*[0.75, 1.25], got {d}"
+    assert all(d == 120 for d in sleep_durations[:3]), (
+        f"expected queue-exhaustion 120s cycles, got {sleep_durations[:3]}"
+    )
 
 
 @pytest.mark.asyncio
@@ -1555,7 +1519,7 @@ async def test_publish_failure_retries_next_iteration(tmp_path, monkeypatch):
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
     }))
-    monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
+
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
         return slot.model == "mk", 0.01
     monkeypatch.setattr("affine.loop.run_one", _run_one)
@@ -1602,7 +1566,7 @@ async def test_dry_run_does_not_persist_last_published_uid(tmp_path, monkeypatch
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
     }))
-    monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
+
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
         return slot.model == "mk", 0.01
     monkeypatch.setattr("affine.loop.run_one", _run_one)
@@ -1698,6 +1662,41 @@ def test_task_id_matched_pair_and_varies_with_iter():
     assert len(seq) == 8
     # Env changes the task.
     assert _task_id(3, 7, "A", 0, 0, 99) != _task_id(3, 7, "B", 0, 0, 99)
+
+
+@pytest.mark.asyncio
+async def test_dwell_persists_matched_task_id_per_iter(tmp_path, monkeypatch):
+    """design.md §"Challenge-centric evidence": both miners face the same
+    instance per iteration. End-to-end check that the rows actually persisted
+    to evidence carry equal `i` for each (king, chal) pair within a dwell iter,
+    while distinct iters draw distinct task_ids. Catches regressions that
+    decouple king/chal task selection (e.g. per-uid task_id)."""
+    store = EvidenceStore(tmp_path / "ev.jsonl")
+    chain = Chain(hotkey="VAL", list_miners=AsyncMock(),
+                  current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
+    king, chal = _miner(0, model="mk"), _miner(1, model="mc")
+    cfg = Config(dwell=12, evidence_path=str(tmp_path / "ev.jsonl"))
+    async def _ok(wrapper, params, timeout, slot, seed, task_id=0):
+        return True, 0.01
+    monkeypatch.setattr("affine.loop.run_one", _ok)
+    out = await dwell(
+        chain, king, SimpleNamespace(model="mk", base_url="uk"),
+        chal, SimpleNamespace(model="mc", base_url="uc"),
+        [king, chal], [], _env(), ["E"], store, cfg, Priors(),
+        np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
+    )
+    rows = store.read()
+    assert len(rows) == 2 * cfg.dwell
+    # Group by (env, t, c-pair-index) — within a single iter, k_row immediately
+    # precedes c_row (same store.append pair). The persistence order is what the
+    # validator's matched-task contract relies on.
+    pairs = list(zip(rows[::2], rows[1::2]))
+    assert all(r0.m == king.uid and r1.m == chal.uid for r0, r1 in pairs)
+    assert all(r0.i == r1.i for r0, r1 in pairs), \
+        f"matched-task broken: pair task_ids: {[(p[0].i, p[1].i) for p in pairs]}"
+    # And the iter-to-iter draws are diverse — a stuck task_id would also pass
+    # the per-pair equality check, so this is the second axis.
+    assert len({r.i for r, _ in pairs}) >= cfg.dwell // 2
 
 
 @pytest.mark.asyncio

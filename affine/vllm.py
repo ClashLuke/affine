@@ -37,37 +37,6 @@ async def health_ping(base_url: str, timeout: float = 5) -> bool:
         return False
 
 
-async def inference_ping(base_url: str, model: str, timeout: float = 30,
-                         attempts: int = 3) -> bool:
-    """Confirm the slot can actually serve inference, not just `/models`.
-
-    Gateways (Targon, CDN proxies) often return 200 on `/models` while the
-    underlying workers 5xx on `/chat/completions`. A 1-token completion is the
-    cheapest unambiguous signal that the full inference path works.
-
-    Retries transient gateway errors (429, 5xx, network) before declaring the
-    slot dead — a single Targon throttle would otherwise tear down a healthy
-    cached king and force a full re-provision.
-    """
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 1, "temperature": 0.0,
-    }
-    backoff = 1.0
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        for i in range(attempts):
-            try:
-                r = await client.post(f"{base_url}/chat/completions", json=payload)
-                if r.status_code == 200: return True
-                if r.status_code < 500 and r.status_code != 429: return False
-            except Exception:
-                pass
-            if i < attempts - 1:
-                await asyncio.sleep(backoff); backoff *= 2
-    return False
-
-
 def _docker_host_ip() -> str | None:
     """Docker bridge gateway IP — only meaningful when affine runs inside a container
     that needs to reach a vLLM on the host. On the host itself, localhost works and

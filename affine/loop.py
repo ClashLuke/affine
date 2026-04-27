@@ -29,8 +29,7 @@ import logging
 import os
 import secrets
 import signal
-from dataclasses import dataclass
-from enum import Enum, auto
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -45,7 +44,7 @@ from .evidence import EvidenceStore, Row, atomic_append
 from .irt import Fit, Priors, compute_k, fisher_env, fit_2pl
 from .sampler import run_one
 from .verdict import ArtKey, Dethrone, DuelStatus, Hold, Skip, VerdictEvidence, decide
-from .vllm import Slot, SlotProvisionFailed, TargonSlots, inference_ping
+from .vllm import Slot, SlotProvisionFailed, TargonSlots
 
 log = logging.getLogger(__name__)
 
@@ -65,97 +64,63 @@ def art_key(m: Miner) -> ArtKey:
     return (m.model, m.revision)
 
 
-class State(Enum):
-    UNTRIED = auto()
-    ATTEMPTED = auto()      # tested this reign, not skipped
-    SESSION_SKIP = auto()   # transient/unhealthy/error/chal_broken — clears on restart
-    DURABLE_SKIP = auto()   # crashloop — persists
-
-
-@dataclass(frozen=True)
-class StateRecord:
-    state: State
-    reason: str
-
-
 class MinerStates:
-    """Per-(uid, art_key) policy. `art_durable(k)` is true iff every uid currently
-    committing `k` is DURABLE_SKIP, so a chal's durable skip on a shared artifact
-    never filters the (UNTRIED) king — no explicit exemption needed.
-
-    Legacy JSONL lines `{"model","revision"}` (no uid) load as art-level durable
-    (binds the artifact regardless of committer); new writes carry `uid`."""
+    """`durable` (disk-backed JSONL) is per-(uid, art_key): vLLM crashed loading
+    this artifact. Per-uid so a fresh uid that re-commits a known-broken artifact
+    gets one shot before being marked itself. `attempted` (in-memory) is
+    per-art_key: deduplicating multi-uid-per-artifact wastes — IRT pools evidence
+    by art_key, so one duel's worth is sufficient regardless of how many uids
+    share the artifact. Cleared on reign change or queue exhaustion. UNTRIED is
+    the implicit default (no record either side)."""
     def __init__(self, excluded_models: set[str] = frozenset(),
                  path: str | Path | None = None):
-        self._records: dict[tuple[int, ArtKey], StateRecord] = {}
-        self._legacy_durable: set[ArtKey] = set()
+        self._durable: set[tuple[int, ArtKey]] = set()
+        self._attempted: set[ArtKey] = set()
         self._excluded_models = set(excluded_models)
         self.path = Path(path) if path else None
         if self.path and self.path.exists():
-            n_pre = len(self._records) + len(self._legacy_durable)
+            skipped = 0
             for line in self.path.read_text().splitlines():
-                line = line.strip()
-                if not line:
+                if not line.strip():
                     continue
                 try:
                     d = json.loads(line)
-                    k = (d["model"], d["revision"])
-                    if "uid" in d:
-                        self._records[(int(d["uid"]), k)] = StateRecord(
-                            State.DURABLE_SKIP, str(d.get("reason", "crashloop")))
-                    else:
-                        self._legacy_durable.add(k)
-                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-                    log.warning(f"states: skipping malformed line: {e}")
-            n = len(self._records) + len(self._legacy_durable) - n_pre
-            if n:
-                log.info(f"states: loaded {n} durable entries from {self.path}")
+                    self._durable.add((int(d["uid"]), (d["model"], d["revision"])))
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    skipped += 1
+            if self._durable or skipped:
+                log.info(f"states: loaded {len(self._durable)} durable entries"
+                         f"{f' (skipped {skipped} malformed lines)' if skipped else ''} from {self.path}")
 
-    def mark(self, uid: int, k: ArtKey, state: State, reason: str) -> None:
-        if state is State.DURABLE_SKIP:
-            existing = self._records.get((uid, k))
-            if existing is not None and existing.state is State.DURABLE_SKIP:
-                return
-            # Disk first, memory second — a failed write must not leave us thinking
-            # we persisted a skip we'll lose on restart.
-            if self.path:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                payload = json.dumps({"uid": int(uid), "model": k[0],
-                                       "revision": k[1], "reason": reason}) + "\n"
-                atomic_append(self.path, payload.encode())
-        self._records[(uid, k)] = StateRecord(state, reason)
-        log.info(f"states ({state.name}): uid{uid} {k[0]}@{k[1]} ({reason})")
+    def mark_durable(self, uid: int, k: ArtKey, reason: str) -> None:
+        if (uid, k) in self._durable:
+            return
+        # Disk first, memory second — a failed write must not leave us thinking
+        # we persisted a skip we'll lose on restart.
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps({"uid": uid, "model": k[0],
+                                   "revision": k[1], "reason": reason}) + "\n"
+            atomic_append(self.path, payload.encode())
+        self._durable.add((uid, k))
+        log.info(f"durable: uid{uid} {k[0]}@{k[1]} ({reason})")
 
-    def state(self, uid: int, k: ArtKey) -> State:
-        rec = self._records.get((uid, k))
-        return rec.state if rec is not None else State.UNTRIED
+    def mark_attempted(self, k: ArtKey) -> None:
+        self._attempted.add(k)
 
-    def art_durable(self, k: ArtKey, miners: list[Miner]) -> bool:
-        if k in self._legacy_durable:
-            return True
-        committing = [m for m in miners if art_key(m) == k]
-        if not committing:
-            return False
-        return all(self.state(m.uid, k) is State.DURABLE_SKIP for m in committing)
+    def is_attempted(self, k: ArtKey) -> bool:
+        return k in self._attempted
+
+    def is_durable(self, uid: int, k: ArtKey) -> bool:
+        return (uid, k) in self._durable
 
     def filter(self, miners: list[Miner]) -> list[Miner]:
-        committers: dict[ArtKey, list[int]] = {}
-        for m in miners:
-            committers.setdefault(art_key(m), []).append(m.uid)
-        durable_art = {
-            k: (k in self._legacy_durable
-                or all(self.state(u, k) is State.DURABLE_SKIP for u in uids))
-            for k, uids in committers.items()
-        }
-        skipped = (State.SESSION_SKIP, State.DURABLE_SKIP)
         return [m for m in miners
                 if m.model not in self._excluded_models
-                and self.state(m.uid, art_key(m)) not in skipped
-                and not durable_art[art_key(m)]]
+                and (m.uid, art_key(m)) not in self._durable]
 
     def clear_attempted(self) -> None:
-        self._records = {key: rec for key, rec in self._records.items()
-                         if rec.state is not State.ATTEMPTED}
+        self._attempted.clear()
 
 
 def _row_art(r: Row, by_uid_rev: dict[tuple[int, str], Miner]) -> ArtKey:
@@ -255,7 +220,7 @@ async def _load_envs(cfg: Config) -> dict[str, tuple]:
     except BaseException:
         for wrapper, _ in loaded.values():
             try: await asyncio.wait_for(wrapper.cleanup(), timeout=30.0)
-            except (Exception, asyncio.TimeoutError) as e:
+            except Exception as e:
                 log.warning(f"env cleanup-on-fail: {e}")
         raise
 
@@ -321,13 +286,13 @@ async def _safe_teardown(slots, slot: Slot, ctx: str) -> None:
 
 
 async def _provision(slots, miner: Miner, stop: asyncio.Event) -> tuple[Slot | None, str]:
-    """Provision and probe a slot. Returns (slot|None, status). Status is one of:
-    "ok" (slot returned), "crashloop" (artifact-level fault — caller should durable-skip),
-    "timeout" (could be Targon infra — caller may session-skip non-king miners),
-    "unhealthy" (provisioned but failed health/inference probes), "transient"
-    (network/protocol blip — no skip, retry next iter), "error" (unclassified;
-    treat as miner-side artifact bug). Slot-bearing exceptions during the probe
-    phase tear down the slot before re-raising."""
+    """Returns (slot|None, status). `crashloop` is the only miner-fault signal —
+    vLLM crashed loading the artifact. `timeout`/`transient`/`error` are our
+    infrastructure (we picked the resource, image, timeout). The slot is *not*
+    further probed here: a `/chat/completions` health check is our test of our
+    slot, and a failure would conflate orchestration with miner fault. If the
+    provisioned slot can't actually serve, dwell samples fail and synthetic
+    losses drive dethrone via the design's z>k path (notes/design.md §27)."""
     try:
         slot = await _cancellable(
             slots.provision(miner.model, miner.revision), stop,
@@ -342,47 +307,38 @@ async def _provision(slots, miner: Miner, stop: asyncio.Event) -> tuple[Slot | N
     except asyncio.CancelledError:
         raise
     except httpx.HTTPError as e:
-        # Targon API blips (ConnectError, ReadTimeout, 5xx). Session-skipping
-        # on these would empty the queue during a 30s Targon outage and stall
-        # the validator until queue refresh. Retry next iter instead.
         log.warning(f"provision transient uid {miner.uid}: {type(e).__name__}: {e}")
         return None, "transient"
     except Exception as e:
         log.error(f"provision error uid {miner.uid}: {e}")
         return None, "error"
-    try:
-        if not await _cancellable(inference_ping(slot.base_url, miner.model), stop):
-            log.warning(f"slot inference probe failed uid {miner.uid}: {slot.base_url}")
-            await _safe_teardown(slots, slot, "unhealthy")
-            return None, "unhealthy"
-    except BaseException:
-        await _safe_teardown(slots, slot, "probe-aborted")
-        raise
     return slot, "ok"
 
 
 def _apply_skip(states: MinerStates, miner: Miner, status: str, *, is_king: bool) -> None:
-    """Crashloop → durable; transient/unhealthy/error on a non-king → session.
-    The king is never session-skipped — Targon hiccups must not force a
-    re-election that burns weight quota."""
+    """`crashloop` is the only miner-fault signal (vLLM crashed loading) → DURABLE.
+    Every other chal outcome — `ok` (will duel), `transient`/`timeout`/`error`
+    (our infra failed) — marks ATTEMPTED: the queue advances, chal is re-picked
+    on reign change or queue exhaustion. Marking at provision time means a chal
+    that successfully provisions is committed to using up its queue slot this
+    reign regardless of duel outcome. King isn't in the queue, so the
+    non-crashloop case is a no-op."""
     if status == "crashloop":
-        states.mark(miner.uid, art_key(miner), State.DURABLE_SKIP, "crashloop")
-    elif status in ("timeout", "unhealthy", "error") and not is_king:
-        states.mark(miner.uid, art_key(miner), State.SESSION_SKIP, status)
+        states.mark_durable(miner.uid, art_key(miner), reason=status)
+    elif not is_king:
+        states.mark_attempted(art_key(miner))
 
 
 async def _provision_pair(slots, king: Miner, chal: Miner, states: MinerStates,
                           stop: asyncio.Event,
-                          ) -> tuple[Slot | None, Slot | None, bool, str | None]:
+                          ) -> tuple[Slot | None, Slot | None, bool]:
     """Provision king and challenger concurrently with fail-fast cancellation.
 
-    Returns `(king_slot, chal_slot, king_attempt_failed, chal_status)`.
-    `king_attempt_failed` is True iff king's provision ran to completion with a
-    non-ok status; False if king was cancelled because chal failed first. The
-    caller uses this to distinguish king-fail backoff from "advance to next
-    challenger". `chal_status` is the chal task's status string (`"ok"`,
-    `"transient"`, `"crashloop"`, ...) or None if chal was cancelled — the
-    caller uses it to decide whether to mark the chal as attempted.
+    Returns `(king_slot, chal_slot, king_attempt_failed)`. `king_attempt_failed`
+    is True iff king's provision ran to completion with a non-ok status (False
+    if king was cancelled because chal failed first). The caller uses this to
+    decide king-fail backoff vs advancing to the next challenger. `_apply_skip`
+    is called internally for both miners; chal status doesn't propagate.
 
     If the first finisher fails to produce a slot, the duel is dead — cancel the
     sibling immediately rather than wait out a 15-min Targon provision we'll
@@ -453,24 +409,18 @@ async def _provision_pair(slots, king: Miner, chal: Miner, states: MinerStates,
     if outer_cancelled:
         await _teardown_got("pair-cancelled")
         raise asyncio.CancelledError()
-    # Task.exception() raises on cancelled — guard with .cancelled() (short-circuits).
-    king_attempt_failed = (not t_k.cancelled()
-                           and (t_k.exception() is not None or slots_got[0] is None))
-    chal_status: str | None = None
-    if not (t_c.cancelled() or t_c.exception() is not None):
-        _, chal_status = t_c.result()
+    king_attempt_failed = not t_k.cancelled() and slots_got[0] is None
     if fail_fast:
         await _teardown_got("pair-fail-fast")
-        return None, None, king_attempt_failed, chal_status
+        return None, None, king_attempt_failed
     king_slot, chal_slot = slots_got
-    # If only the chal failed, retain the king slot — it's the long-lived 600GB
-    # download we cache across duels. Tearing it down on every chal-only failure
-    # would force a fresh download per challenger when a churn of bad chals arrives.
-    # Caller's `if chal_slot is None: continue` handles the chal absence.
+    # King-only failure: tear down the orphan chal slot (it can't duel without a
+    # king). Chal-only failure (king ok, chal None) keeps king cached — the 600GB
+    # model download is reused across challengers.
     if king_slot is None and chal_slot is not None:
         await _safe_teardown(slots, chal_slot, "king-failed-chal-orphan")
-        return None, None, king_attempt_failed, chal_status
-    return king_slot, chal_slot, king_attempt_failed, chal_status
+        return None, None, king_attempt_failed
+    return king_slot, chal_slot, king_attempt_failed
 
 
 def _seed(uid: int, rev: str, env: str, c: int, salt: str = "") -> int:
@@ -523,9 +473,6 @@ async def _sample(chain: Chain, wrapper, params: dict, timeout: float, slot: Slo
                i=int(task_id), k=miner.model), delivered
 
 
-SIDE_FAIL_THRESHOLD = 3   # consecutive single-side Nones across diverse envs → side broken
-
-
 async def dwell(chain: Chain, king: Miner, king_slot: Slot,
                 challenger: Miner, chal_slot: Slot, miners: list[Miner],
                 rows: list[Row], envs, env_names, store: EvidenceStore,
@@ -535,18 +482,13 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
                 ) -> DuelOutcome:
     """Fisher-best env → sample king & challenger concurrently → append rows → refit.
 
-    Failure attribution:
-      env_fails[e]: BOTH sides None on env e → env-side issue; quarantine env after
-        ENV_FAIL_QUARANTINE consecutive same-env fails. If all envs quarantine, abort.
-      chal_streak: chal None / king ok across envs → chal-side artifact issue.
-        After SIDE_FAIL_THRESHOLD returns CHAL_BROKEN. Engineering optimization:
-        the chal can't dethrone (z stays below k under chal-failure), so abort
-        saves the remaining dwell budget without affecting any decision.
-
-    King-side persistent failure has no early-abort: synthetic-loss row appended
-    on each non-delivery drives the IRT contrast toward dethrone via the standard
-    z>k path. This is the "first functioning challenger wins by default" path
-    from notes/plan.md."""
+    Both sides failing on env e (or a sample raising) is attributed to env-side
+    plumbing — env_fails[e] increments, env quarantined after ENV_FAIL_QUARANTINE
+    consecutive same-env fails. If all envs quarantine, abort. Single-side
+    failures append a synthetic-loss row (p=0, l=0.0) for the failing miner;
+    accumulated synthetic losses drive the IRT contrast toward dethrone via the
+    standard z>k path (notes/plan.md "first functioning challenger wins by
+    default")."""
     rows0 = len(rows)
     def _out(status: DuelStatus, fit: Fit) -> DuelOutcome:
         return DuelOutcome(rows=rows, fit=fit, status=status, rows_added=len(rows) - rows0)
@@ -557,7 +499,6 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
     k_idx = art_keys.index(art_key(king))
     c_idx = art_keys.index(art_key(challenger))
     env_fails = [0] * len(env_names)
-    chal_streak = 0
     for i in range(cfg.dwell):
         if stop.is_set():
             return _out(DuelStatus.CANCELLED, fit)
@@ -605,32 +546,19 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
                 except BaseException as e:
                     log.warning(f"dwell sample drain interrupted ({type(e).__name__})")
             return _out(DuelStatus.CANCELLED, fit)
-        if any(isinstance(r, BaseException) for r in results):
+        env_failed = any(isinstance(r, BaseException) for r in results)
+        if env_failed:
             for r in results:
-                if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
+                if isinstance(r, Exception):
                     log.warning(f"dwell sample raised on env={env_name}: {type(r).__name__}: {r}")
-            # Sample exception: ambiguous evidence (env-side plumbing failure can't
-            # attribute to a miner). Track as env-side; don't feed side streaks.
+        else:
+            (k_row, k_ok), (c_row, c_ok) = results
+            env_failed = not k_ok and not c_ok
+        if env_failed:
             env_fails[e] += 1
-            chal_streak = 0
-            continue
-        (k_row, k_ok), (c_row, c_ok) = results
-        if not k_ok and not c_ok:
-            # Both failed → env-side: don't accumulate side-specific streak; don't
-            # record synthetic losses (we can't blame either miner when the env
-            # itself appears to be down).
-            env_fails[e] += 1
-            chal_streak = 0
             if env_fails[e] == ENV_FAIL_QUARANTINE:
                 log.warning(f"quarantine env '{env_name}' after {env_fails[e]} consecutive fails (king={king.uid} chal={challenger.uid})")
             continue
-        # At least one side delivered — env is functional. Per design intent,
-        # the failing side's loss is recorded as p=0 (synthetic-loss row carries
-        # l=0.0 to distinguish from real samples). Accumulated synthetic losses
-        # drive the IRT contrast toward dethrone (z>k) when an endpoint is
-        # persistently broken — this is the "first functioning challenger wins
-        # by default" path from notes/plan.md.
-        chal_streak = 0 if c_ok else chal_streak + 1
         env_fails[e] = 0
         store.append(k_row, c_row); rows.extend((k_row, c_row))
         fit = _fit(rows, miners, env_names, priors, init_x=init_x)
@@ -643,15 +571,6 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
             if z > k:
                 log.info(f"dwell early-stop i={i+1}/{cfg.dwell}: z={z:+.2f} > k={k:.2f}")
                 return _out(DuelStatus.COMPLETED, fit)
-
-        # Engineering shortcut: chal failing every iter can't dethrone (z stays
-        # below k as synthetic losses pile on chal's side). Aborting after K
-        # consecutive non-deliveries from chal saves the rest of the dwell.
-        # K=3 is heuristic — there's no principled threshold short of an explicit
-        # SPRT, which would just trade one set of constants (α/β) for another.
-        if chal_streak >= SIDE_FAIL_THRESHOLD:
-            log.warning(f"chal uid{challenger.uid} appears broken: {chal_streak} consecutive chal-only Nones across envs; aborting dwell")
-            return _out(DuelStatus.CHAL_BROKEN, fit)
     return _out(DuelStatus.COMPLETED, fit)
 
 
@@ -741,9 +660,9 @@ class Reign:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         payload = json.dumps({
-            "uid": int(self.champion[0]), "revision": str(self.champion[1]),
-            "reign_start": int(self.start_block),
-            "last_published_uid": (int(self.last_published_uid) if self.last_published_uid is not None else None),
+            "uid": self.champion[0], "revision": self.champion[1],
+            "reign_start": self.start_block,
+            "last_published_uid": self.last_published_uid,
         }).encode()
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
@@ -806,9 +725,7 @@ def _miner_pl(m: Miner) -> dict:
 def _audit_verdict(verdict_str: str, king: Miner, chal: Miner, ev: VerdictEvidence) -> None:
     log.info(f"verdict: Δθ̂={ev.delta:+.3f}±{ev.se:.3f} z={ev.z:+.2f} k={ev.k:.2f} reign={ev.reign_blocks}b")
     audit(type="duel", verdict=verdict_str,
-          king=_miner_pl(king), challenger=_miner_pl(chal),
-          delta=ev.delta, se=ev.se, z=ev.z, k=ev.k,
-          reign_blocks=ev.reign_blocks, rows_per_env=ev.rows_per_env)
+          king=_miner_pl(king), challenger=_miner_pl(chal), **asdict(ev))
 
 
 async def run(cfg: Config, chain: Chain, slots=None):
@@ -877,7 +794,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 champion_art = art_key(king)
                 queue = sorted(
                     (m for m in miners if art_key(m) != champion_art
-                                       and states.state(m.uid, art_key(m)) is State.UNTRIED),
+                                       and not states.is_attempted(art_key(m))),
                     key=lambda m: (m.block, _tiebreak(m)),
                 )
                 if not queue:
@@ -887,46 +804,27 @@ async def run(cfg: Config, chain: Chain, slots=None):
 
                 challenger = queue[0]
 
-                if state.king_slot is not None and not await _cancellable(
-                        inference_ping(state.king_slot.base_url, king.model), stop):
-                    log.warning(f"cached king slot unhealthy; re-provisioning")
-                    await _drop_king(state, slots)
-
                 chal_slot: Slot | None = None
                 king_attempt_failed = False
-                chal_status: str | None = None
                 try:
                     if state.king_slot is None:
-                        state.king_slot, chal_slot, king_attempt_failed, chal_status = await _provision_pair(
+                        state.king_slot, chal_slot, king_attempt_failed = await _provision_pair(
                             slots, king, challenger, states, stop)
                     else:
-                        chal_slot, chal_status = await _provision(slots, challenger, stop)
-                        _apply_skip(states, challenger, chal_status, is_king=False)
+                        chal_slot, status = await _provision(slots, challenger, stop)
+                        _apply_skip(states, challenger, status, is_king=False)
                 except asyncio.CancelledError:
                     if stop.is_set(): break
                     raise
 
-                # Mark attempted only when chal genuinely got tested. SESSION/DURABLE chals
-                # are filtered out of the queue; transient failures need to retry next iter
-                # rather than be locked out for the rest of the reign.
-                if chal_slot is not None:
-                    states.mark(challenger.uid, art_key(challenger), State.ATTEMPTED, "tested")
-
-                # Targon-side failure (king failed OR chal hit a transient httpx error)
-                # → exponential backoff to avoid hammering during outages. Other chal
-                # failures (crashloop/timeout/unhealthy/error) trigger _apply_skip
-                # which filters chal from the queue, so the next iter exercises a
-                # different chal — no backoff needed. _provision_pair guarantees
-                # `state.king_slot is None ⇒ chal_slot is None` on return.
-                if (state.king_slot is None and king_attempt_failed) or chal_status == "transient":
-                    # ±25% jitter de-syncs validators sharing a Targon API key so
-                    # their retry waves don't self-amplify the outage on Targon's side.
-                    sleep_s = state.provision_backoff * (0.75 + 0.5 * rng.random())
-                    log.warning(f"provision blip (king_failed={king_attempt_failed}, chal={chal_status}); "
-                                f"sleeping {sleep_s:.0f}s")
-                    await _cancellable(asyncio.sleep(sleep_s), stop)
+                # King-failed → backoff to avoid hammering Targon. Chal failures are
+                # already ATTEMPTED via _apply_skip; the queue advances next iter,
+                # and queue exhaustion provides the natural multi-chal backoff (120s).
+                if king_attempt_failed:
+                    log.warning(f"king provision failed; sleeping {state.provision_backoff}s")
+                    await _cancellable(asyncio.sleep(state.provision_backoff), stop)
                     state.provision_backoff = min(state.provision_backoff * 2, 600)
-                if state.king_slot is None or chal_slot is None:
+                if chal_slot is None:
                     continue
                 state.provision_backoff = 60
 
@@ -965,9 +863,6 @@ async def run(cfg: Config, chain: Chain, slots=None):
 
                     match verdict:
                         case Skip(reason=reason):
-                            if reason == "chal_broken":
-                                states.mark(challenger.uid, art_key(challenger),
-                                            State.SESSION_SKIP, "chal_broken")
                             log.info(f"duel aborted ({reason}, rows={out.rows_added}); skipping verdict")
                             audit(type="duel_aborted", reason=reason,
                                   king=_miner_pl(king), challenger=_miner_pl(challenger))
@@ -1005,15 +900,13 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 await _cancellable(asyncio.sleep(60), stop)
     finally:
         log.info("shutdown")
-        if state.king_slot is not None:
-            try: await _safe_teardown(slots, state.king_slot, "shutdown")
-            except Exception as e: log.warning(f"king teardown on shutdown: {e}")
+        await _drop_king(state, slots)
         seen: set[int] = set()
         for wrapper, _ in envs.values():
             if id(wrapper) in seen: continue
             seen.add(id(wrapper))
             try: await asyncio.wait_for(wrapper.cleanup(), timeout=30.0)
-            except (Exception, asyncio.TimeoutError) as e:
+            except Exception as e:
                 log.warning(f"env cleanup: {e}")
 
 

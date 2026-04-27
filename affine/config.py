@@ -183,7 +183,7 @@ def _validate(cfg: Config) -> None:
     # dethrone strictly worse challengers. The minimum useful threshold is 1σ.
     if cfg.k_final <= 0:
         raise ValueError(f"k_final must be > 0, got {cfg.k_final}")
-    if not (cfg.k_final <= cfg.k_init):
+    if cfg.k_final > cfg.k_init:
         raise ValueError(f"k_final ({cfg.k_final}) must be <= k_init ({cfg.k_init})")
     for n in ("sigma_beta", "sigma_alpha"):
         v = getattr(cfg, n)

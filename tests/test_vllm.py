@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from affine.vllm import LocalSlots, Slot, SlotProvisionFailed, TargonSlots, health_ping, inference_ping
+from affine.vllm import LocalSlots, Slot, SlotProvisionFailed, TargonSlots, health_ping
 
 HOTKEY = "test-hotkey"
 
@@ -103,53 +103,6 @@ async def test_health_ping_exception_returns_false():
     factory = _ClientFactory([RuntimeError("boom")])
     with patch("affine.vllm.httpx.AsyncClient", factory):
         assert await health_ping("http://svc", timeout=1) is False
-
-
-@pytest.mark.asyncio
-async def test_inference_ping_success():
-    factory = _ClientFactory([SimpleNamespace(status_code=200)])
-    with patch("affine.vllm.httpx.AsyncClient", factory):
-        assert await inference_ping("http://svc", "m") is True
-
-
-@pytest.mark.asyncio
-async def test_inference_ping_gateway_5xx_is_false():
-    """Targon's failure mode: /models returns 200 but /chat/completions returns 502.
-    With retries enabled, three consecutive 502s confirm the slot is dead."""
-    factory = _ClientFactory([SimpleNamespace(status_code=502)] * 3)
-    with patch("affine.vllm.httpx.AsyncClient", factory), \
-         patch("affine.vllm.asyncio.sleep", AsyncMock()):
-        assert await inference_ping("http://svc", "m") is False
-
-
-@pytest.mark.asyncio
-async def test_inference_ping_exception_returns_false():
-    factory = _ClientFactory([RuntimeError("net down")] * 3)
-    with patch("affine.vllm.httpx.AsyncClient", factory), \
-         patch("affine.vllm.asyncio.sleep", AsyncMock()):
-        assert await inference_ping("http://svc", "m") is False
-
-
-@pytest.mark.asyncio
-async def test_inference_ping_429_then_success():
-    """Transient Targon throttle should not tear down a healthy slot."""
-    factory = _ClientFactory([
-        SimpleNamespace(status_code=429),
-        SimpleNamespace(status_code=200),
-    ])
-    with patch("affine.vllm.httpx.AsyncClient", factory), \
-         patch("affine.vllm.asyncio.sleep", AsyncMock()):
-        assert await inference_ping("http://svc", "m") is True
-
-
-@pytest.mark.asyncio
-async def test_inference_ping_4xx_no_retry():
-    """Non-throttle 4xx (e.g. bad model name) is fatal — no point retrying."""
-    factory = _ClientFactory([SimpleNamespace(status_code=400)])
-    with patch("affine.vllm.httpx.AsyncClient", factory), \
-         patch("affine.vllm.asyncio.sleep", AsyncMock()):
-        assert await inference_ping("http://svc", "m") is False
-    assert factory.calls == 1
 
 
 @pytest.mark.asyncio
