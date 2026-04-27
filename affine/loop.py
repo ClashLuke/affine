@@ -45,7 +45,7 @@ from .evidence import EvidenceStore, Row, atomic_append
 from .irt import Fit, Priors, compute_k, fisher_env, fit_2pl
 from .sampler import run_one
 from .verdict import ArtKey, Dethrone, DuelStatus, Hold, Skip, VerdictEvidence, decide
-from .vllm import Slot, SlotProvisionFailed, TargonSlots, health_ping, inference_ping
+from .vllm import Slot, SlotProvisionFailed, TargonSlots, inference_ping
 
 log = logging.getLogger(__name__)
 
@@ -300,7 +300,10 @@ async def _cancellable(coro, stop: asyncio.Event, on_orphan=None):
                 # Worker exceeded its cleanup budget — it's still pending, we're
                 # losing the reference. Reconcile() at next startup is the backstop.
                 log.warning("_cancellable: worker cleanup exceeded 60s; rental may leak until reconcile")
-            except BaseException: pass
+            except BaseException as e:
+                # Recursive cancellation during shielded await: worker still running,
+                # not awaited. Same leak class as TimeoutError above.
+                log.warning(f"_cancellable: shielded wait interrupted ({type(e).__name__}); rental may leak until reconcile")
         if not delivered and worker.done() and not worker.cancelled() and worker.exception() is None:
             orphan = worker.result()
             if on_orphan is not None and orphan is not None:
@@ -309,12 +312,12 @@ async def _cancellable(coro, stop: asyncio.Event, on_orphan=None):
                     log.warning(f"_cancellable: on_orphan failed: {type(e).__name__}: {e}")
 
 
-async def _safe_teardown(slots, slot: Slot, ctx: str = "") -> None:
+async def _safe_teardown(slots, slot: Slot, ctx: str) -> None:
     """Shielded so an outer cancel during teardown doesn't interrupt the Targon
     DELETE — the request keeps flying as a fire-and-forget task; reconcile() at
     next startup is the backstop. CancelledError still propagates to the caller."""
     try: await asyncio.shield(slots.teardown(slot))
-    except Exception as e: log.warning(f"teardown error{f' ({ctx})' if ctx else ''}: {e}")
+    except Exception as e: log.warning(f"teardown error ({ctx}): {e}")
 
 
 async def _provision(slots, miner: Miner, stop: asyncio.Event) -> tuple[Slot | None, str]:
@@ -348,10 +351,6 @@ async def _provision(slots, miner: Miner, stop: asyncio.Event) -> tuple[Slot | N
         log.error(f"provision error uid {miner.uid}: {e}")
         return None, "error"
     try:
-        if not await _cancellable(health_ping(slot.base_url), stop):
-            log.warning(f"slot unhealthy post-provision uid {miner.uid}: {slot.base_url}")
-            await _safe_teardown(slots, slot, "unhealthy")
-            return None, "unhealthy"
         if not await _cancellable(inference_ping(slot.base_url, miner.model), stop):
             log.warning(f"slot inference probe failed uid {miner.uid}: {slot.base_url}")
             await _safe_teardown(slots, slot, "unhealthy")
@@ -399,7 +398,8 @@ async def _provision_pair(slots, king: Miner, chal: Miner, states: MinerStates,
             if not t.done(): t.cancel()
         for t in (t_k, t_c):
             try: await asyncio.shield(t)
-            except BaseException: pass
+            except BaseException as e:
+                log.warning(f"_provision_pair drain interrupted ({type(e).__name__}); rental may leak")
             if t.done() and not t.cancelled() and t.exception() is None:
                 slot, _ = t.result()
                 if slot is not None:
@@ -487,11 +487,13 @@ def _seed(uid: int, rev: str, env: str, c: int, salt: str = "") -> int:
 
 def _task_id(king_uid: int, chal_uid: int, env: str, iter_idx: int,
              lo: int, hi: int, salt: str = "") -> int:
-    """Per-iteration task_id, shared by king and challenger so the verdict is
-    matched-task. Order-invariant in (king, chal) so reversing the duel picks the
-    same sequence. Uniform over [lo, hi]. See `_seed` for the salt/commit-reveal
-    contract."""
-    a, b = (king_uid, chal_uid) if king_uid <= chal_uid else (chal_uid, king_uid)
+    """Per-iter task id, shared by king and challenger. Order-invariant in the
+    pair so swapping who-is-king doesn't reshuffle the schedule. design.md
+    §"Challenge-centric evidence": both miners face the same instance,
+    eliminating between-task variance — the duel measures relative capability
+    on the same work, not relative luck on adjacent work. Uniform over [lo, hi].
+    See `_seed` for the salt/commit-reveal contract."""
+    a, b = sorted((king_uid, chal_uid))
     h = hashlib.sha256(f"{salt}\0{a}\0{b}\0{env}\0{iter_idx}".encode()).digest()
     n = hi - lo + 1
     return lo + (int.from_bytes(h[:8], "big") % n)
@@ -533,25 +535,18 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
                 ) -> DuelOutcome:
     """Fisher-best env → sample king & challenger concurrently → append rows → refit.
 
-    Three independent streaks track failure attribution:
+    Failure attribution:
       env_fails[e]: BOTH sides None on env e → env-side issue; quarantine env after
         ENV_FAIL_QUARANTINE consecutive same-env fails. If all envs quarantine, abort.
-      chal_streak: chal None / king ok across envs → chal-side artifact issue (broken
-        endpoint, model OOM). After SIDE_FAIL_THRESHOLD returns CHAL_BROKEN so the
-        caller can session-skip the chal artifact and advance.
-      king_streak: king None / chal ok across envs → king-side issue (memory leak,
-        host-level fault that 1-token health probes don't detect). Returns KING_BROKEN;
-        caller drops the king slot. Re-provision next iter — Targon may give a
-        different physical host that doesn't have the leak.
+      chal_streak: chal None / king ok across envs → chal-side artifact issue.
+        After SIDE_FAIL_THRESHOLD returns CHAL_BROKEN. Engineering optimization:
+        the chal can't dethrone (z stays below k under chal-failure), so abort
+        saves the remaining dwell budget without affecting any decision.
 
-    Mixing all three into env_fails (the prior bug) made a chal-only-broken miner
-    eventually quarantine every env and abort with no rows, while a king-only-broken
-    king reigned forever because no signal differentiated it from env failures.
-
-    Early-stop: after each refit, if z = Δθ̂/SE > k(reign) the duel returns
-    COMPLETED — `decide()` will produce Dethrone from the same fit. Plan §6
-    early-stop. Optional stopping is consistent with the Laplace posterior;
-    k_init=3 keeps cumulative type-I < 1% across the ~dwell looks."""
+    King-side persistent failure has no early-abort: synthetic-loss row appended
+    on each non-delivery drives the IRT contrast toward dethrone via the standard
+    z>k path. This is the "first functioning challenger wins by default" path
+    from notes/plan.md."""
     rows0 = len(rows)
     def _out(status: DuelStatus, fit: Fit) -> DuelOutcome:
         return DuelOutcome(rows=rows, fit=fit, status=status, rows_added=len(rows) - rows0)
@@ -563,7 +558,6 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
     c_idx = art_keys.index(art_key(challenger))
     env_fails = [0] * len(env_names)
     chal_streak = 0
-    king_streak = 0
     for i in range(cfg.dwell):
         if stop.is_set():
             return _out(DuelStatus.CANCELLED, fit)
@@ -608,7 +602,8 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
                 if not t.done(): t.cancel()
             for t in (t_k, t_c):
                 try: await asyncio.shield(t)
-                except BaseException: pass
+                except BaseException as e:
+                    log.warning(f"dwell sample drain interrupted ({type(e).__name__})")
             return _out(DuelStatus.CANCELLED, fit)
         if any(isinstance(r, BaseException) for r in results):
             for r in results:
@@ -617,7 +612,7 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
             # Sample exception: ambiguous evidence (env-side plumbing failure can't
             # attribute to a miner). Track as env-side; don't feed side streaks.
             env_fails[e] += 1
-            chal_streak = king_streak = 0
+            chal_streak = 0
             continue
         (k_row, k_ok), (c_row, c_ok) = results
         if not k_ok and not c_ok:
@@ -625,33 +620,22 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
             # record synthetic losses (we can't blame either miner when the env
             # itself appears to be down).
             env_fails[e] += 1
-            chal_streak = king_streak = 0
+            chal_streak = 0
             if env_fails[e] == ENV_FAIL_QUARANTINE:
                 log.warning(f"quarantine env '{env_name}' after {env_fails[e]} consecutive fails (king={king.uid} chal={challenger.uid})")
             continue
         # At least one side delivered — env is functional. Per design intent,
         # the failing side's loss is recorded as p=0 (synthetic-loss row carries
-        # l=0.0 to distinguish from real samples). Side streaks still trigger
-        # KING_BROKEN/CHAL_BROKEN abort so we stop wasting compute on a
-        # confirmed-broken endpoint, but the accumulated loss rows let a
-        # functional challenger eventually dethrone a chronically-broken king
-        # via cross-duel evidence.
-        king_streak = 0 if k_ok else king_streak + 1
+        # l=0.0 to distinguish from real samples). Accumulated synthetic losses
+        # drive the IRT contrast toward dethrone (z>k) when an endpoint is
+        # persistently broken — this is the "first functioning challenger wins
+        # by default" path from notes/plan.md.
         chal_streak = 0 if c_ok else chal_streak + 1
         env_fails[e] = 0
         store.append(k_row, c_row); rows.extend((k_row, c_row))
         fit = _fit(rows, miners, env_names, priors, init_x=init_x)
         if not fit.degenerate:
             init_x = np.concatenate([fit.theta, fit.beta, fit.alpha])
-
-        if king_streak >= SIDE_FAIL_THRESHOLD:
-            log.warning(f"king uid{king.uid} appears broken: {king_streak} consecutive king-only Nones across envs; aborting dwell")
-            return _out(DuelStatus.KING_BROKEN, fit)
-        if chal_streak >= SIDE_FAIL_THRESHOLD:
-            log.warning(f"chal uid{challenger.uid} appears broken: {chal_streak} consecutive chal-only Nones across envs; aborting dwell")
-            return _out(DuelStatus.CHAL_BROKEN, fit)
-
-        if not fit.degenerate:
             delta, se = fit.contrast(c_idx, k_idx)
             z = delta / se if se > 0 else 0.0
             k = compute_k(block - reign_start_block,
@@ -659,6 +643,15 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
             if z > k:
                 log.info(f"dwell early-stop i={i+1}/{cfg.dwell}: z={z:+.2f} > k={k:.2f}")
                 return _out(DuelStatus.COMPLETED, fit)
+
+        # Engineering shortcut: chal failing every iter can't dethrone (z stays
+        # below k as synthetic losses pile on chal's side). Aborting after K
+        # consecutive non-deliveries from chal saves the rest of the dwell.
+        # K=3 is heuristic — there's no principled threshold short of an explicit
+        # SPRT, which would just trade one set of constants (α/β) for another.
+        if chal_streak >= SIDE_FAIL_THRESHOLD:
+            log.warning(f"chal uid{challenger.uid} appears broken: {chal_streak} consecutive chal-only Nones across envs; aborting dwell")
+            return _out(DuelStatus.CHAL_BROKEN, fit)
     return _out(DuelStatus.COMPLETED, fit)
 
 
@@ -728,6 +721,8 @@ class Reign:
             return None
         try:
             d = json.loads(path.read_text())
+            if not isinstance(d, dict):
+                raise TypeError(f"reign state must be a JSON object, got {type(d).__name__}")
             lp = d.get("last_published_uid")
             return cls(
                 champion=(int(d["uid"]), str(d["revision"])),
@@ -771,9 +766,9 @@ class DuelOutcome:
 
 @dataclass
 class LoopState:
-    reign: Reign | None
-    king_slot: Slot | None
-    king_fail_backoff: int
+    reign: Reign | None = None
+    king_slot: Slot | None = None
+    provision_backoff: int = 60   # exponential Targon-API-wide backoff; 60→600s
 
 
 async def _drop_king(state: LoopState, slots) -> None:
@@ -810,7 +805,7 @@ def _miner_pl(m: Miner) -> dict:
 
 def _audit_verdict(verdict_str: str, king: Miner, chal: Miner, ev: VerdictEvidence) -> None:
     log.info(f"verdict: Δθ̂={ev.delta:+.3f}±{ev.se:.3f} z={ev.z:+.2f} k={ev.k:.2f} reign={ev.reign_blocks}b")
-    audit(type="duel", verdict=verdict_str, abort_reason=None,
+    audit(type="duel", verdict=verdict_str,
           king=_miner_pl(king), challenger=_miner_pl(chal),
           delta=ev.delta, se=ev.se, z=ev.z, k=ev.k,
           reign_blocks=ev.reign_blocks, rows_per_env=ev.rows_per_env)
@@ -824,7 +819,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
     # state.king_slot persists across duels within a reign — re-provisioning a
     # 600GB model download per challenger is the dominant cost. Hoisted out of
     # the inner try so the outer finally can shield-tear it down even on init failure.
-    state = LoopState(None, None, 60)
+    state = LoopState()
     try:
         env_names = [spec.name for spec in cfg.environments]
         store = EvidenceStore(cfg.evidence_path)
@@ -892,10 +887,8 @@ async def run(cfg: Config, chain: Chain, slots=None):
 
                 challenger = queue[0]
 
-                if state.king_slot is not None and not (
-                    await _cancellable(health_ping(state.king_slot.base_url), stop)
-                    and await _cancellable(inference_ping(state.king_slot.base_url, king.model), stop)
-                ):
+                if state.king_slot is not None and not await _cancellable(
+                        inference_ping(state.king_slot.base_url, king.model), stop):
                     log.warning(f"cached king slot unhealthy; re-provisioning")
                     await _drop_king(state, slots)
 
@@ -919,23 +912,23 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 if chal_slot is not None:
                     states.mark(challenger.uid, art_key(challenger), State.ATTEMPTED, "tested")
 
-                if state.king_slot is None:
-                    if chal_slot is not None: await _safe_teardown(slots, chal_slot, "king-failed")
-                    if king_attempt_failed:
-                        log.warning(f"king uid {king.uid} provision failed; sleeping {state.king_fail_backoff}s before retry")
-                        # Keep champion identity — only reset if chain says they're gone. Don't
-                        # re-elect just because Targon hiccuped, or we burn `set_weights` quota.
-                        await _cancellable(asyncio.sleep(state.king_fail_backoff), stop)
-                        state.king_fail_backoff = min(state.king_fail_backoff * 2, 600)
-                    else:
-                        # King was cancelled by chal-fail-fast. Chal got marked via
-                        # _apply_skip if status was definitive; transient leaves chal in
-                        # the queue for next-iter retry. Either way: advance.
-                        log.info(f"chal uid {challenger.uid} provision failed ({chal_status}); advancing without king backoff")
+                # Targon-side failure (king failed OR chal hit a transient httpx error)
+                # → exponential backoff to avoid hammering during outages. Other chal
+                # failures (crashloop/timeout/unhealthy/error) trigger _apply_skip
+                # which filters chal from the queue, so the next iter exercises a
+                # different chal — no backoff needed. _provision_pair guarantees
+                # `state.king_slot is None ⇒ chal_slot is None` on return.
+                if (state.king_slot is None and king_attempt_failed) or chal_status == "transient":
+                    # ±25% jitter de-syncs validators sharing a Targon API key so
+                    # their retry waves don't self-amplify the outage on Targon's side.
+                    sleep_s = state.provision_backoff * (0.75 + 0.5 * rng.random())
+                    log.warning(f"provision blip (king_failed={king_attempt_failed}, chal={chal_status}); "
+                                f"sleeping {sleep_s:.0f}s")
+                    await _cancellable(asyncio.sleep(sleep_s), stop)
+                    state.provision_backoff = min(state.provision_backoff * 2, 600)
+                if state.king_slot is None or chal_slot is None:
                     continue
-                state.king_fail_backoff = 60
-                if chal_slot is None:
-                    continue
+                state.provision_backoff = 60
 
                 # chal_slot lifetime is owned by this block: only retained on a
                 # successful dethrone (promoted to state.king_slot). Every other
@@ -975,9 +968,6 @@ async def run(cfg: Config, chain: Chain, slots=None):
                             if reason == "chal_broken":
                                 states.mark(challenger.uid, art_key(challenger),
                                             State.SESSION_SKIP, "chal_broken")
-                            elif reason == "king_broken":
-                                log.warning(f"king uid{king.uid} mid-dwell broken; dropping slot for re-provision")
-                                await _drop_king(state, slots)
                             log.info(f"duel aborted ({reason}, rows={out.rows_added}); skipping verdict")
                             audit(type="duel_aborted", reason=reason,
                                   king=_miner_pl(king), challenger=_miner_pl(challenger))

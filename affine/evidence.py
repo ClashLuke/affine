@@ -87,6 +87,8 @@ def read_rows(path: str | Path) -> list[Row]:
                 # parse_constant rejects NaN/Infinity. json.loads accepts both
                 # by default and they'd silently flow into the IRT fit / counters.
                 d = json.loads(line, parse_constant=_reject_constant)
+                if not isinstance(d, dict):
+                    raise TypeError(f"row must be a JSON object, got {type(d).__name__}")
                 if not (isinstance(d.get("r"), str) and isinstance(d.get("e"), str)):
                     raise TypeError(f"r/e must be strings, got r={type(d.get('r')).__name__} e={type(d.get('e')).__name__}")
                 lat = float(d["l"])

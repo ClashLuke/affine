@@ -99,6 +99,15 @@ def test_reign_state_corrupt_file_resets(tmp_path):
     assert Reign.load(p) is None
     p.write_text('{"uid": "not-int", "revision": "r", "reign_start": 1}')
     assert Reign.load(p) is None
+    # Non-dict JSON: array, scalar, string. d.get(...) on non-dict raises
+    # AttributeError; without explicit isinstance(d, dict) check, the load
+    # crashes startup instead of falling back to cold-elect.
+    p.write_text("[1, 2, 3]")
+    assert Reign.load(p) is None
+    p.write_text("42")
+    assert Reign.load(p) is None
+    p.write_text('"a string"')
+    assert Reign.load(p) is None
 
 
 def test_reign_state_atomic_replace(tmp_path):
@@ -408,15 +417,15 @@ async def test_provision_pair_skips_shared_artifact_on_chal_crashloop(tmp_path):
 
     from affine import loop as loop_mod
     async def _ok(*a, **kw): return True
-    orig_h, orig_i = loop_mod.health_ping, loop_mod.inference_ping
-    loop_mod.health_ping = _ok; loop_mod.inference_ping = _ok
+    orig_i = loop_mod.inference_ping
+    loop_mod.inference_ping = _ok
     try:
         await _provision_pair(_Slots(),
                               _miner(0, model="shared", rev="r1"),
                               _miner(1, model="shared", rev="r1"),
                               states, stop)
     finally:
-        loop_mod.health_ping = orig_h; loop_mod.inference_ping = orig_i
+        loop_mod.inference_ping = orig_i
 
     # Whichever side completes its provision call writes DURABLE for its (uid, art).
     # The other may be cancelled by fail-fast and stay UNTRIED — but next iter will
@@ -453,14 +462,14 @@ async def test_provision_pair_fail_fast_cancels_sibling(tmp_path):
 
     from affine import loop as loop_mod
     async def _ok(*a, **kw): return True
-    orig_h, orig_i = loop_mod.health_ping, loop_mod.inference_ping
-    loop_mod.health_ping = _ok; loop_mod.inference_ping = _ok
+    orig_i = loop_mod.inference_ping
+    loop_mod.inference_ping = _ok
     try:
         k_slot, c_slot, king_failed, _ = await _provision_pair(_Slots(),
                                                _miner(0, model="king"), _miner(1, model="chal"),
                                                states, stop)
     finally:
-        loop_mod.health_ping = orig_h; loop_mod.inference_ping = orig_i
+        loop_mod.inference_ping = orig_i
 
     assert k_slot is None and c_slot is None
     assert king_failed, "king's task ran to completion with crashloop status"
@@ -492,14 +501,14 @@ async def test_provision_pair_chal_fails_first_does_not_blame_king(tmp_path):
 
     from affine import loop as loop_mod
     async def _ok(*a, **kw): return True
-    orig_h, orig_i = loop_mod.health_ping, loop_mod.inference_ping
-    loop_mod.health_ping = _ok; loop_mod.inference_ping = _ok
+    orig_i = loop_mod.inference_ping
+    loop_mod.inference_ping = _ok
     try:
         k_slot, c_slot, king_failed, _ = await _provision_pair(_Slots(),
                                                             _miner(0, model="king"), _miner(1, model="chal"),
                                                             states, stop)
     finally:
-        loop_mod.health_ping = orig_h; loop_mod.inference_ping = orig_i
+        loop_mod.inference_ping = orig_i
 
     assert k_slot is None and c_slot is None
     assert king_failed is False, "king was cancelled by chal-fail-fast, not a real king failure"
@@ -532,14 +541,14 @@ async def test_provision_pair_king_succeeds_chal_fails_retains_king(tmp_path):
 
     from affine import loop as loop_mod
     async def _ok(*a, **kw): return True
-    orig_h, orig_i = loop_mod.health_ping, loop_mod.inference_ping
-    loop_mod.health_ping = _ok; loop_mod.inference_ping = _ok
+    orig_i = loop_mod.inference_ping
+    loop_mod.inference_ping = _ok
     try:
         k_slot, c_slot, king_failed, _ = await _provision_pair(_Slots(),
                                                              _miner(0, model="king"), _miner(1, model="chal"),
                                                              states, stop)
     finally:
-        loop_mod.health_ping = orig_h; loop_mod.inference_ping = orig_i
+        loop_mod.inference_ping = orig_i
 
     assert k_slot is not None and k_slot.model == "king"
     assert c_slot is None
@@ -566,14 +575,14 @@ async def test_provision_pair_king_fails_chal_succeeds_tears_chal(tmp_path):
 
     from affine import loop as loop_mod
     async def _ok(*a, **kw): return True
-    orig_h, orig_i = loop_mod.health_ping, loop_mod.inference_ping
-    loop_mod.health_ping = _ok; loop_mod.inference_ping = _ok
+    orig_i = loop_mod.inference_ping
+    loop_mod.inference_ping = _ok
     try:
         k_slot, c_slot, king_failed, _ = await _provision_pair(_Slots(),
                                                              _miner(0, model="king"), _miner(1, model="chal"),
                                                              states, stop)
     finally:
-        loop_mod.health_ping = orig_h; loop_mod.inference_ping = orig_i
+        loop_mod.inference_ping = orig_i
 
     assert k_slot is None and c_slot is None
     assert king_failed is True
@@ -599,8 +608,8 @@ async def test_provision_pair_partial_failure_tears_down_survivor(tmp_path):
     # on stop. health_ping/inference_ping would otherwise block — patch them too.
     from affine import loop as loop_mod
     async def _ok(*a, **kw): return True
-    orig_h, orig_i = loop_mod.health_ping, loop_mod.inference_ping
-    loop_mod.health_ping = _ok; loop_mod.inference_ping = _ok
+    orig_i = loop_mod.inference_ping
+    loop_mod.inference_ping = _ok
     try:
         async def fire():
             await asyncio.sleep(0.05); stop.set()
@@ -611,7 +620,7 @@ async def test_provision_pair_partial_failure_tears_down_survivor(tmp_path):
                                   states, stop)
         await fire_task
     finally:
-        loop_mod.health_ping = orig_h; loop_mod.inference_ping = orig_i
+        loop_mod.inference_ping = orig_i
     assert teardowns == ["king"]
 
 
@@ -1133,10 +1142,12 @@ async def test_dwell_aborts_with_chal_broken_records_synthetic_loss(tmp_path, mo
 
 
 @pytest.mark.asyncio
-async def test_dwell_aborts_with_king_broken_when_only_king_returns_none(tmp_path, monkeypatch):
-    """Mirror: king-only-fails (vLLM memory leak surviving 1-token health probe)
-    must surface as 'king_broken' so the loop drops the slot. Without this the
-    king reigns forever — the 1-token cached-king probe doesn't catch it."""
+async def test_dwell_dethrones_broken_king_via_synthetic_loss(tmp_path, monkeypatch):
+    """Per notes/plan.md ('first functioning challenger wins by default'), a
+    king whose endpoint persistently fails must dethrone within a single duel
+    via accumulated synthetic losses + z>k early-stop. There is no KING_BROKEN
+    abort — that path was removed because it interrupted the principled
+    dethrone path with an arbitrary K=3 streak threshold."""
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
         return (None if slot.model == "mk" else True), 0.01
     monkeypatch.setattr("affine.loop.run_one", split)
@@ -1146,21 +1157,22 @@ async def test_dwell_aborts_with_king_broken_when_only_king_returns_none(tmp_pat
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=30, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(dwell=30, evidence_path=str(tmp_path / "ev.jsonl"),
+                 k_init=3.0, k_final=3.0, k_halflife=1)
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
         [king, chal], [], envs, list(envs), store, cfg, Priors(),
         np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
     )
-    rows, _, abort = out.rows, out.fit, out.status
-    assert abort is DuelStatus.KING_BROKEN
-    king_rows = [r for r in rows if r.m == king.uid]
-    chal_rows = [r for r in rows if r.m == chal.uid]
-    assert len(king_rows) == len(chal_rows) > 0
-    assert all(r.p == 0 and r.l == 0.0 for r in king_rows)   # synthetic loss
+    assert out.status is DuelStatus.COMPLETED
+    delta, se = out.fit.contrast(1, 0)
+    z = delta / se if se > 0 else 0
+    assert z > 3.0, f"broken king should yield dethrone-grade z; got {z:+.2f}"
+    king_rows = [r for r in out.rows if r.m == king.uid]
+    chal_rows = [r for r in out.rows if r.m == chal.uid]
+    assert all(r.p == 0 and r.l == 0.0 for r in king_rows)
     assert all(r.p == 1 for r in chal_rows)
-    assert rows == store.read()
 
 
 @pytest.mark.asyncio
@@ -1243,11 +1255,10 @@ async def test_dwell_env_fails_resets_on_single_side_success(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_dwell_synthetic_loss_drives_dethrone_against_broken_king(tmp_path, monkeypatch):
-    """Cross-duel evidence accumulation: a chronically-broken king accumulates
-    synthetic-loss rows over multiple aborted dwells. Once enough are stacked,
-    the next dwell's first refit shows θ̂_chal ≫ θ̂_king with tight SE → early-stop
-    z>k. Without synthetic-loss recording, the broken king reigned forever
-    (KING_BROKEN aborts produced zero negative evidence per duel)."""
+    """Cross-duel evidence accumulation against a broken king. Each duel ends
+    via z>k early-stop (single-duel dethrone path is verified separately); this
+    test's purpose is to confirm the rows persist across duels and the joint
+    fit on accumulated evidence produces dethrone-grade z for the latest chal."""
     async def king_broken(wrapper, params, timeout, slot, seed, task_id=0):
         return (None if slot.model == "mk" else True), 0.01
     monkeypatch.setattr("affine.loop.run_one", king_broken)
@@ -1341,7 +1352,6 @@ async def test_run_cold_starts_and_dethrones(tmp_path, monkeypatch):
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
     }))
-    monkeypatch.setattr("affine.loop.health_ping", AsyncMock(return_value=True))
     monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
@@ -1390,7 +1400,6 @@ async def test_dethrone_resilient_to_king_teardown_error(tmp_path, monkeypatch):
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
     }))
-    monkeypatch.setattr("affine.loop.health_ping", AsyncMock(return_value=True))
     monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
@@ -1449,7 +1458,6 @@ async def test_run_caches_king_across_duels_in_reign(tmp_path, monkeypatch):
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
     }))
-    monkeypatch.setattr("affine.loop.health_ping", AsyncMock(return_value=True))
     monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
@@ -1492,6 +1500,52 @@ async def test_run_caches_king_across_duels_in_reign(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_chal_transient_triggers_exponential_backoff(tmp_path, monkeypatch):
+    """Regression: chal-side `transient` (httpx error) must engage the same
+    exponential backoff as king-side failures. Without symmetric backoff, a
+    Targon-API outage tight-loops on the same UNTRIED chal hammering the API."""
+    from affine.loop import run
+    import httpx
+
+    monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
+        "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
+    }))
+    monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
+    async def _run_one(*a, **kw): return True, 0.01
+    monkeypatch.setattr("affine.loop.run_one", _run_one)
+
+    sleep_durations: list[float] = []
+    async def capture_sleep(d, *a, **kw):
+        sleep_durations.append(d)
+        if len(sleep_durations) >= 4:
+            import os, signal
+            os.kill(os.getpid(), signal.SIGINT)
+    monkeypatch.setattr("affine.loop.asyncio.sleep", capture_sleep)
+
+    miners = [_miner(0, model="mk"), _miner(1, model="mc")]
+    async def list_miners(): return miners
+    async def current_block(): return 0
+    async def publish(uid, hk=""): return True
+    chain = Chain(hotkey="V", list_miners=list_miners,
+                  current_block=current_block, publish_winner=publish)
+    cfg = Config(dwell=3, evidence_path=str(tmp_path / "ev.jsonl"),
+                 environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
+                 k_init=10.0, k_final=10.0, k_halflife=1)
+
+    class _ChalTransientSlots(_FakeSlots):
+        async def provision(self, model, revision):
+            if model.startswith("mc"):
+                raise httpx.ConnectError("targon api unreachable")
+            return await super().provision(model, revision)
+
+    await run(cfg, chain, slots=_ChalTransientSlots())
+    # Backoff doubles each retry; ±25% jitter de-syncs validators on a shared
+    # Targon API key. Bounds: base ∈ {60, 120, 240}, multiplier ∈ [0.75, 1.25).
+    for d, base in zip(sleep_durations[:3], [60, 120, 240]):
+        assert base * 0.75 <= d <= base * 1.25, f"expected {base}*[0.75, 1.25], got {d}"
+
+
+@pytest.mark.asyncio
 async def test_publish_failure_retries_next_iteration(tmp_path, monkeypatch):
     """Regression: if publish_winner returns False (set_weights rejected), the loop
     must NOT mark the publish as done. Otherwise validators silently believe they
@@ -1501,7 +1555,6 @@ async def test_publish_failure_retries_next_iteration(tmp_path, monkeypatch):
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
     }))
-    monkeypatch.setattr("affine.loop.health_ping", AsyncMock(return_value=True))
     monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
         return slot.model == "mk", 0.01
@@ -1549,7 +1602,6 @@ async def test_dry_run_does_not_persist_last_published_uid(tmp_path, monkeypatch
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
     }))
-    monkeypatch.setattr("affine.loop.health_ping", AsyncMock(return_value=True))
     monkeypatch.setattr("affine.loop.inference_ping", AsyncMock(return_value=True))
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
         return slot.model == "mk", 0.01

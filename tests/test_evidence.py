@@ -217,3 +217,19 @@ def test_read_rejects_nan_inf_and_wrong_types(tmp_path):
     rows = EvidenceStore(p).read()
     assert len(rows) == 1
     assert rows[0].c == 3
+
+
+def test_read_skips_non_dict_rows(tmp_path):
+    """A JSON line that's not an object (e.g., array, scalar) must be skipped,
+    not crash the read. Otherwise one corrupted line takes down all subsequent
+    rows — and the validator's startup."""
+    p = tmp_path / "ev.jsonl"
+    p.write_text(
+        '{"m":1,"r":"rv","e":"e","c":0,"p":1,"t":0,"l":1.0}\n'
+        '[1,2,3]\n'
+        '"just a string"\n'
+        '42\n'
+        '{"m":2,"r":"rv","e":"e","c":1,"p":0,"t":0,"l":1.0}\n'
+    )
+    rows = EvidenceStore(p).read()
+    assert [r.m for r in rows] == [1, 2]

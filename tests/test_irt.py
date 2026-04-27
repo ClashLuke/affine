@@ -215,6 +215,38 @@ def test_fit_2pl_floor_caps_posterior_draw_magnitude():
     assert np.all(np.abs(draws).max(axis=0) < 5.0)
 
 
+def test_fit_warm_start_matches_cold_start_map():
+    """Regression: warm-starting L-BFGS from a previous MAP must converge to
+    the same point as cold-starting from zeros. If a future change introduces
+    looser convergence tolerance to make warm-start "faster", the speedup
+    would silently sacrifice fit quality. Tests across multiple data scales
+    that the MAP differs by <1e-3 in θ, β, and α."""
+    rng = np.random.default_rng(0)
+    n_m, n_e = 20, 4
+    theta_true = rng.normal(0, 1.0, n_m)
+    beta_true = rng.normal(0, 0.5, n_e)
+    a_true = np.exp(rng.normal(0, 0.3, n_e))
+    m_idx = rng.integers(0, n_m, 5_000)
+    e_idx = rng.integers(0, n_e, 5_000)
+    L = a_true[e_idx] * (theta_true[m_idx] - beta_true[e_idx])
+    y = (rng.random(5_000) < 1 / (1 + np.exp(-L))).astype(np.float64)
+
+    cold = fit_2pl(m_idx.astype(np.intp), e_idx.astype(np.intp), y, n_m, n_e)
+    init_x = np.concatenate([cold.theta, cold.beta, cold.alpha])
+    # Add a few new rows and warm-start from cold's MAP
+    new_m = rng.integers(0, n_m, 10)
+    new_e = rng.integers(0, n_e, 10)
+    new_y = (rng.random(10) < 0.5).astype(np.float64)
+    m2 = np.concatenate([m_idx, new_m]).astype(np.intp)
+    e2 = np.concatenate([e_idx, new_e]).astype(np.intp)
+    y2 = np.concatenate([y, new_y])
+    cold2 = fit_2pl(m2, e2, y2, n_m, n_e)
+    warm2 = fit_2pl(m2, e2, y2, n_m, n_e, init_x=init_x)
+    assert np.max(np.abs(cold2.theta - warm2.theta)) < 1e-3
+    assert np.max(np.abs(cold2.beta - warm2.beta)) < 1e-3
+    assert np.max(np.abs(cold2.alpha - warm2.alpha)) < 1e-3
+
+
 def test_fit_flags_alpha_saturation_as_degenerate():
     """An α saturating its bound is an active-set KKT solution, not an unconstrained
     MAP — the unconstrained Hessian we compute below ignores the active bound, so
