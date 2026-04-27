@@ -15,7 +15,7 @@ class EnvSpec:
     mem_limit: str = "8g"
     # Inclusive task-id range. Distill's R2 bucket is 1-indexed and ~2000 entries;
     # affine-env's HF dataset has ~23k rows; game encodes config in task_id (no upper
-    # bound). The validator draws task_ids uniformly per dwell iteration so both miners
+    # bound). The validator draws task_ids uniformly per duel iteration so both miners
     # see the same task. Default chosen to be safe for all known envs.
     task_range: tuple[int, int] = (1, 2000)
 
@@ -27,7 +27,7 @@ class Config:
     hotkey_name: str = "default"
     subtensor_endpoint: str = "finney"
     subtensor_fallback: str = "wss://lite.sub.latent.to:443"
-    dwell: int = 50                       # env picks per duel (one king sample + one challenger sample per pick)
+    dwell_batch: int = 1                  # matched-task pairs kept in flight at all times; sets the parallelism ceiling. Dwell exits only on principled stops (z>k, z<-k, shutdown, env-quarantine) — there is no iter cap.
     k_init: float = 3.0                   # starting dethronement threshold
     k_final: float = 1.0                  # asymptotic threshold
     k_halflife: int = 7200                # blocks for k decay half-life (~24h on 12s blocks)
@@ -47,7 +47,7 @@ class Config:
             hotkey_name=os.getenv("BT_WALLET_HOT", "default"),
             subtensor_endpoint=endpoint,
             subtensor_fallback=os.getenv("SUBTENSOR_FALLBACK", "wss://lite.sub.latent.to:443"),
-            dwell=int(os.getenv("AFFINE_DWELL", "50")),
+            dwell_batch=int(os.getenv("AFFINE_DWELL_BATCH", "1")),
             k_init=float(os.getenv("AFFINE_K_INIT", "3.0")),
             k_final=float(os.getenv("AFFINE_K_FINAL", "1.0")),
             k_halflife=int(os.getenv("AFFINE_K_HALFLIFE", "7200")),
@@ -88,7 +88,6 @@ def _apply_config_spec(cfg: Config, spec: str) -> Config:
 _PROFILES: dict[str, dict] = {
     "default": {},
     "full": {
-        "dwell": 32,
         "k_init": 3.0,
         "env_overrides": {
             "affine:ded": {"params": {"timeout": 300}},
@@ -98,7 +97,6 @@ _PROFILES: dict[str, dict] = {
         },
     },
     "smoke": {
-        "dwell": 8,
         "k_init": 1.0,
         "env_overrides": {
             "affine:ded": {"params": {"timeout": 90}},
@@ -170,8 +168,8 @@ def _validate(cfg: Config) -> None:
     """Reject configs that would crash deeper in the stack with confusing errors.
     NaN/Inf gets through `<=`/`>=` because all comparisons against NaN are False;
     use math.isfinite explicitly so Priors(σ=nan) doesn't poison the IRT fit."""
-    if cfg.dwell <= 0:
-        raise ValueError(f"dwell must be > 0, got {cfg.dwell}")
+    if cfg.dwell_batch <= 0:
+        raise ValueError(f"dwell_batch must be > 0, got {cfg.dwell_batch}")
     if cfg.k_halflife <= 0:
         raise ValueError(f"k_halflife must be > 0, got {cfg.k_halflife}")
     for n in ("k_init", "k_final"):

@@ -41,6 +41,22 @@ async def _drain(task: asyncio.Task, slot) -> None:
         pass
 
 
+def _tokens(r) -> int:
+    """Best-effort completion-token count from the env response. envs that don't
+    surface usage return 0, which the dwell logger treats as 'unknown' rather
+    than zero. Generation tok/s is the primary throughput metric, so a
+    decentralized env API that doesn't ship usage will miss the stat — not the
+    end of the world."""
+    try:
+        u = (r.get("extra") or {}).get("usage") or r.get("usage")
+        if isinstance(u, dict):
+            for k in ("completion_tokens", "output_tokens", "generated_tokens"):
+                v = u.get(k)
+                if isinstance(v, (int, float)) and v > 0: return int(v)
+    except Exception: pass
+    return 0
+
+
 async def run_one(
     env_wrapper,
     params: dict,
@@ -48,14 +64,18 @@ async def run_one(
     slot,
     seed: int,
     task_id: int = 0,
-) -> tuple[bool | None, float]:
-    """Run one inference sample. Returns (outcome, latency_seconds).
+) -> tuple[bool | None, float, int]:
+    """Run one inference sample. Returns (outcome, latency_seconds, tokens).
 
     outcome is True/False for decisive pass/fail, None for infrastructure error
     (connection refused, wrapper-reported failure, or exception in env wrapper).
     Callers use None to detect slot/infra problems and discard the row; False is
     a legitimate loss (real inference that produced a wrong answer or ran to the
     sample timeout).
+
+    tokens is best-effort completion-token count parsed from env usage stats; 0
+    if the env doesn't surface it. Throughput logging in the dwell uses this to
+    compute generation tok/s.
 
     The outer deadline is enforced by an explicit task + wait so we can tell our
     timeout (miner-loss = False) from any inner asyncio.TimeoutError that the
@@ -64,10 +84,6 @@ async def run_one(
     as miner losses.
     """
     async def _call():
-        # Wrap evaluate so a sync evaluate, a non-coroutine return, or an
-        # immediate TypeError from create_task surfaces as a task exception
-        # (→ infra=None) rather than crashing run_one before the timeout
-        # try/except is in scope.
         return await env_wrapper.evaluate(
             model=slot.model, base_url=slot.base_url,
             seed=seed, task_id=task_id, **params,
@@ -83,24 +99,24 @@ async def run_one(
     if task not in done:
         await _drain(task, slot)
         log.warning(f"sample timed out after {timeout}s: {slot.model}")
-        return False, time.monotonic() - t0
+        return False, time.monotonic() - t0, 0
     if (exc := task.exception()) is not None:
         log.warning(f"sample error ({slot.model}) after {dt:.2f}s: {type(exc).__name__}: {exc}")
-        return None, dt
+        return None, dt, 0
     r = task.result()
     if not isinstance(r, dict):
         log.warning(f"infra failure ({slot.model}) in {dt:.2f}s — non-dict response: {str(r)[:200]}")
-        return None, dt
+        return None, dt, 0
     if r.get("status") == "failed":
         log.warning(f"infra failure ({slot.model}) in {dt:.2f}s — affinetes wrapper status=failed: {str(r.get('error', ''))[:200]}")
-        return None, dt
+        return None, dt, 0
     if (err := r.get("error_type")) is not None:
         log.warning(f"infra failure ({slot.model}) in {dt:.2f}s, error_type={err}: {str(r.get('error', ''))[:200]}")
-        return None, dt
-    # success and score are mutually authoritative; accept exactly one shape.
+        return None, dt, 0
+    tok = _tokens(r)
     if isinstance(r.get("success"), bool):
-        return r["success"], dt
+        return r["success"], dt, tok
     if isinstance(r.get("score"), (int, float)) and math.isfinite(r["score"]):
-        return r["score"] > 0, dt
+        return r["score"] > 0, dt, tok
     log.warning(f"infra failure ({slot.model}) in {dt:.2f}s — response missing/invalid success/score: {str(r)[:200]}")
-    return None, dt
+    return None, dt, 0

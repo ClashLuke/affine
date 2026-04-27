@@ -209,6 +209,14 @@ class TargonSlots:
             "--enable-prefix-caching",
             "--enable-chunked-prefill",
             "--gpu-memory-utilization", "0.95",
+            # We rent the GPU and run vLLM ourselves. Defaults are conservative
+            # (max-num-seqs=256, max-num-batched-tokens=8192) and become the
+            # validator-side concurrency ceiling: queue dispatches B=512 streams
+            # but vLLM only batches 256 at a time, the rest sit at the gateway,
+            # per-stream tok/s collapses. Bump both well past the dwell_batch
+            # we actually drive.
+            "--max-num-seqs", "1024",
+            "--max-num-batched-tokens", "65536",
         ]
         env = {"HF_HUB_ENABLE_HF_TRANSFER": "1"}
         for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):

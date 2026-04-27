@@ -14,7 +14,7 @@ def _env_timeout(cfg: Config, name: str) -> int:
 
 def test_config_defaults():
     cfg = Config.from_env()
-    assert cfg.dwell == 50
+    assert cfg.dwell_batch == 1
     assert cfg.k_init == 3.0
     assert cfg.k_final == 1.0
     assert cfg.k_halflife == 7200
@@ -25,14 +25,14 @@ def test_config_defaults():
 
 
 def test_config_env_overrides(monkeypatch):
-    monkeypatch.setenv("AFFINE_DWELL", "7")
+    monkeypatch.setenv("AFFINE_DWELL_BATCH", "7")
     monkeypatch.setenv("AFFINE_K_INIT", "2.5")
     monkeypatch.setenv("AFFINE_K_FINAL", "0.8")
     monkeypatch.setenv("AFFINE_K_HALFLIFE", "3600")
     monkeypatch.setenv("AFFINE_SIGMA_BETA", "2.0")
     monkeypatch.setenv("AFFINE_EVIDENCE_PATH", "/tmp/ev.jsonl")
     cfg = Config.from_env()
-    assert cfg.dwell == 7
+    assert cfg.dwell_batch == 7
     assert cfg.k_init == 2.5
     assert cfg.k_final == 0.8
     assert cfg.k_halflife == 3600
@@ -43,7 +43,7 @@ def test_config_env_overrides(monkeypatch):
 def test_config_json_override(monkeypatch, tmp_path):
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps({
-        "dwell": 12,
+        "dwell_batch": 12,
         "k_init": 2.0,
         "env_overrides": {
             "affine:ded": {"params": {"timeout": 45}},
@@ -52,7 +52,7 @@ def test_config_json_override(monkeypatch, tmp_path):
     }))
     monkeypatch.setenv("AFFINE_CONFIG_SPEC", str(spec_path))
     cfg = Config.from_env()
-    assert cfg.dwell == 12
+    assert cfg.dwell_batch == 12
     assert cfg.k_init == 2.0
     assert _env_timeout(cfg, "affine:ded") == 45
     distill = [spec for spec in cfg.environments if spec.name == "distill"][0]
@@ -83,7 +83,6 @@ def test_config_missing_spec_path(monkeypatch):
 def test_config_smoke_profile(monkeypatch):
     monkeypatch.setenv("AFFINE_CONFIG_SPEC", "smoke")
     cfg = Config.from_env()
-    assert cfg.dwell == 8
     assert cfg.k_init == 1.0
     assert _env_timeout(cfg, "affine:ded") == 90
     assert _env_timeout(cfg, "game") == 420
@@ -92,7 +91,6 @@ def test_config_smoke_profile(monkeypatch):
 def test_config_full_profile(monkeypatch):
     monkeypatch.setenv("AFFINE_CONFIG_SPEC", "full")
     cfg = Config.from_env()
-    assert cfg.dwell == 32
     assert cfg.k_init == 3.0
     assert _env_timeout(cfg, "affine:abd") == 300
     assert _env_timeout(cfg, "game") == 1800
@@ -102,7 +100,6 @@ def test_config_default_profile(monkeypatch):
     monkeypatch.setenv("AFFINE_CONFIG_SPEC", "default")
     cfg = Config.from_env()
     # default profile is a no-op overlay on Config.from_env() defaults
-    assert cfg.dwell == 50
     assert cfg.k_init == 3.0
     assert _env_timeout(cfg, "affine:ded") == 600
 

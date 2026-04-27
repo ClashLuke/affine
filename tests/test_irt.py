@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from affine.irt import Fit, Priors, compute_k, fisher_env, fit_2pl
@@ -379,3 +381,5 @@ def test_fisher_env_robust_to_extreme_alpha_draw():
     rng = np.random.default_rng(0)
     picks = [fisher_env(fit, 0, 1, rng) for _ in range(500)]
     assert all(0 <= p < n_e for p in picks)
+
+

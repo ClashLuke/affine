@@ -8,9 +8,12 @@ Each outer iteration:
      argmax(θ̂) from the global fit and publish them.
   2. Pick the lowest-block challenger not yet attempted this reign.
   3. Provision king and challenger on two slots in parallel.
-  4. Dwell: for cfg.dwell env picks, choose the env maximizing Fisher info
-     for the contrast (θ_chal − θ_king), sample both models concurrently,
-     append two rows, refit. The posterior sharpens as evidence accrues.
+  4. Dwell: keep `cfg.dwell_batch` matched-task pairs in flight; for each
+     pick, choose the env maximizing Fisher info for the contrast
+     (θ_chal − θ_king), sample both models concurrently, append two rows,
+     refit. The posterior sharpens as evidence accrues. Exits only on
+     principled stops: z > k (dethrone), z < −k (chal can't recover under
+     unbounded future info), shutdown, or all envs quarantined. No budget cap.
   5. Teardown. Contrast z = (θ̂_chal − θ̂_king) / √Var against a ratcheting
      threshold k(reign). If z > k, challenger dethrones; reset the reign
      block; publish. Else champion holds; try the next challenger.
@@ -438,27 +441,50 @@ def _task_id(king_uid: int, chal_uid: int, env: str, iter_idx: int,
 
 
 async def _sample(chain: Chain, wrapper, params: dict, timeout: float, slot: Slot,
-                  miner: Miner, env_name: str, store: EvidenceStore,
-                  task_id: int, block: int) -> tuple[Row, bool]:
-    """One evaluation of `miner` in `env_name` on `slot`. Returns (row, delivered).
-    `delivered=False` iff the miner's endpoint failed to produce a verdict (None
-    from run_one); the row is then a synthetic loss (p=0, l=0). The dwell uses
-    `delivered` for side-streak attribution and env-vs-side classification.
+                  miner: Miner, env_name: str, c: int,
+                  task_id: int, block: int) -> tuple[Row, bool, int]:
+    """One evaluation of `miner` in `env_name` on `slot`. Returns
+    (row, delivered, tokens). `delivered=False` iff the miner's endpoint failed
+    to produce a verdict (None from run_one); the row is then a synthetic loss
+    (p=0, l=0). `tokens` is best-effort completion-token count for throughput
+    logging (0 if the env doesn't surface usage).
 
     Per notes/plan.md ("Challenger times out on a task → that task is a loss
     for the challenger"), failure-to-deliver is a loss for the miner. Recording
     the loss instead of dropping the row makes a chronically-broken endpoint
     accumulate negative evidence so the IRT contrast eventually surfaces the
-    "first functioning challenger wins by default" semantics the design specifies."""
-    c = store.next_counter(miner.uid, miner.revision, env_name)
-    outcome, latency = await run_one(wrapper, params, timeout, slot,
-                                     seed=_seed(miner.uid, miner.revision, env_name, c, salt=chain.hotkey),
-                                     task_id=task_id)
+    "first functioning challenger wins by default" semantics the design specifies.
+
+    `c` is pre-allocated by the caller: the dwell may dispatch many samples for
+    the same (uid, rev, env) in parallel before any append, and reading
+    `store.next_counter` inside each call would return the same value for all of
+    them — colliding on Row identity and seed. Hoisting allocation lets the
+    caller assign sequential counters across the in-flight batch."""
+    outcome, latency, tokens = await run_one(
+        wrapper, params, timeout, slot,
+        seed=_seed(miner.uid, miner.revision, env_name, c, salt=chain.hotkey),
+        task_id=task_id)
     delivered = outcome is not None
     return Row(m=miner.uid, r=miner.revision, e=env_name, c=c,
                p=int(bool(outcome)), t=int(block),
                l=float(latency) if delivered else 0.0,
-               i=int(task_id), k=miner.model), delivered
+               i=int(task_id), k=miner.model), delivered, int(tokens)
+
+
+async def _pair_sample(chain: Chain, wrapper, params: dict, timeout: float,
+                       king_slot: Slot, king: Miner, ck: int,
+                       chal_slot: Slot, challenger: Miner, cc: int,
+                       env_name: str, task_id: int, block: int, e_idx: int):
+    """One matched-task king/chal pair on env e. Returns
+    (e_idx, env_name, king_result, chal_result) where each result is (Row, bool)
+    or BaseException — exception per-side is tolerated so the dwell can
+    attribute env-side plumbing failures separately from miner outcomes."""
+    rk, rc = await asyncio.gather(
+        _sample(chain, wrapper, params, timeout, king_slot, king, env_name, ck, task_id, block),
+        _sample(chain, wrapper, params, timeout, chal_slot, challenger, env_name, cc, task_id, block),
+        return_exceptions=True,
+    )
+    return e_idx, env_name, rk, rc
 
 
 async def dwell(chain: Chain, king: Miner, king_slot: Slot,
@@ -468,15 +494,33 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
                 rng: np.random.Generator, stop: asyncio.Event,
                 reign_start_block: int,
                 ) -> DuelOutcome:
-    """Fisher-best env → sample king & challenger concurrently → append rows → refit.
+    """Queue-driven dwell: keep `cfg.dwell_batch` matched-task pairs in flight at
+    all times, harvest via FIRST_COMPLETED, refill on completion. Refit on every
+    wakeup that yielded new rows. Exits only when the evidence answers the
+    question — no budget cap.
+
+    Termination:
+      - z > k(reign)  → dethrone (DuelStatus.COMPLETED)
+      - z < −k(reign) → asymptotic mirror; under unbounded future info the chal
+        cannot reach k, so HOLDS is decided (DuelStatus.COMPLETED)
+      - stop event   → shutdown (DuelStatus.CANCELLED)
+      - all envs quarantined and nothing in flight → DuelStatus.ENVS_QUARANTINED
 
     Both sides failing on env e (or a sample raising) is attributed to env-side
     plumbing — env_fails[e] increments, env quarantined after ENV_FAIL_QUARANTINE
-    consecutive same-env fails. If all envs quarantine, abort. Single-side
-    failures append a synthetic-loss row (p=0, l=0.0) for the failing miner;
-    accumulated synthetic losses drive the IRT contrast toward dethrone via the
-    standard z>k path (notes/plan.md "first functioning challenger wins by
-    default")."""
+    consecutive same-env fails. Single-side failures append a synthetic-loss
+    row (p=0, l=0.0) for the failing miner; accumulated synthetic losses drive
+    the IRT contrast toward dethrone via z>k (notes/plan.md "first functioning
+    challenger wins by default").
+
+    Counter allocation is local to the dwell: store.next_counter is read once
+    per (uid, rev, env) at first dispatch, then incremented in-process.
+
+    The z<−k stop is the iters_remaining→∞ limit of the Bayesian projection
+    `Δθ̂_n < k·(SE_∞ − √(SE_n²−SE_∞²))`: with no cap, SE_∞ → 0, drift_var → SE_n²,
+    criterion collapses to z < −k. Symmetric mirror of dethrone, no
+    hyperparameters beyond k(reign)."""
+    import time as _time
     rows0 = len(rows)
     def _out(status: DuelStatus, fit: Fit) -> DuelOutcome:
         return DuelOutcome(rows=rows, fit=fit, status=status, rows_added=len(rows) - rows0)
@@ -487,79 +531,124 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
     k_idx = art_keys.index(art_key(king))
     c_idx = art_keys.index(art_key(challenger))
     env_fails = [0] * len(env_names)
-    for i in range(cfg.dwell):
-        if stop.is_set():
-            return _out(DuelStatus.CANCELLED, fit)
-        excluded = frozenset(j for j, n in enumerate(env_fails) if n >= ENV_FAIL_QUARANTINE)
-        if len(excluded) >= len(env_names):
-            log.warning(f"all envs quarantined at i={i}; aborting dwell (king={king.uid} chal={challenger.uid})")
-            return _out(DuelStatus.ENVS_QUARANTINED, fit)
-        # Degenerate fit: cov is fabricated (eigvals floored from large negatives
-        # to 1e-12 → inverse ~1e12), so Fit.sample produces garbage draws and
-        # log_info collapses to ~constant. Targeted acquisition is meaningless;
-        # uniform random over non-excluded envs at least preserves coverage.
+    next_c: dict[tuple[int, str, str], int] = {}
+    inflight: set[asyncio.Task] = set()
+    iters_started = 0
+    iters_done = 0
+    samples_done = 0; tokens_done = 0; latency_sum = 0.0
+    t_start = _time.monotonic()
+
+    def alloc_c(uid: int, rev: str, env: str) -> int:
+        key = (uid, rev, env)
+        c = next_c.setdefault(key, store.next_counter(uid, rev, env))
+        next_c[key] = c + 1
+        return c
+
+    def pick_env(excluded: frozenset[int]) -> int:
         if fit.degenerate:
             choices = [j for j in range(len(env_names)) if j not in excluded]
-            e = int(rng.choice(choices))
-        else:
-            e = fisher_env(fit, c_idx, k_idx, rng, excluded=excluded)
-        env_name = env_names[e]
+            return int(rng.choice(choices))
+        return fisher_env(fit, c_idx, k_idx, rng, excluded=excluded)
+
+    def dispatch_one(e_idx: int, iter_idx: int, block: int) -> asyncio.Task:
+        env_name = env_names[e_idx]
         wrapper, spec = envs[env_name]
         params = {k: v for k, v in spec.params.items() if k != "timeout"}
         timeout = float(spec.params.get("timeout", 600))
         lo, hi = spec.task_range
-        task_id = _task_id(king.uid, challenger.uid, env_name, i, lo, hi, salt=chain.hotkey)
-        # Read block once per dwell iter, share across king+chal samples. Per-sample
-        # reads put the chain RPC inside the sample's exception path: a transient
-        # subtensor blip would surface as a sample exception, which env_fails counts
-        # toward quarantine — wrong attribution. RPC failures here fall back to 0
-        # so the duel proceeds on best-effort metadata; t is record-keeping only.
-        try: block = await chain.current_block()
-        except Exception as ex:
-            log.warning(f"current_block failed at dwell i={i}: {ex}; using 0")
-            block = 0
+        task_id = _task_id(king.uid, challenger.uid, env_name, iter_idx, lo, hi, salt=chain.hotkey)
+        ck = alloc_c(king.uid, king.revision, env_name)
+        cc = alloc_c(challenger.uid, challenger.revision, env_name)
+        return asyncio.create_task(_pair_sample(
+            chain, wrapper, params, timeout,
+            king_slot, king, ck, chal_slot, challenger, cc,
+            env_name, task_id, block, e_idx))
 
-        # Explicit tasks + shielded drain: if one sample raises, the sibling is
-        # cancelled AND awaited before we return. asyncio.gather lets the loser
-        # keep running, which leaks inference onto a slot we may be tearing down.
-        t_k = asyncio.create_task(_sample(chain, wrapper, params, timeout, king_slot, king, env_name, store, task_id, block))
-        t_c = asyncio.create_task(_sample(chain, wrapper, params, timeout, chal_slot, challenger, env_name, store, task_id, block))
+    async def drain(reason: str):
+        for t in inflight:
+            if not t.done(): t.cancel()
+        for t in list(inflight):
+            try: await asyncio.shield(t)
+            except BaseException as ex:
+                log.warning(f"dwell drain ({reason}) interrupted: {type(ex).__name__}")
+        inflight.clear()
+
+    try: block = await chain.current_block()
+    except Exception as ex:
+        log.warning(f"current_block failed at dwell start: {ex}; using 0")
+        block = 0
+
+    while True:
+        if stop.is_set():
+            await drain("stop"); return _out(DuelStatus.CANCELLED, fit)
+        excluded = frozenset(j for j, n in enumerate(env_fails) if n >= ENV_FAIL_QUARANTINE)
+        # Refill: maintain `dwell_batch` in flight; skip if all envs quarantined.
+        if len(excluded) < len(env_names):
+            while len(inflight) < cfg.dwell_batch:
+                e_idx = pick_env(excluded)
+                inflight.add(dispatch_one(e_idx, iters_started, block))
+                iters_started += 1
+        if not inflight:
+            log.warning(f"all envs quarantined at i={iters_done}; aborting dwell (king={king.uid} chal={challenger.uid})")
+            return _out(DuelStatus.ENVS_QUARANTINED, fit)
         try:
-            results = await _cancellable(asyncio.gather(t_k, t_c, return_exceptions=True), stop)
+            done, _pending = await _cancellable(
+                asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED), stop)
         except asyncio.CancelledError:
-            for t in (t_k, t_c):
-                if not t.done(): t.cancel()
-            for t in (t_k, t_c):
-                try: await asyncio.shield(t)
-                except BaseException as e:
-                    log.warning(f"dwell sample drain interrupted ({type(e).__name__})")
-            return _out(DuelStatus.CANCELLED, fit)
-        env_failed = any(isinstance(r, BaseException) for r in results)
-        if env_failed:
-            for r in results:
-                if isinstance(r, Exception):
-                    log.warning(f"dwell sample raised on env={env_name}: {type(r).__name__}: {r}")
-        else:
-            (k_row, k_ok), (c_row, c_ok) = results
-            env_failed = not k_ok and not c_ok
-        if env_failed:
-            env_fails[e] += 1
-            if env_fails[e] == ENV_FAIL_QUARANTINE:
-                log.warning(f"quarantine env '{env_name}' after {env_fails[e]} consecutive fails (king={king.uid} chal={challenger.uid})")
-            continue
-        env_fails[e] = 0
-        store.append(k_row, c_row); rows.extend((k_row, c_row))
-        fit = _fit(rows, miners, env_names, priors, init_x=init_x)
-        if not fit.degenerate:
-            init_x = np.concatenate([fit.theta, fit.beta, fit.alpha])
-            delta, se = fit.contrast(c_idx, k_idx)
-            z = delta / se if se > 0 else 0.0
-            k = compute_k(block - reign_start_block,
-                          cfg.k_init, cfg.k_final, cfg.k_halflife)
-            if z > k:
-                log.info(f"dwell early-stop i={i+1}/{cfg.dwell}: z={z:+.2f} > k={k:.2f}")
-                return _out(DuelStatus.COMPLETED, fit)
-    return _out(DuelStatus.COMPLETED, fit)
+            await drain("cancel"); return _out(DuelStatus.CANCELLED, fit)
+
+        new_rows: list[Row] = []
+        succeeded_envs: set[int] = set()
+        for t in done:
+            inflight.discard(t)
+            e_idx, env_name, rk, rc = t.result()
+            iters_done += 1
+            if isinstance(rk, BaseException) or isinstance(rc, BaseException):
+                for ex in (rk, rc):
+                    if isinstance(ex, BaseException):
+                        log.warning(f"dwell sample raised on env={env_name}: {type(ex).__name__}: {ex}")
+                env_fails[e_idx] += 1
+                continue
+            (k_row, k_ok, k_tok), (c_row, c_ok, c_tok) = rk, rc
+            for row, ok, tok in ((k_row, k_ok, k_tok), (c_row, c_ok, c_tok)):
+                if ok:
+                    samples_done += 1; tokens_done += tok; latency_sum += row.l
+            if not k_ok and not c_ok:
+                env_fails[e_idx] += 1
+                continue
+            new_rows.extend((k_row, c_row))
+            succeeded_envs.add(e_idx)
+        for e in succeeded_envs:
+            env_fails[e] = 0
+        for e, n in enumerate(env_fails):
+            if n >= ENV_FAIL_QUARANTINE and e not in excluded:
+                log.warning(f"quarantine env '{env_names[e]}' after {n} consecutive fails (king={king.uid} chal={challenger.uid})")
+
+        if new_rows:
+            store.append(*new_rows); rows.extend(new_rows)
+            try: block = await chain.current_block()
+            except Exception as ex:
+                log.warning(f"current_block refresh failed at i={iters_done}: {ex}; reusing previous")
+            elapsed = max(1e-3, _time.monotonic() - t_start)
+            sps = samples_done / elapsed
+            mean_lat = latency_sum / samples_done if samples_done else 0.0
+            tok_s = tokens_done / elapsed  # aggregate over both slots
+            log.info(f"dwell pairs={iters_done} (in_flight={len(inflight)}/{cfg.dwell_batch}) "
+                     f"samples={samples_done} tokens={tokens_done} elapsed={elapsed:.1f}s "
+                     f"throughput={sps:.2f} sample/s {tok_s:.0f} tok/s mean_lat={mean_lat:.1f}s")
+            fit = _fit(rows, miners, env_names, priors, init_x=init_x)
+            if not fit.degenerate:
+                init_x = np.concatenate([fit.theta, fit.beta, fit.alpha])
+                delta, se = fit.contrast(c_idx, k_idx)
+                z = delta / se if se > 0 else 0.0
+                k = compute_k(block - reign_start_block,
+                              cfg.k_init, cfg.k_final, cfg.k_halflife)
+                if z > k:
+                    log.info(f"dwell dethrone after {iters_done} iters: z={z:+.2f} > k={k:.2f}")
+                    await drain("z>k"); return _out(DuelStatus.COMPLETED, fit)
+                if z < -k:
+                    log.info(f"dwell hold after {iters_done} iters: z={z:+.2f} < -k={-k:.2f}")
+                    await drain("z<-k"); return _out(DuelStatus.COMPLETED, fit)
 
 
 async def _elect(rows: list[Row], miners: list[Miner], env_names: list[str],
@@ -675,6 +764,10 @@ class DuelOutcome:
 class LoopState:
     reign: Reign | None = None
     king_slot: Slot | None = None
+    # Prefetched next-challenger provision. Started while the current duel dwells
+    # so a fast z<-k or z>k early-exit doesn't stall on a 5-15min Targon spin.
+    # Tuple of (task, miner). The task awaits to (slot|None, status) like _provision.
+    next_chal: tuple[asyncio.Task, Miner] | None = None
     provision_backoff: int = 60   # exponential Targon-API-wide backoff; 60→600s
 
 
@@ -683,6 +776,75 @@ async def _drop_king(state: LoopState, slots) -> None:
         return
     slot, state.king_slot = state.king_slot, None
     await _safe_teardown(slots, slot, "king-drop")
+
+
+async def _drop_next_chal(state: LoopState, slots) -> None:
+    """Cancel any in-flight prefetch and tear down its slot if it managed to land.
+    Idempotent. Called on shutdown and on cold-start (where the king isn't even
+    alive — prefetch assumptions don't hold)."""
+    if state.next_chal is None:
+        return
+    task, _miner = state.next_chal
+    state.next_chal = None
+    if not task.done():
+        task.cancel()
+    try:
+        slot, _status = await asyncio.shield(task)
+    except (asyncio.CancelledError, Exception):
+        return
+    if slot is not None:
+        await _safe_teardown(slots, slot, "prefetch-drop")
+
+
+def _start_prefetch(state: LoopState, slots, queue: list[Miner],
+                    current_chal: Miner, states: MinerStates,
+                    stop: asyncio.Event) -> None:
+    """Kick off provisioning for the next-in-queue candidate. No-op if a
+    prefetch is already pending or no candidate exists. We do NOT mark
+    `attempted` at provision time — that defers to `_take_prefetched` so a
+    Dethrone (which clears `attempted`) doesn't strand a rental we want to
+    re-evaluate later."""
+    if state.next_chal is not None:
+        return
+    cur_art = art_key(current_chal)
+    nxt = next((m for m in queue if art_key(m) != cur_art), None)
+    if nxt is None:
+        return
+    task = asyncio.create_task(_provision(slots, nxt, stop))
+    state.next_chal = (task, nxt)
+    log.info(f"prefetch: provisioning next chal uid{nxt.uid} {nxt.model}@{nxt.revision}")
+
+
+async def _take_prefetched(state: LoopState, slots, states: MinerStates,
+                           want_art: ArtKey) -> Slot | None:
+    """If the prefetched miner matches `want_art`, await its provision and
+    return the slot (mark_attempted on success). Otherwise teardown and return
+    None — the queue moved beneath us (typically a Dethrone). `crashloop` is
+    always recorded as `durable` even on mismatch: an artifact that crashed
+    loading is a miner fault regardless of which iter saw it."""
+    if state.next_chal is None:
+        return None
+    task, miner = state.next_chal
+    state.next_chal = None
+    try:
+        slot, status = await task
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning(f"prefetch task raised: {e}")
+        return None
+    if status == "crashloop":
+        states.mark_durable(miner.uid, art_key(miner), reason=status)
+    if art_key(miner) != want_art:
+        if slot is not None:
+            log.info(f"prefetch mismatch: had {art_key(miner)}, want {want_art}; tearing down")
+            await _safe_teardown(slots, slot, "prefetch-mismatch")
+        return None
+    if slot is None:
+        return None
+    states.mark_attempted(art_key(miner))
+    log.info(f"prefetch hit: reusing slot for {want_art}")
+    return slot
 
 
 async def _maybe_publish(state: LoopState, chain: Chain, cfg: Config,
@@ -796,11 +958,16 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 king_attempt_failed = False
                 try:
                     if state.king_slot is None:
+                        # Cold-start: any pending prefetch was based on a stale
+                        # king assumption — drop it before _provision_pair.
+                        await _drop_next_chal(state, slots)
                         state.king_slot, chal_slot, king_attempt_failed = await _provision_pair(
                             slots, king, challenger, states, stop)
                     else:
-                        chal_slot, status = await _provision(slots, challenger, stop)
-                        _apply_skip(states, challenger, status, is_king=False)
+                        chal_slot = await _take_prefetched(state, slots, states, art_key(challenger))
+                        if chal_slot is None:
+                            chal_slot, status = await _provision(slots, challenger, stop)
+                            _apply_skip(states, challenger, status, is_king=False)
                 except asyncio.CancelledError:
                     if stop.is_set(): break
                     raise
@@ -815,6 +982,10 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 if chal_slot is None:
                     continue
                 state.provision_backoff = 60
+
+                # Prefetch the next candidate now so dwell overlaps a 5-15min
+                # Targon spin. Hold/Skip on next iter reuses; Dethrone tears down.
+                _start_prefetch(state, slots, queue, challenger, states, stop)
 
                 # chal_slot lifetime is owned by this block: only retained on a
                 # successful dethrone (promoted to state.king_slot). Every other
@@ -886,6 +1057,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 await _cancellable(asyncio.sleep(60), stop)
     finally:
         log.info("shutdown")
+        await _drop_next_chal(state, slots)
         await _drop_king(state, slots)
         seen: set[int] = set()
         for wrapper, _ in envs.values():

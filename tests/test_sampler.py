@@ -15,7 +15,7 @@ def _slot(model="m", url="http://s/v1"):
 @pytest.mark.asyncio
 async def test_run_one_success_bool():
     env = SimpleNamespace(evaluate=AsyncMock(return_value={"success": True}))
-    passed, dt = await run_one(env, {}, 10, _slot(), seed=1)
+    passed, dt, _tok = await run_one(env, {}, 10, _slot(), seed=1)
     assert passed is True
     assert dt >= 0
 
@@ -25,7 +25,7 @@ async def test_run_one_falsy_score_is_loss():
     """A success=False / score<=0 with no infra signal is a miner loss regardless
     of latency. Latency-based gating let an adversary instafail to dodge evidence."""
     env = SimpleNamespace(evaluate=AsyncMock(return_value={"score": 0}))
-    passed, _ = await run_one(env, {}, 10, _slot(), seed=1)
+    passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
     assert passed is False
 
 
@@ -36,14 +36,14 @@ async def test_run_one_fast_success_false_is_loss_not_infra():
     silently dodge evidence by instafailing. With clear infra signals (status,
     error_type), a bare success=False is a verdict — count it."""
     env = SimpleNamespace(evaluate=AsyncMock(return_value={"success": False}))
-    passed, _ = await run_one(env, {}, 10, _slot(), seed=1)
+    passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
     assert passed is False
 
 
 @pytest.mark.asyncio
 async def test_run_one_positive_score():
     env = SimpleNamespace(evaluate=AsyncMock(return_value={"score": 0.7}))
-    passed, _ = await run_one(env, {}, 10, _slot(), seed=1)
+    passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
     assert passed is True
 
 
@@ -53,7 +53,7 @@ async def test_run_one_timeout_is_false():
         import asyncio
         await asyncio.sleep(1)
     env = SimpleNamespace(evaluate=slow)
-    passed, _ = await run_one(env, {}, 0.01, _slot(), seed=1)
+    passed, _, _ = await run_one(env, {}, 0.01, _slot(), seed=1)
     assert passed is False
 
 
@@ -76,7 +76,7 @@ async def test_run_one_any_error_type_is_infra(error_type):
     env = SimpleNamespace(evaluate=AsyncMock(return_value={
         "success": False, "error_type": error_type, "error": f"simulated {error_type}",
     }))
-    passed, _ = await run_one(env, {}, 10, _slot(), seed=1)
+    passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
     assert passed is None
 
 
@@ -91,14 +91,14 @@ async def test_run_one_inner_timeout_is_infra_not_loss():
     async def _inner_timeout(**kwargs):
         raise asyncio.TimeoutError("env's own client deadline")
     env = SimpleNamespace(evaluate=_inner_timeout)
-    passed, _ = await run_one(env, {}, 10, _slot(), seed=1)
+    passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
     assert passed is None
 
 
 @pytest.mark.asyncio
 async def test_run_one_exception_is_none():
     env = SimpleNamespace(evaluate=AsyncMock(side_effect=RuntimeError("boom")))
-    passed, _ = await run_one(env, {}, 10, _slot(), seed=1)
+    passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
     assert passed is None
 
 
@@ -120,7 +120,7 @@ async def test_run_one_success_with_error_type_is_infra():
     The error_type field is authoritative — its presence means infra, regardless
     of any other field."""
     env = SimpleNamespace(evaluate=AsyncMock(return_value={"success": True, "error_type": "llm_failure"}))
-    passed, _ = await run_one(env, {}, 10, _slot(), seed=1)
+    passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
     assert passed is None
 
 
@@ -128,7 +128,7 @@ async def test_run_one_success_with_error_type_is_infra():
 async def test_run_one_score_none_is_infra_not_crash():
     """Regression: `r.get('score', 0) > 0` raised on score=None."""
     env = SimpleNamespace(evaluate=AsyncMock(return_value={"score": None}))
-    passed, _ = await run_one(env, {}, 10, _slot(), seed=1)
+    passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
     assert passed is None
 
 
@@ -136,7 +136,7 @@ async def test_run_one_score_none_is_infra_not_crash():
 async def test_run_one_string_success_is_infra_not_truthy():
     """Regression: bool('false') == True, so success='false' was being passed."""
     env = SimpleNamespace(evaluate=AsyncMock(return_value={"success": "false"}))
-    passed, _ = await run_one(env, {}, 10, _slot(), seed=1)
+    passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
     assert passed is None
 
 
@@ -147,7 +147,7 @@ async def test_run_one_sync_evaluator_returning_dict_is_infra_not_crash():
     timeout try-block, crashing run_one. Now wrapped so it surfaces as task
     exception → infra (None)."""
     env = SimpleNamespace(evaluate=lambda **kw: {"success": True})
-    passed, _ = await run_one(env, {}, 10, _slot(), seed=1)
+    passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
     assert passed is None
 
 
@@ -167,7 +167,7 @@ async def test_run_one_drain_bounded_when_evaluator_swallows_cancel(monkeypatch)
             except asyncio.CancelledError: pass
     env = SimpleNamespace(evaluate=uncooperative)
     t0 = time.monotonic()
-    passed, _ = await run_one(env, {}, 0.05, _slot(), seed=1)
+    passed, _, _ = await run_one(env, {}, 0.05, _slot(), seed=1)
     elapsed = time.monotonic() - t0
     assert passed is False  # outer timeout = miner loss
     assert elapsed < 1.0    # bounded — would be 60s+ without _drain

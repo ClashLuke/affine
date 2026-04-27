@@ -13,9 +13,9 @@ from affine.config import Config, EnvSpec
 from affine.evidence import EvidenceStore, Row
 from affine.irt import Priors
 from affine.loop import (
-    ENV_FAIL_QUARANTINE, Chain, MinerStates, Reign, _apply_skip, _cancellable,
-    art_key, dwell, _fit, _load_envs, _provision, _provision_pair, _respondents, _seed,
-    _slot_from_task, static_chain,
+    ENV_FAIL_QUARANTINE, Chain, LoopState, MinerStates, Reign, _apply_skip, _cancellable,
+    art_key, _drop_next_chal, dwell, _fit, _load_envs, _provision, _provision_pair,
+    _respondents, _seed, _slot_from_task, _start_prefetch, _take_prefetched, static_chain,
 )
 from affine.verdict import DuelStatus
 from affine.vllm import SlotProvisionFailed
@@ -615,6 +615,172 @@ async def test_slot_from_task_returns_none_for_exception():
     assert _slot_from_task(t) is None
 
 
+class _StubSlots:
+    """In-memory slots stub for prefetch tests. `provision_calls` records every
+    (model, rev) provisioned; `teardowns` records every slot torn down. `delay`
+    holds provision until set; `failures` maps (model, rev) → exception."""
+    def __init__(self):
+        self.provision_calls: list[tuple[str, str]] = []
+        self.teardowns: list[tuple[str, str]] = []
+        self.delay = asyncio.Event(); self.delay.set()
+        self.failures: dict[tuple[str, str], BaseException] = {}
+
+    async def provision(self, model, revision):
+        self.provision_calls.append((model, revision))
+        await self.delay.wait()
+        if (model, revision) in self.failures:
+            raise self.failures[(model, revision)]
+        return SimpleNamespace(model=model, revision=revision, base_url=f"http://{model}", slot_id=f"{model}-{revision}")
+
+    async def teardown(self, slot):
+        self.teardowns.append((slot.model, slot.revision))
+
+
+@pytest.mark.asyncio
+async def test_start_prefetch_kicks_off_next_in_queue(tmp_path):
+    states = MinerStates(path=tmp_path / "skip.jsonl")
+    state = LoopState()
+    slots = _StubSlots()
+    queue = [_miner(1, model="cur"), _miner(2, model="nxt"), _miner(3, model="other")]
+    _start_prefetch(state, slots, queue, queue[0], states, asyncio.Event())
+    assert state.next_chal is not None
+    task, miner = state.next_chal
+    assert miner.model == "nxt"
+    await task
+    assert ("nxt", "r") in slots.provision_calls
+
+
+@pytest.mark.asyncio
+async def test_start_prefetch_noop_when_queue_only_has_current(tmp_path):
+    states = MinerStates(path=tmp_path / "skip.jsonl")
+    state = LoopState()
+    slots = _StubSlots()
+    cur = _miner(1, model="cur")
+    _start_prefetch(state, slots, [cur], cur, states, asyncio.Event())
+    assert state.next_chal is None
+    assert slots.provision_calls == []
+
+
+@pytest.mark.asyncio
+async def test_start_prefetch_noop_when_already_pending(tmp_path):
+    states = MinerStates(path=tmp_path / "skip.jsonl")
+    state = LoopState()
+    slots = _StubSlots(); slots.delay.clear()
+    queue = [_miner(1, model="cur"), _miner(2, model="nxt"), _miner(3, model="other")]
+    _start_prefetch(state, slots, queue, queue[0], states, asyncio.Event())
+    first_task, first_miner = state.next_chal
+    _start_prefetch(state, slots, queue, queue[0], states, asyncio.Event())  # 2nd call no-op
+    assert state.next_chal[0] is first_task
+    assert state.next_chal[1] is first_miner
+    slots.delay.set()
+    await first_task
+
+
+@pytest.mark.asyncio
+async def test_start_prefetch_does_not_mark_attempted(tmp_path):
+    """Mark-attempted defers to `_take_prefetched`. A Dethrone between
+    prefetch-start and use clears `attempted`; if we'd marked at provision time
+    the cleared mark would re-permit the same chal next iter, but the slot is
+    already torn down. Defer-to-use keeps both states aligned."""
+    states = MinerStates(path=tmp_path / "skip.jsonl")
+    state = LoopState()
+    slots = _StubSlots()
+    queue = [_miner(1, model="cur"), _miner(2, model="nxt")]
+    _start_prefetch(state, slots, queue, queue[0], states, asyncio.Event())
+    await state.next_chal[0]
+    assert not states.is_attempted(("nxt", "r"))
+
+
+@pytest.mark.asyncio
+async def test_take_prefetched_returns_slot_on_match(tmp_path):
+    states = MinerStates(path=tmp_path / "skip.jsonl")
+    state = LoopState()
+    slots = _StubSlots()
+    queue = [_miner(1, model="cur"), _miner(2, model="nxt")]
+    _start_prefetch(state, slots, queue, queue[0], states, asyncio.Event())
+    slot = await _take_prefetched(state, slots, states, ("nxt", "r"))
+    assert slot is not None and slot.model == "nxt"
+    assert states.is_attempted(("nxt", "r"))   # marked at use
+    assert state.next_chal is None
+    assert slots.teardowns == []
+
+
+@pytest.mark.asyncio
+async def test_take_prefetched_tears_down_on_mismatch(tmp_path):
+    """Dethrone between prefetch and next iter rebuilds the queue with a
+    different head; the prefetched slot is now stale and must be torn down."""
+    states = MinerStates(path=tmp_path / "skip.jsonl")
+    state = LoopState()
+    slots = _StubSlots()
+    queue = [_miner(1, model="cur"), _miner(2, model="nxt")]
+    _start_prefetch(state, slots, queue, queue[0], states, asyncio.Event())
+    slot = await _take_prefetched(state, slots, states, ("other", "v1"))
+    assert slot is None
+    assert slots.teardowns == [("nxt", "r")]
+    assert not states.is_attempted(("nxt", "r"))   # mismatch ≠ attempt
+    assert state.next_chal is None
+
+
+@pytest.mark.asyncio
+async def test_take_prefetched_records_crashloop_as_durable_even_on_mismatch(tmp_path):
+    """A crashlooping artifact is miner fault regardless of which iter saw it.
+    Must persist `durable` so the next iter doesn't re-prefetch the same
+    crashing artifact."""
+    states = MinerStates(path=tmp_path / "skip.jsonl")
+    state = LoopState()
+    slots = _StubSlots()
+    slots.failures[("nxt", "r")] = SlotProvisionFailed("crash")
+    queue = [_miner(1, model="cur"), _miner(2, model="nxt")]
+    _start_prefetch(state, slots, queue, queue[0], states, asyncio.Event())
+    slot = await _take_prefetched(state, slots, states, ("other", "v1"))
+    assert slot is None
+    assert states.is_durable(2, ("nxt", "r"))
+
+
+@pytest.mark.asyncio
+async def test_take_prefetched_returns_none_when_no_prefetch(tmp_path):
+    states = MinerStates(path=tmp_path / "skip.jsonl")
+    state = LoopState()
+    slots = _StubSlots()
+    slot = await _take_prefetched(state, slots, states, ("any", "r"))
+    assert slot is None
+
+
+@pytest.mark.asyncio
+async def test_drop_next_chal_cancels_in_flight_and_tears_down_if_landed(tmp_path):
+    states = MinerStates(path=tmp_path / "skip.jsonl")
+    state = LoopState()
+    slots = _StubSlots()
+    queue = [_miner(1, model="cur"), _miner(2, model="nxt")]
+    _start_prefetch(state, slots, queue, queue[0], states, asyncio.Event())
+    await state.next_chal[0]                       # let it land
+    await _drop_next_chal(state, slots)
+    assert state.next_chal is None
+    assert slots.teardowns == [("nxt", "r")]
+
+
+@pytest.mark.asyncio
+async def test_drop_next_chal_cancels_running_provision(tmp_path):
+    states = MinerStates(path=tmp_path / "skip.jsonl")
+    state = LoopState()
+    slots = _StubSlots(); slots.delay.clear()      # provision will hang
+    queue = [_miner(1, model="cur"), _miner(2, model="nxt")]
+    _start_prefetch(state, slots, queue, queue[0], states, asyncio.Event())
+    await asyncio.sleep(0)                          # let task start
+    await _drop_next_chal(state, slots)
+    assert state.next_chal is None
+    assert slots.teardowns == []                    # slot never landed
+
+
+@pytest.mark.asyncio
+async def test_drop_next_chal_idempotent_on_none(tmp_path):
+    state = LoopState()
+    slots = _StubSlots()
+    await _drop_next_chal(state, slots)              # no-op
+    assert state.next_chal is None
+    assert slots.teardowns == []
+
+
 def test_respondents_registered_first_then_ghosts():
     miners = [_miner(1, rev="v1"), _miner(2, rev="v1")]
     rows = [
@@ -911,6 +1077,23 @@ def _env(err=False):
     return {"E": (wrapper, EnvSpec(name="E", image="img", params={"timeout": 5}))}
 
 
+def _stop_after_pairs(stop, n, base):
+    """Wrap a `run_one` mock so that after `n` pair-completions (= 2*n single
+    samples), the dwell `stop` event fires. Used in tests where the data is
+    inherently uninformative (all-pass / forced-degenerate / both-fail) so
+    neither z>k nor z<-k can fire — without an external stop the loop would
+    never terminate now that the iter cap is gone."""
+    counter = [0]
+    target = 2 * n
+    async def wrapped(*args, **kwargs):
+        result = await base(*args, **kwargs)
+        counter[0] += 1
+        if counter[0] >= target:
+            stop.set()
+        return result
+    return wrapped
+
+
 @pytest.mark.asyncio
 async def test_dwell_appends_two_rows_per_env_pick(tmp_path, monkeypatch):
     """Each fisher_env pick must append exactly two rows (king + challenger)."""
@@ -918,23 +1101,109 @@ async def test_dwell_appends_two_rows_per_env_pick(tmp_path, monkeypatch):
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=42), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=5, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
+    stop = asyncio.Event()
+    # Balanced data per pair (both win or both lose, alternating) → z ≈ 0,
+    # neither z>k nor z<-k fires, runtime bounded by injected stop.
     n = [0]
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
         n[0] += 1
-        return bool(n[0] % 2), 0.01
-    monkeypatch.setattr("affine.loop.run_one", _run_one)
+        return bool((n[0] // 2) % 2), 0.01, 0
+    monkeypatch.setattr("affine.loop.run_one", _stop_after_pairs(stop, 5, _run_one))
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
         [king, chal], [], _env(), ["E"], store, cfg, Priors(),
-        np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
+        np.random.default_rng(0), stop, reign_start_block=0,
     )
     rows, fit, _abort = out.rows, out.fit, out.status
-    assert len(rows) == 2 * cfg.dwell
+    # Each pick appends exactly 2 rows (king + chal), uids balanced. Exact count
+    # depends on race between stop and pair completion in the synchronous mock.
+    assert len(rows) > 0 and len(rows) % 2 == 0
     uids = [r.m for r in store.read()]
-    assert uids.count(0) == cfg.dwell and uids.count(1) == cfg.dwell
+    assert uids.count(0) == uids.count(1) > 0
     assert fit.n_m == 2
+
+
+@pytest.mark.asyncio
+async def test_dwell_batch_dispatches_in_parallel_with_unique_counters(tmp_path, monkeypatch):
+    """dwell_batch=B dispatches B*2 samples concurrently per refit. Same-env
+    samples within a batch must use sequential counters (else they collide on
+    Row identity and seed). Each sample's task_id is keyed by a unique iter_idx
+    so even same-env duplicates in the batch see distinct tasks."""
+    inflight = [0]; max_inflight = [0]
+    seen_seeds: set[int] = set()
+    seen_task_ids: set[tuple[int, str]] = set()
+    async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
+        inflight[0] += 1; max_inflight[0] = max(max_inflight[0], inflight[0])
+        seen_seeds.add(seed); seen_task_ids.add((task_id, slot.model))
+        await asyncio.sleep(0.01)
+        inflight[0] -= 1
+        return True, 0.01, 0
+    envs = {n: (SimpleNamespace(evaluate=AsyncMock()),
+                EnvSpec(name=n, image="i", params={"timeout": 5}))
+            for n in ("A", "B")}
+    store = EvidenceStore(tmp_path / "ev.jsonl")
+    chain = Chain(hotkey="V", list_miners=AsyncMock(),
+                  current_block=AsyncMock(return_value=42), publish_winner=AsyncMock())
+    king, chal = _miner(0, model="mk"), _miner(1, model="mc")
+    cfg = Config(dwell_batch=4, evidence_path=str(tmp_path / "ev.jsonl"))
+    stop = asyncio.Event()
+    monkeypatch.setattr("affine.loop.run_one", _stop_after_pairs(stop, 8, _run_one))
+    out = await dwell(
+        chain, king, SimpleNamespace(model="mk", base_url="uk"),
+        chal, SimpleNamespace(model="mc", base_url="uc"),
+        [king, chal], [], envs, ["A", "B"], store, cfg, Priors(),
+        np.random.default_rng(0), stop, reign_start_block=0,
+    )
+    assert max_inflight[0] >= 2 * cfg.dwell_batch, \
+        f"expected ≥{2*cfg.dwell_batch} concurrent samples, observed {max_inflight[0]}"
+    rows = store.read()
+    assert len(rows) > 0, "no rows accumulated"
+    by_id = {(r.m, r.r, r.e, r.c) for r in rows}
+    assert len(by_id) == len(rows), "duplicate Row identity — counter collision in batched dispatch"
+
+
+@pytest.mark.asyncio
+async def test_dwell_queue_keeps_slot_saturated_under_mixed_latency(tmp_path, monkeypatch):
+    """Queue model: a fast pair finishing triggers an immediate refill rather
+    than waiting for the slow tail of a batch. Verified by time-weighting the
+    in-flight sample count under mixed latencies — average stays close to
+    `dwell_batch * 2` (king + chal per pair). A batch-then-wait model would
+    drop to ~0 between batches as the slow tail finishes."""
+    import time as _time
+    inflight = [0]; samples: list[tuple[float, int]] = []
+    async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
+        inflight[0] += 1; samples.append((_time.monotonic(), inflight[0]))
+        # task_id is shared by king+chal of a pair, so latency is per-pair, not
+        # per-side. Without this, both sides of every pair span the slow band
+        # → pair latencies all collapse to max → effectively batched behavior.
+        await asyncio.sleep(0.05 if task_id % 3 == 0 else 0.01)
+        inflight[0] -= 1; samples.append((_time.monotonic(), inflight[0]))
+        return True, 0.0, 0
+    envs = {n: (SimpleNamespace(evaluate=AsyncMock()),
+                EnvSpec(name=n, image="i", params={"timeout": 5}))
+            for n in ("A", "B")}
+    store = EvidenceStore(tmp_path / "ev.jsonl")
+    chain = Chain(hotkey="V", list_miners=AsyncMock(),
+                  current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
+    king, chal = _miner(0, model="mk"), _miner(1, model="mc")
+    B = 8
+    cfg = Config(dwell_batch=B, evidence_path=str(tmp_path / "ev.jsonl"))
+    stop = asyncio.Event()
+    monkeypatch.setattr("affine.loop.run_one", _stop_after_pairs(stop, 64, _run_one))
+    await dwell(
+        chain, king, SimpleNamespace(model="mk", base_url="uk"),
+        chal, SimpleNamespace(model="mc", base_url="uc"),
+        [king, chal], [], envs, ["A", "B"], store, cfg, Priors(),
+        np.random.default_rng(0), stop, reign_start_block=0,
+    )
+    weighted = total = 0.0
+    for (t1, n1), (t2, _n2) in zip(samples, samples[1:]):
+        dt = t2 - t1
+        weighted += n1 * dt; total += dt
+    avg = weighted / total if total else 0.0
+    assert avg >= 1.4 * B, f"avg in-flight {avg:.1f} < 1.4*B={1.4 * B}; queue isn't saturating slot"
 
 
 @pytest.mark.asyncio
@@ -949,10 +1218,13 @@ async def test_dwell_keeps_sampling_through_zero_variance(tmp_path, monkeypatch)
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=42), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=10, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
+    stop = asyncio.Event()
     async def _all_pass(wrapper, params, timeout, slot, seed, task_id=0):
-        return True, 0.01
-    monkeypatch.setattr("affine.loop.run_one", _all_pass)
+        return True, 0.01, 0
+    # All-pass on every env: fit stays degenerate, neither z>k nor z<-k can fire,
+    # dwell would otherwise loop forever. Cap with stop after 10 pairs.
+    monkeypatch.setattr("affine.loop.run_one", _stop_after_pairs(stop, 10, _all_pass))
     envs = {
         "A": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="A", image="i", params={"timeout": 5})),
         "B": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="B", image="i", params={"timeout": 5})),
@@ -961,10 +1233,13 @@ async def test_dwell_keeps_sampling_through_zero_variance(tmp_path, monkeypatch)
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
         [king, chal], [], envs, ["A", "B"], store, cfg, Priors(),
-        np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
+        np.random.default_rng(0), stop, reign_start_block=0,
     )
-    rows, _, _abort = out.rows, out.fit, out.status
-    assert len(rows) == 2 * cfg.dwell, "dwell must use full budget despite all-pass degeneracy"
+    rows, _, abort = out.rows, out.fit, out.status
+    # Pre-fix: dwell aborts at i=0 with no rows when all envs are all-pass.
+    # Post-fix: rows accumulate continuously until our injected stop fires.
+    assert len(rows) > 0, f"dwell must keep sampling under all-pass degeneracy; got {len(rows)} rows"
+    assert abort is DuelStatus.CANCELLED
 
 
 @pytest.mark.asyncio
@@ -989,10 +1264,11 @@ async def test_dwell_routes_around_fisher_env_when_fit_is_degenerate(tmp_path, m
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=42), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=5, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
+    stop = asyncio.Event()
     async def _ok(wrapper, params, timeout, slot, seed, task_id=0):
-        return True, 0.01
-    monkeypatch.setattr("affine.loop.run_one", _ok)
+        return True, 0.01, 0
+    monkeypatch.setattr("affine.loop.run_one", _stop_after_pairs(stop, 5, _ok))
     envs = {
         "A": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="A", image="i", params={"timeout": 5})),
         "B": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="B", image="i", params={"timeout": 5})),
@@ -1001,10 +1277,10 @@ async def test_dwell_routes_around_fisher_env_when_fit_is_degenerate(tmp_path, m
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
         [king, chal], [], envs, ["A", "B"], store, cfg, Priors(),
-        np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
+        np.random.default_rng(0), stop, reign_start_block=0,
     )
     rows, fit, _abort = out.rows, out.fit, out.status
-    assert len(rows) == 2 * cfg.dwell
+    assert len(rows) > 0
     assert fisher_calls[0] == 0
     # Coverage: with degenerate-fit uniform fallback over 5 picks across 2 envs,
     # both envs should appear (RNG seed 0 is deterministic; this is verifying
@@ -1024,11 +1300,11 @@ async def test_dwell_early_stops_when_z_exceeds_k(tmp_path, monkeypatch):
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=50, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
     n = [0]
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
         n[0] += 1
-        return n[0] % 4 != 0, 0.01  # mixed outcomes — escape the degenerate fit
+        return n[0] % 4 != 0, 0.01, 0  # mixed outcomes — escape the degenerate fit
     monkeypatch.setattr("affine.loop.run_one", _run_one)
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
@@ -1037,7 +1313,36 @@ async def test_dwell_early_stops_when_z_exceeds_k(tmp_path, monkeypatch):
         np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
     )
     assert out.status is DuelStatus.COMPLETED
-    assert out.rows_added < 2 * cfg.dwell, "early-stop must fire before budget exhausts"
+    delta, se = out.fit.contrast(1, 0)
+    z = delta / se if se > 0 else 0.0
+    assert z > -1.0, f"early-stop fires on z>k=-1; expected z>-1, got z={z:+.2f}"
+
+
+@pytest.mark.asyncio
+async def test_dwell_z_below_neg_k_fires_for_lopsided_chal(tmp_path, monkeypatch):
+    """Mirror of z>k early-stop: with chal failing every pick and king passing
+    every pick, the contrast z plunges below −k. dwell returns COMPLETED on
+    the symmetric stop and decide() produces Hold (z_below_k). The asymptotic
+    mirror of z>k under unbounded info — both directions share the one knob k(reign)."""
+    async def split(wrapper, params, timeout, slot, seed, task_id=0):
+        return (True if slot.model == "mk" else False), 0.01, 0
+    monkeypatch.setattr("affine.loop.run_one", split)
+    store = EvidenceStore(tmp_path / "ev.jsonl")
+    chain = Chain(hotkey="V", list_miners=AsyncMock(),
+                  current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
+    king, chal = _miner(0, model="mk"), _miner(1, model="mc")
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
+                 k_init=1.5, k_final=1.5, k_halflife=1)
+    out = await dwell(
+        chain, king, SimpleNamespace(model="mk", base_url="uk"),
+        chal, SimpleNamespace(model="mc", base_url="uc"),
+        [king, chal], [], _env(), ["E"], store, cfg, Priors(),
+        np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
+    )
+    assert out.status is DuelStatus.COMPLETED
+    delta, se = out.fit.contrast(1, 0)
+    z = delta / se if se > 0 else 0.0
+    assert z < -1.5, f"chal failing every pick should trip z<-k; got z={z:+.2f}"
 
 
 @pytest.mark.asyncio
@@ -1046,7 +1351,7 @@ async def test_dwell_aborts_on_infra_streak(tmp_path):
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=100, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
@@ -1061,10 +1366,12 @@ async def test_dwell_aborts_on_infra_streak(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dwell_quarantines_broken_env_keeps_sampling_healthy(tmp_path):
+async def test_dwell_quarantines_broken_env_keeps_sampling_healthy(tmp_path, monkeypatch):
     """One broken env, one healthy env: dwell must quarantine the broken one
     after ENV_FAIL_QUARANTINE fails and keep collecting rows from the healthy
-    one for the remaining budget."""
+    one. With healthy env returning all-pass, the fit stays degenerate and no
+    z-stop fires — bound runtime with an injected stop after enough pairs to
+    observe the quarantine + healthy-env pickup."""
     broken_calls = healthy_calls = 0
     async def evaluate_broken(*a, **kw):
         nonlocal broken_calls; broken_calls += 1
@@ -1082,12 +1389,15 @@ async def test_dwell_quarantines_broken_env_keeps_sampling_healthy(tmp_path):
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=30, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
+    stop = asyncio.Event()
+    from affine.loop import run_one as _real_run_one
+    monkeypatch.setattr("affine.loop.run_one", _stop_after_pairs(stop, 30, _real_run_one))
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
         [king, chal], [], envs, ["bad", "good"], store, cfg, Priors(),
-        np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
+        np.random.default_rng(0), stop, reign_start_block=0,
     )
     rows, _, _abort = out.rows, out.fit, out.status
     by_env = {r.e: 0 for r in rows}
@@ -1106,7 +1416,7 @@ async def test_dwell_records_synthetic_loss_for_persistently_failing_chal(tmp_pa
     losses pin chal's θ̂ low and Hold via z<<-k. There is no CHAL_BROKEN abort:
     that was an arbitrary-K=3 heuristic conflating our infra with miner fault."""
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
-        return (True if slot.model == "mk" else None), 0.01
+        return (True if slot.model == "mk" else None), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", split)
     envs = {n: (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name=n, image="i", params={"timeout": 5}))
             for n in ("A", "B", "C")}
@@ -1114,7 +1424,7 @@ async def test_dwell_records_synthetic_loss_for_persistently_failing_chal(tmp_pa
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=10, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
@@ -1125,7 +1435,7 @@ async def test_dwell_records_synthetic_loss_for_persistently_failing_chal(tmp_pa
     assert out.status is DuelStatus.COMPLETED
     king_rows = [r for r in rows if r.m == king.uid]
     chal_rows = [r for r in rows if r.m == chal.uid]
-    assert len(king_rows) == len(chal_rows) == cfg.dwell      # all iters paired
+    assert len(king_rows) == len(chal_rows) > 0  # all iters paired
     assert all(r.p == 1 for r in king_rows)
     assert all(r.p == 0 and r.l == 0.0 for r in chal_rows)    # synthetic losses
     assert rows == store.read()
@@ -1142,7 +1452,7 @@ async def test_dwell_dethrones_broken_king_via_synthetic_loss(tmp_path, monkeypa
     abort — that path was removed because it interrupted the principled
     dethrone path with an arbitrary K=3 streak threshold."""
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
-        return (None if slot.model == "mk" else True), 0.01
+        return (None if slot.model == "mk" else True), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", split)
     envs = {n: (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name=n, image="i", params={"timeout": 5}))
             for n in ("A", "B", "C")}
@@ -1150,7 +1460,7 @@ async def test_dwell_dethrones_broken_king_via_synthetic_loss(tmp_path, monkeypa
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=30, evidence_path=str(tmp_path / "ev.jsonl"),
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
                  k_init=3.0, k_final=3.0, k_halflife=1)
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
@@ -1189,21 +1499,24 @@ async def test_dwell_env_fails_resets_on_single_side_success(tmp_path, monkeypat
         last_pick["slot_count"] += 1
         idx = (last_pick["slot_count"] + 1) // 2 - 1
         if idx >= len(seq):
-            return False, 0.01                                            # productive failures keep dwell going
+            return False, 0.01, 0                                            # productive failures keep dwell going
         k, c = seq[idx]
-        return (k if slot.model == "mk" else c), 0.01
-    monkeypatch.setattr("affine.loop.run_one", scripted)
+        return (k if slot.model == "mk" else c), 0.01, 0
     envs = {"X": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="X", image="i", params={"timeout": 5}))}
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=10, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
+    stop = asyncio.Event()
+    # Both-False past pick 5 keeps z near 0 (neither side wins) — no z-stop, so
+    # cap with our stop after enough pairs to observe the env_fails reset.
+    monkeypatch.setattr("affine.loop.run_one", _stop_after_pairs(stop, 10, scripted))
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
         [king, chal], [], envs, list(envs), store, cfg, Priors(),
-        np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
+        np.random.default_rng(0), stop, reign_start_block=0,
     )
     rows, _, abort = out.rows, out.fit, out.status
     # After fix, picks 6+ produce both-False (productive failures) → rows accumulate.
@@ -1219,7 +1532,7 @@ async def test_dwell_synthetic_loss_drives_dethrone_against_broken_king(tmp_path
     test's purpose is to confirm the rows persist across duels and the joint
     fit on accumulated evidence produces dethrone-grade z for the latest chal."""
     async def king_broken(wrapper, params, timeout, slot, seed, task_id=0):
-        return (None if slot.model == "mk" else True), 0.01
+        return (None if slot.model == "mk" else True), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", king_broken)
     envs = {n: (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name=n, image="i", params={"timeout": 5}))
             for n in ("A", "B", "C", "D")}
@@ -1227,7 +1540,7 @@ async def test_dwell_synthetic_loss_drives_dethrone_against_broken_king(tmp_path
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king = _miner(0, model="mk")
-    cfg = Config(dwell=20, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
 
     rows: list[Row] = []
     chal_uids = list(range(1, 9))
@@ -1263,17 +1576,17 @@ async def test_dwell_intermittent_one_side_does_not_abort(tmp_path, monkeypatch)
     counter = {"n": 0}
     async def alternating(wrapper, params, timeout, slot, seed, task_id=0):
         if slot.model == "mk":
-            return True, 0.01
+            return True, 0.01, 0
         # chal: fail every 4th sample but otherwise succeed
         counter["n"] += 1
-        return (None if counter["n"] % 4 == 0 else False), 0.01
+        return (None if counter["n"] % 4 == 0 else False), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", alternating)
     envs = {"A": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="A", image="i", params={"timeout": 5}))}
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=20, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
@@ -1313,7 +1626,7 @@ async def test_run_cold_starts_and_dethrones(tmp_path, monkeypatch):
 
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
-        return (slot.model == "mc"), 0.01   # mc always wins, mk always loses
+        return (slot.model == "mc"), 0.01, 0   # mc always wins, mk always loses
     monkeypatch.setattr("affine.loop.run_one", _run_one)
 
     miners = [_miner(0, model="mk"), _miner(1, model="mc")]
@@ -1333,7 +1646,7 @@ async def test_run_cold_starts_and_dethrones(tmp_path, monkeypatch):
     chain = Chain(hotkey="V", list_miners=list_miners,
                   current_block=current_block, publish_winner=publish)
 
-    cfg = Config(dwell=8, evidence_path=str(tmp_path / "ev.jsonl"),
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
                  environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
                  k_init=0.5, k_final=0.5, k_halflife=1)   # easy to dethrone for the test
 
@@ -1361,7 +1674,7 @@ async def test_dethrone_skipped_when_chal_deregisters_mid_dwell(tmp_path, monkey
     }))
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
-        return (slot.model == "mc"), 0.01
+        return (slot.model == "mc"), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", _run_one)
 
     full = [_miner(0, model="mk"), _miner(1, model="mc")]
@@ -1387,7 +1700,7 @@ async def test_dethrone_skipped_when_chal_deregisters_mid_dwell(tmp_path, monkey
 
     chain = Chain(hotkey="V", list_miners=list_miners,
                   current_block=current_block, publish_winner=publish)
-    cfg = Config(dwell=8, evidence_path=str(tmp_path / "ev.jsonl"),
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
                  environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
                  k_init=0.5, k_final=0.5, k_halflife=1)
     try:
@@ -1413,7 +1726,7 @@ async def test_dethrone_resilient_to_king_teardown_error(tmp_path, monkeypatch):
 
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
-        return slot.model == "mc", 0.01
+        return slot.model == "mc", 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", _run_one)
 
     miners = [_miner(0, model="mk"), _miner(1, model="mc")]
@@ -1431,7 +1744,7 @@ async def test_dethrone_resilient_to_king_teardown_error(tmp_path, monkeypatch):
 
     chain = Chain(hotkey="V", list_miners=list_miners,
                   current_block=current_block, publish_winner=publish)
-    cfg = Config(dwell=8, evidence_path=str(tmp_path / "ev.jsonl"),
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
                  environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
                  k_init=0.5, k_final=0.5, k_halflife=1)
 
@@ -1471,7 +1784,7 @@ async def test_run_caches_king_across_duels_in_reign(tmp_path, monkeypatch):
 
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
-        return slot.model == "mk", 0.01   # king always wins → no dethrone
+        return slot.model == "mk", 0.01, 0   # king always wins → no dethrone
     monkeypatch.setattr("affine.loop.run_one", _run_one)
 
     # One strong king (uid 0), two weak challengers (uid 1, 2). After uid 0 is
@@ -1494,9 +1807,9 @@ async def test_run_caches_king_across_duels_in_reign(tmp_path, monkeypatch):
 
     chain = Chain(hotkey="V", list_miners=list_miners,
                   current_block=current_block, publish_winner=publish)
-    cfg = Config(dwell=3, evidence_path=str(tmp_path / "ev.jsonl"),
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
                  environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
-                 k_init=10.0, k_final=10.0, k_halflife=1)   # unreachable → no dethrone
+                 k_init=0.5, k_final=0.5, k_halflife=1)   # chal failing → z<-k Hold
 
     slots = _FakeSlots()
     await run(cfg, chain, slots=slots)
@@ -1521,7 +1834,7 @@ async def test_chal_transient_advances_queue_then_exhaustion_sleeps(tmp_path, mo
         "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
     }))
 
-    async def _run_one(*a, **kw): return True, 0.01
+    async def _run_one(*a, **kw): return True, 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", _run_one)
 
     sleep_durations: list[float] = []
@@ -1538,7 +1851,7 @@ async def test_chal_transient_advances_queue_then_exhaustion_sleeps(tmp_path, mo
     async def publish(uid, hk=""): return True
     chain = Chain(hotkey="V", list_miners=list_miners,
                   current_block=current_block, publish_winner=publish)
-    cfg = Config(dwell=3, evidence_path=str(tmp_path / "ev.jsonl"),
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
                  environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
                  k_init=10.0, k_final=10.0, k_halflife=1)
 
@@ -1566,7 +1879,7 @@ async def test_publish_failure_retries_next_iteration(tmp_path, monkeypatch):
     }))
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
-        return slot.model == "mk", 0.01
+        return slot.model == "mk", 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", _run_one)
     # Skip the queue-exhausted backoff so the test runs in <1s instead of 240s.
     monkeypatch.setattr("affine.loop.asyncio.sleep", AsyncMock())
@@ -1588,9 +1901,9 @@ async def test_publish_failure_retries_next_iteration(tmp_path, monkeypatch):
 
     chain = Chain(hotkey="V", list_miners=list_miners,
                   current_block=current_block, publish_winner=publish)
-    cfg = Config(dwell=2, evidence_path=str(tmp_path / "ev.jsonl"),
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
                  environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
-                 k_init=10.0, k_final=10.0, k_halflife=1)
+                 k_init=0.5, k_final=0.5, k_halflife=1)   # chal fails every pick → z<-k Hold
 
     await run(cfg, chain, slots=_FakeSlots())
 
@@ -1613,7 +1926,7 @@ async def test_dry_run_does_not_persist_last_published_uid(tmp_path, monkeypatch
     }))
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
-        return slot.model == "mk", 0.01
+        return slot.model == "mk", 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", _run_one)
     monkeypatch.setattr("affine.loop.asyncio.sleep", AsyncMock())
 
@@ -1632,9 +1945,9 @@ async def test_dry_run_does_not_persist_last_published_uid(tmp_path, monkeypatch
 
     chain = Chain(hotkey="V", list_miners=list_miners,
                   current_block=current_block, publish_winner=publish)
-    cfg = Config(dwell=2, evidence_path=str(tmp_path / "ev.jsonl"),
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
                  environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
-                 k_init=10.0, k_final=10.0, k_halflife=1)
+                 k_init=0.5, k_final=0.5, k_halflife=1)
 
     await run(cfg, chain, slots=_FakeSlots())
     assert published, "dry-run should still call publish (audit/log path)"
@@ -1656,7 +1969,7 @@ async def test_dwell_interrupts_inflight_sample_on_stop(tmp_path):
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=5, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
     stop = asyncio.Event()
 
     sample_started = asyncio.Event()
@@ -1720,18 +2033,20 @@ async def test_dwell_persists_matched_task_id_per_iter(tmp_path, monkeypatch):
     chain = Chain(hotkey="VAL", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=12, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
+    stop = asyncio.Event()
     async def _ok(wrapper, params, timeout, slot, seed, task_id=0):
-        return True, 0.01
-    monkeypatch.setattr("affine.loop.run_one", _ok)
+        return True, 0.01, 0
+    # All-pass → degenerate fit → no z-stop. Cap with stop after 12 pairs.
+    monkeypatch.setattr("affine.loop.run_one", _stop_after_pairs(stop, 12, _ok))
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
         [king, chal], [], _env(), ["E"], store, cfg, Priors(),
-        np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
+        np.random.default_rng(0), stop, reign_start_block=0,
     )
     rows = store.read()
-    assert len(rows) == 2 * cfg.dwell
+    assert len(rows) > 0 and len(rows) % 2 == 0
     # Group by (env, t, c-pair-index) — within a single iter, k_row immediately
     # precedes c_row (same store.append pair). The persistence order is what the
     # validator's matched-task contract relies on.
@@ -1741,7 +2056,7 @@ async def test_dwell_persists_matched_task_id_per_iter(tmp_path, monkeypatch):
         f"matched-task broken: pair task_ids: {[(p[0].i, p[1].i) for p in pairs]}"
     # And the iter-to-iter draws are diverse — a stuck task_id would also pass
     # the per-pair equality check, so this is the second axis.
-    assert len({r.i for r, _ in pairs}) >= cfg.dwell // 2
+    assert len({r.i for r, _ in pairs}) >= max(2, len(pairs) // 2)
 
 
 @pytest.mark.asyncio
@@ -1750,7 +2065,7 @@ async def test_dwell_honors_stop_event(tmp_path):
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(dwell=100, evidence_path=str(tmp_path / "ev.jsonl"))
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
     stop = asyncio.Event(); stop.set()
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
