@@ -827,6 +827,27 @@ def test_fit_theta_tracks_pass_rate():
     assert fit.theta[0] > fit.theta[1]
 
 
+def test_fit_drops_pairs_containing_any_synthetic_row():
+    """Regression for the 2026-04-28 contaminated-dethrone incident: 20
+    pairs of (king l=0, chal l>0) from HTTP 502 against king's URL shifted
+    z from +2.54 to +2.92, crossing k=2.80 and dethroning a healthy king.
+    Validator-side infra is not miner evidence; any pair containing a synth
+    (l=0) row is dropped from the fit. Real evidence (both-delivered) drives
+    the contrast."""
+    miners = [_miner(0), _miner(1)]
+    real = []
+    real += [_row(m=0, c=i, t=i, p=1, l=1.0) for i in range(10)]
+    real += [_row(m=1, c=i, t=i, p=0, l=1.0) for i in range(10)]
+    biased = []
+    for i in range(40):
+        biased.append(_row(m=0, c=100+i, t=100+i, p=0, l=0.0))  # king synth
+        biased.append(_row(m=1, c=100+i, t=100+i, p=1, l=1.0))  # chal pass
+    fit_real = _fit(real, miners, ["E"], Priors())
+    fit_biased = _fit(real + biased, miners, ["E"], Priors())
+    np.testing.assert_allclose(fit_real.theta, fit_biased.theta, atol=1e-9)
+    np.testing.assert_allclose(fit_real.cov, fit_biased.cov, atol=1e-9)
+
+
 def test_fit_drops_zero_variance_envs():
     """Envs where every observation is identical (all-pass or all-fail) are
     structurally uninformative — their α likelihood is monotone in α with no
@@ -1412,13 +1433,13 @@ async def test_dwell_aborts_on_chal_slot_dead_only(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_dwell_persistent_chal_infra_failure_holds_via_synthetic_loss(tmp_path, monkeypatch):
-    """Chal endpoint failing every pick (validator sees `run_one`-None) is
-    matched against a delivering king — asymmetry produces a synthetic chal-loss
-    row paired with a real king-pass row. The IRT contrast plunges below −k and
-    dwell exits with COMPLETED via z<−k. Closes the selective-failure gaming
-    attack: an attacker that 5xxs hard tasks no longer evades the loss."""
-    monkeypatch.setattr("affine.loop.compute_k", lambda *a, **kw: 1.0)
+async def test_dwell_persistent_chal_infra_failure_aborts_via_chal_slot_dead(tmp_path, monkeypatch):
+    """Chal endpoint failing every pick produces single-side synth pairs
+    (chal l=0, king l>0). These are now dropped from the fit (validator-side
+    infra is not miner evidence — the IRT contrast cannot be biased by Targon
+    flake), so z never crosses ±k. The chal_consec_fails counter climbs to
+    SLOT_DEAD and the dwell aborts with CHAL_SLOT_DEAD; decide() returns
+    Skip("chal_slot_dead"). On-disk synth rows are preserved as audit."""
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
         return (True if slot.model == "mk" else None), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", split)
@@ -1435,26 +1456,23 @@ async def test_dwell_persistent_chal_infra_failure_holds_via_synthetic_loss(tmp_
         [king, chal], [], envs, list(envs), store, cfg, Priors(),
         np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
     )
-    assert out.status is DuelStatus.COMPLETED
-    delta, se = out.fit.contrast(1, 0)
-    assert delta / se < -1.0, f"expected z<−k=−1; got z={delta/se:+.2f}"
+    assert out.status is DuelStatus.CHAL_SLOT_DEAD
     king_rows = [r for r in out.rows if r.m == king.uid]
     chal_rows = [r for r in out.rows if r.m == chal.uid]
-    assert king_rows and all(r.p == 1 and r.l > 0 for r in king_rows), "king delivered → real p=1"
-    assert chal_rows and all(r.p == 0 and r.l == 0.0 for r in chal_rows), "chal failed paired with king-pass → synthetic p=0,l=0"
-    assert len(king_rows) == len(chal_rows), "matched-pair count: every kept pair appends both rows"
+    assert king_rows and all(r.p == 1 and r.l > 0 for r in king_rows)
+    assert chal_rows and all(r.p == 0 and r.l == 0.0 for r in chal_rows)
     assert out.rows == store.read()
 
 
 @pytest.mark.asyncio
-async def test_dwell_broken_king_dethrones_via_synthetic_loss(tmp_path, monkeypatch):
-    """plan.md L47 'first functioning challenger wins by default': a king
-    failing to deliver every pick paired with a delivering chal contributes a
-    synthetic king-loss row + real chal-pass row per pair. The contrast crosses
-    z>k and dwell exits with COMPLETED. The verdict path then produces Dethrone
-    on those rows. Without conditional synthetic-loss, the broken-king duel
-    would loop forever (slot-dead → reprovision → same broken king again)."""
-    monkeypatch.setattr("affine.loop.compute_k", lambda *a, **kw: 1.0)
+async def test_dwell_broken_king_aborts_via_king_slot_dead(tmp_path, monkeypatch):
+    """King failing every pick produces single-side synth pairs (king l=0,
+    chal l>0) which the fit ignores. z stays at the prior; king_consec_fails
+    climbs to SLOT_DEAD and the dwell aborts with KING_SLOT_DEAD. decide()
+    returns Skip("king_slot_dead"); the outer loop tears down the king slot
+    and reprovisions on the next iteration. Recovery comes from the slot
+    coming back, not from synth-attribution dethroning the broken king on
+    network noise."""
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
         return (None if slot.model == "mk" else True), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", split)
@@ -1471,14 +1489,11 @@ async def test_dwell_broken_king_dethrones_via_synthetic_loss(tmp_path, monkeypa
         [king, chal], [], envs, list(envs), store, cfg, Priors(),
         np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
     )
-    assert out.status is DuelStatus.COMPLETED
-    delta, se = out.fit.contrast(1, 0)
-    assert delta / se > 1.0, f"expected z>k=1; got z={delta/se:+.2f}"
+    assert out.status is DuelStatus.KING_SLOT_DEAD
     king_rows = [r for r in out.rows if r.m == king.uid]
     chal_rows = [r for r in out.rows if r.m == chal.uid]
-    assert king_rows and all(r.p == 0 and r.l == 0.0 for r in king_rows), "king failed paired with chal-pass → synthetic p=0,l=0"
-    assert chal_rows and all(r.p == 1 and r.l > 0 for r in chal_rows), "chal delivered → real p=1"
-    assert len(king_rows) == len(chal_rows), "matched-pair count: every kept pair appends both rows"
+    assert king_rows and all(r.p == 0 and r.l == 0.0 for r in king_rows)
+    assert chal_rows and all(r.p == 1 and r.l > 0 for r in chal_rows)
 
 
 @pytest.mark.asyncio

@@ -183,12 +183,19 @@ def _fit(rows: list[Row], miners: list[Miner], env_names: list[str],
             outcomes.setdefault(r.e, set()).add(r.p)
         pairs.setdefault((r.e, r.t, r.i), []).append(r.l)
     drop = {n for n, outs in outcomes.items() if len(outs) < 2}
-    # Synth-on-both pairs (both sides l=0) carry no information but in 2PL add
-    # Hessian mass α²σ(η)(1-σ(η)) per row, sharply tightening any wide posterior
-    # (e.g. fresh chal at prior). One such pair shifted z from -0.35 → -3.56 in
-    # the 2026-04-28 incident — fit-time drop is the principled fix; gaming
-    # defense via single-side synth-loss rows (l=0 with l>0 partner) is preserved.
-    synth = {g for g, ls in pairs.items() if all(l == 0.0 for l in ls)}
+    # Any pair with a synthetic (l=0) row is dropped from the fit. The l=0 row
+    # encodes a non-timeout infra failure, which under "we own vLLM/env/network"
+    # is validator-attributable, not miner-attributable: vLLM crashes are our
+    # config, env containers are our infra, Targon proxy 5xx is our network.
+    # Single-side synth (one l=0, one l>0) used to feed the gaming defense
+    # against selective miner crashes — but the same signal also biases the
+    # contrast against an incumbent during asymmetric Targon flake. Today's
+    # uid65→uid206 incident: 23s of HTTP 502 from king's URL produced 20
+    # king_synth+chal_pass pairs that shifted z from +2.54 (Hold) to +2.92
+    # (Dethrone). The on-disk synth rows remain for audit; the fit ignores
+    # them. Real miner-side timeouts are still classified as False (real l>0
+    # row, p=0) by the sampler and survive this filter.
+    synth = {g for g, ls in pairs.items() if any(l == 0.0 for l in ls)}
     filtered = [r for r in rows if r.e in e2i and r.e not in drop
                 and (r.e, r.t, r.i) not in synth]
     m_idx = np.fromiter((k2i[_row_art(r, by_uid_rev)] for r in filtered),
