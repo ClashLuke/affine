@@ -38,6 +38,7 @@ def test_tree_env_query_then_exact_submit():
     prompt, reset = env.reset(seed=7)
     assert "hidden rooted tree" in prompt
     assert reset["env_id"] == "tree_reconstruction"
+    assert reset["n"] == 6
 
     obs, reward, terminated, truncated, info = env.step("QUERY CHILDREN 0\nQUERY DEPTH 3")
     assert reward == 0.0
@@ -61,15 +62,6 @@ def test_tree_default_queries_do_not_allow_direct_child_dump():
     assert "ERROR query type not allowed" in obs
     assert (reward, terminated, truncated) == (0.0, False, False)
     assert info["query_count"] == 0
-
-
-def test_tree_env_answer_wrapped_query_is_still_a_query():
-    env = TreeReconstructionEnv(n=5)
-    env.reset(seed=0)
-    obs, reward, terminated, truncated, info = env.step("<ANSWER>QUERY DEPTH 1</ANSWER>")
-    assert obs.startswith("DEPTH 1:")
-    assert (reward, terminated, truncated) == (0.0, False, False)
-    assert info["query_count"] == 1
 
 
 def test_tree_env_reset_options_are_per_episode():
@@ -110,27 +102,16 @@ def test_tree_env_rejects_bare_numeric_and_trailing_junk_submissions():
     env.reset(seed=0)
     _obs, reward, terminated, truncated, info = env.step(f"SUBMIT {parent} junk")
     assert (reward, terminated, truncated) == (0.0, True, False)
-    assert info["error"] == "expected QUERY or SUBMIT"
-
-
-def test_tree_env_rejects_multiple_answer_blocks():
-    env = TreeReconstructionEnv(n=5, method="recursive")
-    env.reset(seed=0)
-    parent = " ".join(map(str, env._tree.parent[1:]))
-    _obs, reward, terminated, truncated, info = env.step(
-        f"<ANSWER>{parent}</ANSWER><ANSWER>{parent}</ANSWER>"
-    )
-    assert (reward, terminated, truncated) == (0.0, True, False)
-    assert info["error"] == "multiple ANSWER blocks"
-
-
-def test_tree_env_rejects_prose_inside_answer_block():
-    env = TreeReconstructionEnv(n=5, method="recursive")
-    env.reset(seed=0)
-    parent = " ".join(map(str, env._tree.parent[1:]))
-    _obs, reward, terminated, truncated, info = env.step(f"<ANSWER>parents: {parent}</ANSWER>")
-    assert (reward, terminated, truncated) == (0.0, True, False)
     assert info["error"] == "malformed submission"
+
+
+def test_tree_env_rejects_answer_wrapping():
+    env = TreeReconstructionEnv(n=5, method="recursive")
+    env.reset(seed=0)
+    parent = " ".join(map(str, env._tree.parent[1:]))
+    _obs, reward, terminated, truncated, info = env.step(f"<ANSWER>SUBMIT {parent}</ANSWER>")
+    assert (reward, terminated, truncated) == (0.0, True, False)
+    assert info["error"] == "expected QUERY or SUBMIT"
 
 
 def test_tree_env_query_limit_truncates():
@@ -158,7 +139,7 @@ def test_tree_env_bad_submit_shape_is_loss_not_exception():
     env.reset(seed=0)
     _obs, reward, terminated, truncated, info = env.step("SUBMIT 0 1")
     assert (reward, terminated, truncated) == (0.0, True, False)
-    assert "expected 4 or 5 parent values" in info["error"]
+    assert "expected 4 parent values" in info["error"]
 
 
 def test_hidden_tree_rejects_unknown_method():
@@ -167,10 +148,10 @@ def test_hidden_tree_rejects_unknown_method():
 
 
 @pytest.mark.parametrize("options,msg", [
-    ({"n": 1}, "n must be at least 2"),
+    ({"n": 1}, r"n must be in \[2,"),
     ({"method": "bad"}, "method must be"),
-    ({"max_turns": 0}, "max_turns must be > 0"),
-    ({"max_queries": -1}, "max_queries must be >= 0"),
+    ({"max_turns": 0}, r"max_turns must be in \[1,"),
+    ({"max_queries": -1}, r"max_queries must be in \[0,"),
     ({"allowed_queries": ["BAD"]}, "unknown allowed_queries"),
 ])
 def test_tree_env_rejects_invalid_options(options, msg):

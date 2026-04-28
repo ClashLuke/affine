@@ -185,10 +185,10 @@ def test_config_rejects_nonfinite_or_nonpositive_env_timeout(monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize("params,msg", [
-    ({"n": 1}, "n must be at least 2"),
+    ({"n": 1}, r"n must be in \[2,"),
     ({"method": "bad"}, "method must be"),
-    ({"max_turns": 0}, "max_turns must be > 0"),
-    ({"max_queries": -1}, "max_queries must be >= 0"),
+    ({"max_turns": 0}, r"max_turns must be in \[1,"),
+    ({"max_queries": -1}, r"max_queries must be in \[0,"),
     ({"allowed_queries": ["BAD"]}, "unknown allowed_queries"),
     ({"allowed_queries": "DEPTH"}, "allowed_queries"),
 ])

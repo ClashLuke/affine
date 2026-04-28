@@ -7,7 +7,9 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from ._base import Env
+from ._base import Env, int_param
+
+_ALLOWED_QUERIES = ("ANCESTOR", "LCA", "DEPTH", "CHILDREN", "PATH")
 
 
 @dataclass(frozen=True)
@@ -183,10 +185,10 @@ class HiddenTree:
 
 class TreeReconstructionEnv(Env):
     __version__ = "0.0.1"
+    env_id = "tree_reconstruction"
+    option_keys = frozenset({"n", "method", "max_queries", "max_turns", "allowed_queries"})
     QUERY_RE = re.compile(r"^QUERY\s+(ANCESTOR|LCA|DEPTH|CHILDREN|PATH)\s+(-?\d+)(?:\s+(-?\d+))?$", re.I)
-    SUBMIT_RE = re.compile(r"^SUBMIT\s+(?P<body>[-,\s\d\[\]]+)$", re.I)
-    ANSWER_BODY_RE = re.compile(r"^[-,\s\d\[\]]+$")
-    ANSWER_RE = re.compile(r"<ANSWER>(.*?)</ANSWER>", re.I | re.S)
+    SUBMIT_RE = re.compile(r"^SUBMIT(?:\s+(?P<body>.*))?$", re.I)
 
     def __init__(
         self,
@@ -196,17 +198,13 @@ class TreeReconstructionEnv(Env):
         max_turns: int = 32,
         allowed_queries: tuple[str, ...] = ("ANCESTOR", "LCA", "DEPTH"),
     ):
-        self._defaults = self._validate_config(n, method, max_queries, max_turns, allowed_queries)
+        self._defaults = self.validate_options({
+            "n": n, "method": method, "max_queries": max_queries,
+            "max_turns": max_turns, "allowed_queries": allowed_queries,
+        })
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
-        opts = options or {}
-        cfg = self._validate_config(
-            opts.get("n", self._defaults["n"]),
-            opts.get("method", self._defaults["method"]),
-            opts.get("max_queries", self._defaults["max_queries"]),
-            opts.get("max_turns", self._defaults["max_turns"]),
-            opts.get("allowed_queries", self._defaults["allowed_queries"]),
-        )
+        cfg = self.validate_options({**self._defaults, **(options or {})})
         self._n = cfg["n"]
         self._method = cfg["method"]
         self._max_queries = cfg["max_queries"]
@@ -220,7 +218,7 @@ class TreeReconstructionEnv(Env):
         self._done = False
         return self._prompt(), {
             "challenge_id": str(tree_seed),
-            "env_id": "tree_reconstruction",
+            "env_id": self.env_id,
             "spec_version": self.__version__,
             "n": self._n,
             "method": self._method,
@@ -234,42 +232,21 @@ class TreeReconstructionEnv(Env):
         if self._done:
             raise RuntimeError("episode is already done; call reset()")
         self._turns += 1
-        text, wrapped, tag_error = self._body(action or "")
-        if tag_error:
-            self._done = True
-            return None, 0.0, True, False, self._info(score=0.0, success=False, error=tag_error)
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        try:
-            submitted = self._submission(lines, allow_answer=False)
-        except ValueError as exc:
-            self._done = True
-            return None, 0.0, True, False, self._info(score=0.0, success=False, error=str(exc))
-        if submitted is not None:
+        lines = [ln.strip() for ln in (action or "").splitlines() if ln.strip()]
+        if not lines:
+            return self._terminal_loss("expected QUERY or SUBMIT")
+
+        if len(lines) == 1 and (m := self.SUBMIT_RE.fullmatch(lines[0])):
+            try:
+                submitted = self._parse_submit(m.group("body") or "")
+            except ValueError as exc:
+                return self._terminal_loss(str(exc))
             return self._finish(submitted)
 
-        queries = [self.QUERY_RE.fullmatch(line) for line in lines]
-        if queries and all(queries):
-            return self._step_queries(queries)
-        if lines and any(match is not None for match in queries):
-            self._done = True
-            return None, 0.0, True, False, self._info(score=0.0, success=False, error="malformed query batch")
-
-        try:
-            submitted = self._submission(lines, allow_answer=wrapped)
-        except ValueError as exc:
-            self._done = True
-            return None, 0.0, True, False, self._info(score=0.0, success=False, error=str(exc))
-        if submitted is not None:
-            return self._finish(submitted)
-
-        self._done = True
-        return None, 0.0, True, False, {
-            "score": 0.0,
-            "success": False,
-            "error": "expected QUERY or SUBMIT",
-            "query_count": self._queries,
-            "turn_count": self._turns,
-        }
+        queries = [self.QUERY_RE.fullmatch(ln) for ln in lines]
+        if not all(queries):
+            return self._terminal_loss("expected QUERY or SUBMIT")
+        return self._step_queries(queries)
 
     def _step_queries(self, queries):
         lines = []
@@ -297,41 +274,17 @@ class TreeReconstructionEnv(Env):
             return "\n".join(lines), 0.0, False, True, self._info(error="turn limit reached")
         return "\n".join(lines), 0.0, False, False, self._info()
 
-    def _submission(self, lines: list[str], *, allow_answer: bool) -> list[int] | None:
-        if not lines:
-            return None
-        match = self.SUBMIT_RE.fullmatch(lines[0]) if len(lines) == 1 else None
-        if match is None:
-            if not allow_answer:
-                return None
-            if len(lines) != 1 or self.QUERY_RE.fullmatch(lines[0]) or lines[0].upper().startswith("QUERY "):
-                return None
-            body = lines[0]
-            if not self.ANSWER_BODY_RE.fullmatch(body):
-                raise ValueError("malformed submission")
-        else:
-            body = match.group("body")
-        if not re.search(r"-?\d+", body):
-            return None
-        values = [int(x) for x in re.findall(r"-?\d+", body)]
-        if len(values) == self._n - 1:
-            return [-1] + values
-        if len(values) == self._n:
-            values[0] = -1
-            return values
-        raise ValueError(f"expected {self._n - 1} or {self._n} parent values, got {len(values)}")
+    def _parse_submit(self, body: str) -> list[int]:
+        values = re.findall(r"-?\d+", body)
+        if len(values) != self._n - 1:
+            raise ValueError(f"expected {self._n - 1} parent values, got {len(values)}")
+        if body.strip() != " ".join(values):
+            raise ValueError("malformed submission")
+        return [-1] + [int(x) for x in values]
 
-    @classmethod
-    def _body(cls, text: str) -> tuple[str, bool, str | None]:
-        matches = list(cls.ANSWER_RE.finditer(text))
-        if len(matches) > 1:
-            return text, False, "multiple ANSWER blocks"
-        if not matches:
-            return text, False, None
-        outside = (text[:matches[0].start()] + text[matches[0].end():]).strip()
-        if outside:
-            return text, False, "ANSWER block must not have surrounding text"
-        return matches[0].group(1), True, None
+    def _terminal_loss(self, error: str):
+        self._done = True
+        return None, 0.0, True, False, self._info(success=False, error=error)
 
     def _finish(self, predicted: list[int]):
         self._done = True
@@ -364,7 +317,8 @@ Available queries:
 {docs}
 
 Rules:
-- In each response, either issue one or more QUERY lines or submit the final tree.
+- Each response is either one or more QUERY lines, or exactly one SUBMIT line.
+- Do not wrap responses in <ANSWER> tags or any other markup.
 - Query budget: {self._max_queries}
 - Turn budget: {self._max_turns}
 - Submit as: SUBMIT p1 p2 ... p{self._n - 1}
@@ -372,40 +326,24 @@ Rules:
 
 A complete reconstruction must identify every parent exactly."""
 
-    @staticmethod
-    def validate_options(options: dict) -> dict[str, Any]:
-        return TreeReconstructionEnv._validate_config(
-            options.get("n", 20),
-            options.get("method", "prufer"),
-            options.get("max_queries", 64),
-            options.get("max_turns", 32),
-            options.get("allowed_queries", ("ANCESTOR", "LCA", "DEPTH")),
-        )
-
-    @staticmethod
-    def _validate_config(n, method, max_queries, max_turns, allowed_queries) -> dict[str, Any]:
-        allowed = {"ANCESTOR", "LCA", "DEPTH", "CHILDREN", "PATH"}
-        n = TreeReconstructionEnv._as_int("n", n)
-        max_queries = TreeReconstructionEnv._as_int("max_queries", max_queries)
-        max_turns = TreeReconstructionEnv._as_int("max_turns", max_turns)
-        method = str(method)
+    @classmethod
+    def validate_options(cls, options: dict) -> dict[str, Any]:
+        n = int_param(options, "n", default=20, lo=2, hi=10**9)
+        max_queries = int_param(options, "max_queries", default=64, lo=0, hi=10**9)
+        max_turns = int_param(options, "max_turns", default=32, lo=1, hi=10**9)
+        method = str(options.get("method", "prufer"))
+        if method not in {"prufer", "recursive"}:
+            raise ValueError(f"method must be 'prufer' or 'recursive', got {method!r}")
+        allowed_queries = options.get("allowed_queries", ("ANCESTOR", "LCA", "DEPTH"))
         if isinstance(allowed_queries, str):
             raise ValueError("allowed_queries must be a non-empty sequence")
         try:
             queries = tuple(str(q).upper() for q in allowed_queries)
         except TypeError as exc:
             raise ValueError("allowed_queries must be a non-empty sequence") from exc
-        if n < 2:
-            raise ValueError(f"n must be at least 2, got {n}")
-        if method not in {"prufer", "recursive"}:
-            raise ValueError(f"method must be 'prufer' or 'recursive', got {method!r}")
-        if max_queries < 0:
-            raise ValueError(f"max_queries must be >= 0, got {max_queries}")
-        if max_turns <= 0:
-            raise ValueError(f"max_turns must be > 0, got {max_turns}")
         if not queries:
             raise ValueError("allowed_queries must not be empty")
-        unknown = sorted(set(queries) - allowed)
+        unknown = sorted(set(queries) - set(_ALLOWED_QUERIES))
         if unknown:
             raise ValueError(f"unknown allowed_queries: {unknown}")
         return {
@@ -415,18 +353,6 @@ A complete reconstruction must identify every parent exactly."""
             "max_turns": max_turns,
             "allowed_queries": queries,
         }
-
-    @staticmethod
-    def _as_int(name: str, value) -> int:
-        if isinstance(value, bool):
-            raise ValueError(f"{name} must be an integer, got {value!r}")
-        try:
-            out = int(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{name} must be an integer, got {value!r}") from exc
-        if out != value and not isinstance(value, str):
-            raise ValueError(f"{name} must be an integer, got {value!r}")
-        return out
 
     @staticmethod
     def _format(value: Any) -> str:

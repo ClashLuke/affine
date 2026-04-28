@@ -218,45 +218,30 @@ def _validate(cfg: Config) -> None:
         _validate_env_params(spec.name, spec.entrypoint, spec.params)
 
 
+_GENERATION_KEYS = frozenset({
+    "api_key", "frequency_penalty", "logit_bias", "max_tokens", "min_p", "presence_penalty",
+    "repetition_penalty", "stop", "temperature", "top_k", "top_p", "gym_max_steps",
+})
+
+
 def _validate_env_params(name: str, entrypoint: str, params: dict) -> None:
     if not isinstance(params, dict):
         raise TypeError(f"env '{name}': params must be an object, got {type(params).__name__}")
-    validators = {
-        "affine.envs.python_interpreter:PythonInterpreterEnv": ("affine.envs.python_interpreter", "PythonInterpreterEnv"),
-        "affine.envs.nfa_trace:NFATraceEnv": ("affine.envs.nfa_trace", "NFATraceEnv"),
-        "affine.envs.graph_path:GraphPathEnv": ("affine.envs.graph_path", "GraphPathEnv"),
-        "affine.envs.modular_crt:ModularCRTEnv": ("affine.envs.modular_crt", "ModularCRTEnv"),
-        "affine.envs.sudoku:SudokuEnv": ("affine.envs.sudoku", "SudokuEnv"),
-        "affine.envs.boolean_circuit:BooleanCircuitEnv": ("affine.envs.boolean_circuit", "BooleanCircuitEnv"),
-        "affine.envs.tree_reconstruction:TreeReconstructionEnv": ("affine.envs.tree_reconstruction", "TreeReconstructionEnv"),
-    }
-    allowed = {
-        "affine.envs.python_interpreter:PythonInterpreterEnv": {"lines", "ops", "max_digits"},
-        "affine.envs.nfa_trace:NFATraceEnv": {"states", "length", "alphabet", "accept_count"},
-        "affine.envs.graph_path:GraphPathEnv": {"nodes", "edges", "min_path_len"},
-        "affine.envs.modular_crt:ModularCRTEnv": {"moduli", "steps"},
-        "affine.envs.sudoku:SudokuEnv": {"clues", "min_branch_points"},
-        "affine.envs.boolean_circuit:BooleanCircuitEnv": {"variables", "gates", "min_influence"},
-        "affine.envs.tree_reconstruction:TreeReconstructionEnv": {
-            "n", "method", "max_queries", "max_turns", "allowed_queries",
-        },
-    }
-    generation = {
-        "api_key", "frequency_penalty", "logit_bias", "max_tokens", "min_p", "presence_penalty",
-        "repetition_penalty", "stop", "temperature", "top_k", "top_p", "gym_max_steps",
-    }
-    if entrypoint not in validators:
+    from affine.envs._base import load_env_class
+    try:
+        cls = load_env_class(entrypoint)
+    except (ImportError, AttributeError, ValueError):
         return
-    unknown = set(params) - allowed[entrypoint] - generation - {"timeout"}
+    option_keys = getattr(cls, "option_keys", None)
+    if option_keys is None:
+        return
+    unknown = set(params) - set(option_keys) - _GENERATION_KEYS - {"timeout"}
     if unknown:
         raise KeyError(f"env '{name}': unknown params: {sorted(unknown)}")
-    _validate_generation_params(name, {k: v for k, v in params.items() if k in generation})
-    task_params = {k: v for k, v in params.items() if k in allowed[entrypoint]}
-    import importlib
-
-    mod, cls = validators[entrypoint]
+    _validate_generation_params(name, {k: v for k, v in params.items() if k in _GENERATION_KEYS})
+    task_params = {k: v for k, v in params.items() if k in option_keys}
     try:
-        getattr(importlib.import_module(mod), cls).validate_options(task_params)
+        cls.validate_options(task_params)
     except ValueError as exc:
         raise ValueError(f"env '{name}': {exc}") from exc
 
@@ -360,43 +345,28 @@ def _validate_task_range(name: str, raw) -> tuple[int, int]:
 BASELINE_MODELS: tuple[str, ...] = ("Qwen/Qwen3-32B", "openai/gpt-oss-120b")
 
 
+_BASE_PARAMS = {"temperature": 0.0, "timeout": 600}
+
+
+def _spec(name: str, entrypoint: str, **params) -> EnvSpec:
+    return EnvSpec(name=name, entrypoint=entrypoint, params={**_BASE_PARAMS, **params})
+
+
 ENV_REGISTRY: dict[str, EnvSpec] = {
-    "python": EnvSpec(
-        name="python",
-        entrypoint="affine.envs.python_interpreter:PythonInterpreterEnv",
-        params={"lines": 64, "temperature": 0.0, "max_tokens": 4096, "timeout": 600},
-    ),
-    "nfa": EnvSpec(
-        name="nfa",
-        entrypoint="affine.envs.nfa_trace:NFATraceEnv",
-        params={"states": 10, "length": 16, "accept_count": 3, "temperature": 0.0, "max_tokens": 1024, "timeout": 600},
-    ),
-    "graph": EnvSpec(
-        name="graph",
-        entrypoint="affine.envs.graph_path:GraphPathEnv",
-        params={"nodes": 16, "edges": 46, "min_path_len": 5, "temperature": 0.0, "max_tokens": 2048, "timeout": 600},
-    ),
-    "modular": EnvSpec(
-        name="modular",
-        entrypoint="affine.envs.modular_crt:ModularCRTEnv",
-        params={"moduli": 3, "steps": 5, "temperature": 0.0, "max_tokens": 2048, "timeout": 600},
-    ),
-    "sudoku": EnvSpec(
-        name="sudoku",
-        entrypoint="affine.envs.sudoku:SudokuEnv",
-        params={"clues": 36, "min_branch_points": 2, "temperature": 0.0, "max_tokens": 4096, "timeout": 600},
-    ),
-    "boolean": EnvSpec(
-        name="boolean",
-        entrypoint="affine.envs.boolean_circuit:BooleanCircuitEnv",
-        params={"variables": 9, "gates": 18, "min_influence": 7, "temperature": 0.0, "max_tokens": 2048, "timeout": 600},
-    ),
-    "tree": EnvSpec(
-        name="tree",
-        entrypoint="affine.envs.tree_reconstruction:TreeReconstructionEnv",
-        params={"n": 20, "method": "prufer", "max_queries": 64, "max_turns": 32,
-                "temperature": 0.0, "max_tokens": 4096, "timeout": 600},
-    ),
+    "python": _spec("python", "affine.envs.python_interpreter:PythonInterpreterEnv",
+                    lines=64, max_tokens=4096),
+    "nfa": _spec("nfa", "affine.envs.nfa_trace:NFATraceEnv",
+                 states=10, length=16, accept_count=3, max_tokens=1024),
+    "graph": _spec("graph", "affine.envs.graph_path:GraphPathEnv",
+                   nodes=16, edges=46, min_path_len=5, max_tokens=2048),
+    "modular": _spec("modular", "affine.envs.modular_crt:ModularCRTEnv",
+                     moduli=3, steps=5, max_tokens=2048),
+    "sudoku": _spec("sudoku", "affine.envs.sudoku:SudokuEnv",
+                    clues=36, min_branch_points=2, max_tokens=4096),
+    "boolean": _spec("boolean", "affine.envs.boolean_circuit:BooleanCircuitEnv",
+                     variables=9, gates=18, min_influence=7, max_tokens=2048),
+    "tree": _spec("tree", "affine.envs.tree_reconstruction:TreeReconstructionEnv",
+                  n=20, method="prufer", max_queries=64, max_turns=32, max_tokens=4096),
 }
 
 

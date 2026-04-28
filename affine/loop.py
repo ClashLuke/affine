@@ -208,24 +208,14 @@ def _fit(rows: list[Row], miners: list[Miner], env_names: list[str],
 async def _load_envs(cfg: Config) -> dict[str, tuple]:
     loaded: dict[str, EnvFactory] = {}
     out = {}
-    try:
-        for spec in cfg.environments:
-            if spec.entrypoint in loaded:
-                wrapper = loaded[spec.entrypoint]
-                out[spec.name] = (wrapper, spec)
-                log.info(f"env: {spec.name} ({spec.entrypoint}) [shared]")
-                continue
-            wrapper = EnvFactory(spec.entrypoint)
-            loaded[spec.entrypoint] = wrapper
-            out[spec.name] = (wrapper, spec)
+    for spec in cfg.environments:
+        if spec.entrypoint not in loaded:
+            loaded[spec.entrypoint] = EnvFactory(spec.entrypoint)
             log.info(f"env: {spec.name} ({spec.entrypoint})")
-        return out
-    except BaseException:
-        for wrapper in loaded.values():
-            try: await asyncio.wait_for(wrapper.cleanup(), timeout=30.0)
-            except Exception as e:
-                log.warning(f"env cleanup-on-fail: {e}")
-        raise
+        else:
+            log.info(f"env: {spec.name} ({spec.entrypoint}) [shared]")
+        out[spec.name] = (loaded[spec.entrypoint], spec)
+    return out
 
 
 async def _cancellable(coro, stop: asyncio.Event, on_orphan=None):
@@ -1097,13 +1087,6 @@ async def run(cfg: Config, chain: Chain, slots=None):
         log.info("shutdown")
         await _drop_next_chal(state, slots)
         await _drop_king(state, slots)
-        seen: set[int] = set()
-        for wrapper, _ in envs.values():
-            if id(wrapper) in seen: continue
-            seen.add(id(wrapper))
-            try: await asyncio.wait_for(wrapper.cleanup(), timeout=30.0)
-            except Exception as e:
-                log.warning(f"env cleanup: {e}")
 
 
 def bittensor_chain(cfg: Config) -> tuple[Chain, Subtensor]:
