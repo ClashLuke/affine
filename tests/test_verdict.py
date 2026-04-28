@@ -47,21 +47,21 @@ def test_cancelled_skips():
     assert _decide(status=DuelStatus.CANCELLED) == Skip("cancelled")
 
 
-@pytest.mark.parametrize("status", [DuelStatus.KING_SLOT_DEAD, DuelStatus.CHAL_SLOT_DEAD])
-def test_slot_dead_does_not_short_circuit_dethrone(status):
-    """Slot-dead aborts must let `decide` evaluate the rows. Synthetic-loss
-    rows already encode broken-slot evidence; throwing them away would deny
-    the design-intent 'first functioning challenger wins by default' path."""
+@pytest.mark.parametrize("status,reason", [
+    (DuelStatus.KING_SLOT_DEAD, "king_slot_dead"),
+    (DuelStatus.CHAL_SLOT_DEAD, "chal_slot_dead"),
+])
+def test_slot_dead_skips_regardless_of_z(status, reason):
+    """Slot-dead is a unilateral counter trip, not a duel outcome. A reign
+    only changes when the challenger crosses z>k on real evidence; a partial
+    fit at the moment of slot teardown must not be allowed to dethrone (or
+    crown) anyone. A validator-side env bug that fails both models would
+    otherwise race to KING_SLOT_DEAD vs CHAL_SLOT_DEAD with the loser losing
+    its reign on infrastructure noise."""
     k = compute_k(0, CFG.k_init, CFG.k_final, CFG.k_halflife)
-    v = _decide(fit=_fit(k + 1e-6), status=status)
-    assert isinstance(v, Dethrone)
-
-
-@pytest.mark.parametrize("status", [DuelStatus.KING_SLOT_DEAD, DuelStatus.CHAL_SLOT_DEAD])
-def test_slot_dead_with_no_rows_still_skips(status):
-    """If the slot died before a single delivery, there is no evidence to
-    decide on — Skip("no_rows") is the right outcome regardless of status."""
-    assert _decide(rows=[], status=status) == Skip("no_rows")
+    assert _decide(fit=_fit(k + 1e-6), status=status) == Skip(reason)
+    assert _decide(fit=_fit(-(k + 1e-6)), status=status) == Skip(reason)
+    assert _decide(rows=[], status=status) == Skip(reason)
 
 
 @pytest.mark.parametrize("reign_blocks", [0, 1, 10, 100])

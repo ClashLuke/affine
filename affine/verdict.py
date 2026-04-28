@@ -81,19 +81,25 @@ def decide(rows: list[Row], fit: Fit, status: DuelStatus,
            reign_blocks: int, cfg: Config) -> Verdict:
     """Pure decision: maps duel evidence to a Verdict.
 
-    Non-decisions (cancelled, envs broken, no rows, degenerate fit) → Skip;
-    caller audits as duel_aborted. Otherwise compute z = Δθ̂ / SE against
-    k(reign): z > k → Dethrone, else Hold("z_below_k", ev).
+    Non-decisions (cancelled, envs broken, slot dead, no rows, degenerate fit)
+    → Skip; caller audits as duel_aborted. Otherwise compute z = Δθ̂ / SE
+    against k(reign): z > k → Dethrone, else Hold("z_below_k", ev).
 
-    KING_SLOT_DEAD / CHAL_SLOT_DEAD are not short-circuited — synthetic-loss
-    rows already encode the broken-slot evidence (one side fails to deliver →
-    p=0 row for that miner). The contrast z over those rows expresses
-    "first functioning challenger wins by default". Caller still tears down
-    the dead slot regardless of the verdict."""
+    Slot-dead aborts (KING_SLOT_DEAD / CHAL_SLOT_DEAD) are unilateral
+    counter trips, not duel outcomes. Letting a partial fit decide the duel
+    means a healthy king with a flaky validator-side env (e.g. an env wrapper
+    that ships a too-long prompt and gets a 400 from both models) can lose a
+    reign on infrastructure noise. A reign changes only when the challenger
+    accumulates enough real evidence to cross z>k; if a slot dies first,
+    teardown happens but the duel produces no decision."""
     if status is DuelStatus.CANCELLED:
         return Skip("cancelled")
     if status is DuelStatus.ENVS_QUARANTINED:
         return Skip("envs_quarantined")
+    if status is DuelStatus.KING_SLOT_DEAD:
+        return Skip("king_slot_dead")
+    if status is DuelStatus.CHAL_SLOT_DEAD:
+        return Skip("chal_slot_dead")
     if not rows:
         return Skip("no_rows")
     if fit.degenerate:
