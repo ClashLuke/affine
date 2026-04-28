@@ -114,7 +114,10 @@ for i, line in enumerate(tail_lines):
     problems.append("unhandled Traceback in recent stderr")
     break
 
-# 5. fit on full evidence (sanity)
+# 5. fit on full evidence (sanity + ranking)
+fit = None
+miners: list[Miner] = []
+env_names: list[str] = []
 if rows:
     mids = {}
     for r in rows: mids[r.m] = (r.r, r.k or "?")
@@ -140,11 +143,56 @@ if reign and log_text:
     if last is not None and int(last.group(1)) != reign["uid"]:
         warns.append(f"reign uid={reign['uid']} but most recent DETHRONE log → uid {last.group(1)}")
 
+# Health stats — surface what's going on, not just what's broken.
+all_log_text = "".join(p.read_text() for p in sorted((REPO/".shadow").glob("stderr-*.log")))
+duels_lifetime  = len(re.findall(r"affine\.loop INFO duel: king uid", all_log_text))
+duels_session   = len(re.findall(r"affine\.loop INFO duel: king uid", log_text))
+dethrones       = len(re.findall(r"DETHRONE: uid \d+ → uid \d+", all_log_text))
+reign_start_b   = int(reign["reign_start"]) if reign else 0
+rows_this_reign = sum(1 for r in rows if r.t >= reign_start_b) if reign else 0
+reign_span_b    = (max((r.t for r in rows), default=0) - reign_start_b) if reign and rows else 0
+env_counts      = sorted(((e, sum(1 for r in rows if r.e == e)) for e in env_names),
+                         key=lambda x: -x[1])
+
+# Top 5 by θ̂. Index back to art_key → uids/model.
+ranking_lines: list[str] = []
+if fit is not None and not fit.degenerate:
+    by_uid_rev = {(m.uid, m.revision): m for m in miners}
+    keys = []
+    seen = set()
+    for m in miners:
+        k = (m.model, m.revision)
+        if k not in seen: keys.append(k); seen.add(k)
+    for r in rows:
+        k = (r.k, r.r) if r.k is not None else (by_uid_rev.get((r.m, r.r)).model if (r.m, r.r) in by_uid_rev else f"?ghost:{r.m}", r.r)
+        if k not in seen: keys.append(k); seen.add(k)
+    art_uids: dict[tuple, list[int]] = {}
+    for r in rows:
+        k = (r.k, r.r) if r.k is not None else ((by_uid_rev[(r.m, r.r)].model, r.r) if (r.m, r.r) in by_uid_rev else (f"?ghost:{r.m}", r.r))
+        art_uids.setdefault(k, [])
+        if r.m not in art_uids[k]: art_uids[k].append(r.m)
+    se = fit.theta_se
+    order = sorted(range(len(keys)), key=lambda i: -fit.theta[i])
+    for i in order[:5]:
+        model, rev = keys[i]
+        uids = art_uids.get(keys[i], [])
+        crown = " 👑" if reign and reign["uid"] in uids else ""
+        ranking_lines.append(f"  θ̂={fit.theta[i]:+.3f}±{se[i]:.3f}  {model}@{rev[:7]}  uids={uids}{crown}")
+
 # Output
 ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 pid_s = pids[0] if pids else "NONE"
 reign_s = f"uid{reign['uid']}@{reign['reign_start']}b" if reign else "NONE"
-print(f"[{ts}] pid={pid_s} rows={len(rows)} reign={reign_s} | {'OK' if not problems and not warns else ('WARN' if not problems else 'FAIL')}")
+status = "OK" if not problems and not warns else ("WARN" if not problems else "FAIL")
+print(f"[{ts}] pid={pid_s} rows={len(rows)} reign={reign_s} | {status}")
+print(f"  duels: {duels_session} this session / {duels_lifetime} lifetime · dethrones lifetime: {dethrones}")
+print(f"  reign: {rows_this_reign} rows over {reign_span_b}b" if reign else "  reign: NONE")
+if env_counts:
+    top_envs = " · ".join(f"{e}={n}" for e, n in env_counts[:6])
+    print(f"  envs ({len(env_counts)}): {top_envs}")
+if ranking_lines:
+    print("  top θ̂:")
+    for ln in ranking_lines: print(ln)
 for w in warns: print(f"  WARN: {w}")
 for p in problems: print(f"  FAIL: {p}")
 sys.exit(1 if problems else 0)
