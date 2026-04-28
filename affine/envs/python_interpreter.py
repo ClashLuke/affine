@@ -215,27 +215,57 @@ class PythonInterpreterEnv(Env):
     max_digits: int
 
     def __init__(self, lines: int = 64, ops=_all_ops, max_digits: int = 5):
-        self.lines = lines
-        self.ops = list(ops)
-        self.max_digits = max_digits
+        self._defaults = self.validate_options({"lines": lines, "ops": ops, "max_digits": max_digits})
+        self.lines = self._defaults["lines"]
+        self.ops = list(self._defaults["ops"])
+        self.max_digits = self._defaults["max_digits"]
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         opts = options or {}
-        lines = int(opts.get("lines", self.lines))
-        ops = list(opts.get("ops", self.ops))
-        max_digits = int(opts.get("max_digits", self.max_digits))
+        params = self.validate_options({**self._defaults, **opts})
+        lines = params["lines"]
+        ops = list(params["ops"])
+        max_digits = params["max_digits"]
         code = codegen(lines, ops, max_digits, random.Random(0 if seed is None else seed))
-        self._target = _run_code(code).strip()
+        self._target = _run_code(code)
         return static + code, {
             "challenge_id": str(seed if seed is not None else 0),
             "env_id": "python_interpreter",
             "spec_version": self.__version__,
+            **params,
         }
 
     def step(self, action: str):
         matches = re.findall(r"<ANSWER>(.*?)</ANSWER>", action or "", re.IGNORECASE | re.DOTALL)
-        ok = bool(matches and matches[0].strip() == self._target)
+        ok = len(matches) == 1 and matches[0] == self._target
         return None, float(ok), True, False, {"score": float(ok)}
+
+    @staticmethod
+    def validate_options(options: dict) -> dict:
+        lines = _int_param(options, "lines", default=64, min_value=1, max_value=256)
+        max_digits = _int_param(options, "max_digits", default=5, min_value=1, max_value=8)
+        ops = options.get("ops", _all_ops)
+        if isinstance(ops, str) or not isinstance(ops, (list, tuple)) or not ops:
+            raise ValueError("ops must be a non-empty list")
+        unknown = sorted({str(op) for op in ops} - set(_all_ops))
+        if unknown:
+            raise ValueError(f"unknown ops: {unknown}")
+        return {"lines": lines, "ops": tuple(str(op) for op in ops), "max_digits": max_digits}
+
+
+def _int_param(options: dict, key: str, *, default: int, min_value: int, max_value: int) -> int:
+    value = options.get(key, default)
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be an integer, got {value!r}")
+    try:
+        out = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer, got {value!r}") from exc
+    if out != value and not isinstance(value, str):
+        raise ValueError(f"{key} must be an integer, got {value!r}")
+    if not min_value <= out <= max_value:
+        raise ValueError(f"{key} must be in [{min_value}, {max_value}], got {out}")
+    return out
 
 
 PYI = PythonInterpreterEnv

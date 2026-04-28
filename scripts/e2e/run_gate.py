@@ -18,13 +18,13 @@ RE_WEIGHTS = re.compile(r"weights set:\s*uid")
 RE_WEIGHTS_UID = re.compile(r"weights set:\s*uid\s+(\d+)")
 RE_DUEL_START = re.compile(r"duel:\s*king\s+uid(\d+)\s+vs\s+chal\s+uid(\d+)")
 RE_VERDICT = re.compile(r"verdict:\s*Δθ̂=")
-RE_ENV_LOADED = re.compile(r"env:\s*(python)\b")
+RE_ENV_LOADED = re.compile(r"env:\s*(python|nfa|graph|modular|sudoku|boolean|tree)\b")
 RE_DETHRONE = re.compile(r"DETHRONE:\s*uid\s+(\d+)\s*(?:→|->)")
 RE_QUEUE_EXHAUSTED = re.compile(r"queue exhausted")
 RE_SHUTDOWN = re.compile(r"^shutdown$|\bshutdown\s*$")
 
 
-EXPECTED_ENVS = {"python"}
+EXPECTED_ENVS = {"python", "nfa", "graph", "modular", "sudoku", "boolean", "tree"}
 
 
 @dataclass(frozen=True)

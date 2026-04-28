@@ -103,6 +103,18 @@ async def test_run_one_inner_timeout_is_infra_not_loss():
 
 
 @pytest.mark.asyncio
+async def test_run_one_inner_cancelled_task_is_infra_not_outer_cancel():
+    import asyncio
+
+    async def _inner_cancel(**kwargs):
+        raise asyncio.CancelledError()
+
+    env = SimpleNamespace(evaluate=_inner_cancel)
+    passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
+    assert passed is None
+
+
+@pytest.mark.asyncio
 async def test_run_one_exception_is_none():
     env = SimpleNamespace(evaluate=AsyncMock(side_effect=RuntimeError("boom")))
     passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
@@ -149,6 +161,61 @@ async def test_run_one_uses_gym_reset_step(monkeypatch):
     assert calls["reset"] == (7, {"temperature": 0.2})
     assert calls["chat"] == ("m", "prompt", {"temperature": 0.2}, 42)
     assert calls["action"] == "<ANSWER>ok</ANSWER>"
+
+
+@pytest.mark.asyncio
+async def test_run_one_gym_multistep_keeps_conversation(monkeypatch):
+    from affine import sampler
+    calls = []
+
+    class Env:
+        def reset(self, *, seed=None, options=None):
+            return "prompt", {"challenge_id": str(seed), "max_turns": 2}
+
+        def step(self, action):
+            calls.append(("step", action))
+            if len([c for c in calls if c[0] == "step"]) == 1:
+                return "query result", 0.0, False, False, {}
+            return None, 1.0, True, False, {"success": True}
+
+    async def fake_chat(slot, obs, params, seed):
+        calls.append(("chat", obs))
+        content = "QUERY CHILDREN 0" if len([c for c in calls if c[0] == "chat"]) == 1 else "SUBMIT 0"
+        return {"choices": [{"message": {"content": content}}], "usage": {"completion_tokens": 2}}
+
+    monkeypatch.setattr(sampler, "_chat", fake_chat)
+    passed, _, tok = await run_one(Env(), {}, 10, _slot(), seed=42, task_id=7)
+    assert passed is True
+    assert tok == 4
+    assert calls[0] == ("chat", "prompt")
+    assert calls[2] == ("chat", [
+        {"role": "user", "content": "prompt"},
+        {"role": "assistant", "content": "QUERY CHILDREN 0"},
+        {"role": "user", "content": "query result"},
+    ])
+
+
+@pytest.mark.asyncio
+async def test_run_one_gym_max_steps_caps_reset_max_turns(monkeypatch):
+    from affine import sampler
+    calls = []
+
+    class Env:
+        def reset(self, *, seed=None, options=None):
+            return "prompt", {"challenge_id": str(seed), "max_turns": 5}
+
+        def step(self, action):
+            return "keep going", 0.0, False, False, {}
+
+    async def fake_chat(slot, obs, params, seed):
+        calls.append(obs)
+        return {"choices": [{"message": {"content": "QUERY DEPTH 1"}}], "usage": {"completion_tokens": 1}}
+
+    monkeypatch.setattr(sampler, "_chat", fake_chat)
+    passed, _, tok = await run_one(Env(), {"gym_max_steps": 1}, 10, _slot(), seed=42, task_id=7)
+    assert passed is False
+    assert tok == 1
+    assert calls == ["prompt"]
 
 
 @pytest.mark.asyncio

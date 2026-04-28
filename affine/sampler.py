@@ -82,6 +82,15 @@ def _messages(obs) -> list[dict]:
     raise TypeError(f"unsupported env observation: {type(obs).__name__}")
 
 
+def _usage_add(total: dict, usage) -> dict:
+    if not isinstance(usage, dict):
+        return total
+    for k, v in usage.items():
+        if isinstance(v, (int, float)) and math.isfinite(v):
+            total[k] = total.get(k, 0) + v
+    return total
+
+
 def _content(r: dict) -> str:
     choices = r.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -131,16 +140,41 @@ async def _gym_eval(env_wrapper, params: dict, slot, seed: int, task_id: int):
     env = env_wrapper.make() if hasattr(env_wrapper, "make") else env_wrapper
     try:
         obs, reset_info = await _maybe_await(env.reset(seed=task_id, options=params))
-        raw = await _chat(slot, obs, params, seed)
-        answer = _content(raw)
-        _obs, reward, terminated, truncated, info = await _maybe_await(env.step(answer))
-        if not (terminated or truncated):
-            raise RuntimeError("env.step did not terminate or truncate the episode")
+        reset_max = reset_info.get("max_turns") if isinstance(reset_info, dict) else None
+        param_max = params.get("gym_max_steps")
+        if reset_max is None:
+            max_steps = int(param_max if param_max is not None else 64)
+        elif param_max is None:
+            max_steps = int(reset_max)
+        else:
+            max_steps = min(int(reset_max), int(param_max))
+        usage: dict = {}
+        last_info = {}
+        for step_idx in range(max_steps):
+            raw = await _chat(slot, obs, params, seed)
+            _usage_add(usage, raw.get("usage"))
+            answer = _content(raw)
+            next_obs, reward, terminated, truncated, info = await _maybe_await(env.step(answer))
+            last_info = info
+            if terminated or truncated:
+                success = info.get("success") if isinstance(info, dict) else None
+                return {
+                    "score": float(reward),
+                    "success": success if isinstance(success, bool) else float(reward) > 0.0,
+                    "usage": usage or None,
+                    "extra": {"reset": reset_info, "step": info, "turns": step_idx + 1},
+                }
+            obs = [*_messages(obs), {"role": "assistant", "content": answer}, *_messages(next_obs)]
         return {
-            "score": float(reward),
-            "success": float(reward) > 0.0,
-            "usage": raw.get("usage"),
-            "extra": {"reset": reset_info, "step": info},
+            "score": 0.0,
+            "success": False,
+            "usage": usage or None,
+            "extra": {
+                "reset": reset_info,
+                "step": last_info,
+                "turns": max_steps,
+                "error": f"env exceeded gym_max_steps={max_steps}",
+            },
         }
     finally:
         close = getattr(env, "close", None)
@@ -196,10 +230,23 @@ async def run_one(
         await _drain(task, slot)
         log.warning(f"sample timed out after {timeout}s: {slot.model}")
         return False, time.monotonic() - t0, 0
-    if (exc := task.exception()) is not None:
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        if (cur := asyncio.current_task()) is not None and cur.cancelling() > 0:
+            raise
+        log.warning(f"infra failure ({slot.model}) in {dt:.2f}s — sample task cancelled itself")
+        return None, dt, 0
+    if exc is not None:
         log.warning(f"sample error ({slot.model}) after {dt:.2f}s: {type(exc).__name__}: {exc}")
         return None, dt, 0
-    r = task.result()
+    try:
+        r = task.result()
+    except asyncio.CancelledError:
+        if (cur := asyncio.current_task()) is not None and cur.cancelling() > 0:
+            raise
+        log.warning(f"infra failure ({slot.model}) in {dt:.2f}s — sample task cancelled itself")
+        return None, dt, 0
     if not isinstance(r, dict):
         log.warning(f"infra failure ({slot.model}) in {dt:.2f}s — non-dict response: {str(r)[:200]}")
         return None, dt, 0

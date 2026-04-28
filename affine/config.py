@@ -87,12 +87,24 @@ _PROFILES: dict[str, dict] = {
         "k_init": 3.0,
         "env_overrides": {
             "python": {"params": {"timeout": 300}},
+            "nfa": {"params": {"timeout": 300}},
+            "graph": {"params": {"timeout": 300}},
+            "modular": {"params": {"timeout": 300}},
+            "sudoku": {"params": {"timeout": 300}},
+            "boolean": {"params": {"timeout": 300}},
+            "tree": {"params": {"timeout": 300}},
         },
     },
     "smoke": {
         "k_init": 1.0,
         "env_overrides": {
             "python": {"params": {"timeout": 90, "lines": 16}},
+            "nfa": {"params": {"timeout": 90, "states": 7, "length": 8, "accept_count": 2}},
+            "graph": {"params": {"timeout": 90, "nodes": 9, "edges": 18, "min_path_len": 3}},
+            "modular": {"params": {"timeout": 90, "moduli": 2, "steps": 3}},
+            "sudoku": {"params": {"timeout": 90, "clues": 40, "min_branch_points": 0}},
+            "boolean": {"params": {"timeout": 90, "variables": 6, "gates": 10, "min_influence": 4}},
+            "tree": {"params": {"timeout": 120, "n": 10, "max_queries": 32, "max_turns": 16}},
         },
     },
 }
@@ -102,6 +114,8 @@ _TOP_LEVEL_KEYS = frozenset(f.name for f in fields(Config)) | {"env_overrides", 
 
 
 def _apply_json_overrides(cfg: Config, raw: dict) -> Config:
+    if not isinstance(raw, dict):
+        raise TypeError(f"AFFINE_CONFIG_SPEC must decode to an object, got {type(raw).__name__}")
     unknown = set(raw) - _TOP_LEVEL_KEYS
     if unknown:
         raise KeyError(f"unknown config keys: {sorted(unknown)}; "
@@ -136,6 +150,9 @@ def _apply_env_overrides(current: tuple[EnvSpec, ...], raw: dict) -> tuple[EnvSp
             if name not in by_name:
                 raise KeyError(f"unknown environment in env_overrides: {name}")
             by_name[name] = _merge_env(by_name[name], override)
+
+    if "environments" in raw and not isinstance(raw["environments"], list):
+        raise TypeError(f"environments must be a list, got {type(raw['environments']).__name__}")
 
     if isinstance(raw.get("environments"), list):
         rebuilt: list[EnvSpec] = []
@@ -188,6 +205,7 @@ def _validate(cfg: Config) -> None:
         seen.add(spec.name)
         if not spec.entrypoint:
             raise ValueError(f"environment '{spec.name}' has empty entrypoint")
+        _validate_task_range(spec.name, spec.task_range)
         # Per-env timeout drives asyncio.wait deadlines. NaN/Infinity make
         # asyncio.wait return immediately with empty done set → sample looks
         # timed out → False (miner-loss) for every sample. Negative is
@@ -197,21 +215,143 @@ def _validate(cfg: Config) -> None:
                                   and not isinstance(t, bool)
                                   and math.isfinite(t) and t > 0):
             raise ValueError(f"env '{spec.name}': params['timeout'] must be finite > 0, got {t!r}")
+        _validate_env_params(spec.name, spec.entrypoint, spec.params)
+
+
+def _validate_env_params(name: str, entrypoint: str, params: dict) -> None:
+    if not isinstance(params, dict):
+        raise TypeError(f"env '{name}': params must be an object, got {type(params).__name__}")
+    validators = {
+        "affine.envs.python_interpreter:PythonInterpreterEnv": ("affine.envs.python_interpreter", "PythonInterpreterEnv"),
+        "affine.envs.nfa_trace:NFATraceEnv": ("affine.envs.nfa_trace", "NFATraceEnv"),
+        "affine.envs.graph_path:GraphPathEnv": ("affine.envs.graph_path", "GraphPathEnv"),
+        "affine.envs.modular_crt:ModularCRTEnv": ("affine.envs.modular_crt", "ModularCRTEnv"),
+        "affine.envs.sudoku:SudokuEnv": ("affine.envs.sudoku", "SudokuEnv"),
+        "affine.envs.boolean_circuit:BooleanCircuitEnv": ("affine.envs.boolean_circuit", "BooleanCircuitEnv"),
+        "affine.envs.tree_reconstruction:TreeReconstructionEnv": ("affine.envs.tree_reconstruction", "TreeReconstructionEnv"),
+    }
+    allowed = {
+        "affine.envs.python_interpreter:PythonInterpreterEnv": {"lines", "ops", "max_digits"},
+        "affine.envs.nfa_trace:NFATraceEnv": {"states", "length", "alphabet", "accept_count"},
+        "affine.envs.graph_path:GraphPathEnv": {"nodes", "edges", "min_path_len"},
+        "affine.envs.modular_crt:ModularCRTEnv": {"moduli", "steps"},
+        "affine.envs.sudoku:SudokuEnv": {"clues", "min_branch_points"},
+        "affine.envs.boolean_circuit:BooleanCircuitEnv": {"variables", "gates", "min_influence"},
+        "affine.envs.tree_reconstruction:TreeReconstructionEnv": {
+            "n", "method", "max_queries", "max_turns", "allowed_queries",
+        },
+    }
+    generation = {
+        "api_key", "frequency_penalty", "logit_bias", "max_tokens", "min_p", "presence_penalty",
+        "repetition_penalty", "stop", "temperature", "top_k", "top_p", "gym_max_steps",
+    }
+    if entrypoint not in validators:
+        return
+    unknown = set(params) - allowed[entrypoint] - generation - {"timeout"}
+    if unknown:
+        raise KeyError(f"env '{name}': unknown params: {sorted(unknown)}")
+    _validate_generation_params(name, {k: v for k, v in params.items() if k in generation})
+    task_params = {k: v for k, v in params.items() if k in allowed[entrypoint]}
+    import importlib
+
+    mod, cls = validators[entrypoint]
+    try:
+        getattr(importlib.import_module(mod), cls).validate_options(task_params)
+    except ValueError as exc:
+        raise ValueError(f"env '{name}': {exc}") from exc
+
+
+def _validate_generation_params(name: str, params: dict) -> None:
+    for key, value in params.items():
+        if key == "api_key":
+            if not isinstance(value, str):
+                raise ValueError(f"env '{name}': api_key must be a string")
+        elif key in {"temperature"}:
+            _finite_number(name, key, value, min_value=0.0, max_value=2.0)
+        elif key in {"top_p", "min_p"}:
+            _finite_number(name, key, value, min_value=0.0, max_value=1.0, inclusive_min=False)
+        elif key in {"frequency_penalty", "presence_penalty"}:
+            _finite_number(name, key, value, min_value=-2.0, max_value=2.0)
+        elif key == "repetition_penalty":
+            _finite_number(name, key, value, min_value=0.0, max_value=4.0, inclusive_min=False)
+        elif key == "max_tokens":
+            _bounded_int(name, key, value, min_value=1, max_value=65536)
+        elif key == "top_k":
+            _bounded_int(name, key, value, min_value=0, max_value=100000)
+        elif key == "gym_max_steps":
+            _bounded_int(name, key, value, min_value=1, max_value=1024)
+        elif key == "stop":
+            if isinstance(value, str):
+                continue
+            if not isinstance(value, list) or any(not isinstance(x, str) for x in value):
+                raise ValueError(f"env '{name}': stop must be a string or list of strings")
+        elif key == "logit_bias":
+            if not isinstance(value, dict):
+                raise ValueError(f"env '{name}': logit_bias must be an object")
+            for token, bias in value.items():
+                if not isinstance(token, str) or not token:
+                    raise ValueError(f"env '{name}': logit_bias keys must be non-empty strings")
+                _finite_number(name, f"logit_bias[{token!r}]", bias, min_value=-100.0, max_value=100.0)
+
+
+def _bounded_int(name: str, key: str, value, *, min_value: int, max_value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"env '{name}': {key} must be an integer, got {value!r}")
+    if not min_value <= value <= max_value:
+        raise ValueError(f"env '{name}': {key} must be in [{min_value}, {max_value}], got {value}")
+    return value
+
+
+def _finite_number(
+    name: str,
+    key: str,
+    value,
+    *,
+    min_value: float,
+    max_value: float,
+    inclusive_min: bool = True,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"env '{name}': {key} must be finite, got {value!r}")
+    lo_ok = value >= min_value if inclusive_min else value > min_value
+    if not (lo_ok and value <= max_value):
+        bracket = "[" if inclusive_min else "("
+        raise ValueError(f"env '{name}': {key} must be in {bracket}{min_value}, {max_value}], got {value}")
+    return float(value)
 
 
 def _merge_env(base: EnvSpec, override: dict) -> EnvSpec:
+    if not isinstance(override, dict):
+        raise TypeError(f"environment override for {base.name!r} must be an object, got {type(override).__name__}")
+    unknown = set(override) - {"name", "entrypoint", "params", "task_range"}
+    if unknown:
+        raise KeyError(f"environment override for {base.name!r} has unknown keys: {sorted(unknown)}")
+    params = override.get("params", {})
+    if not isinstance(params, dict):
+        raise TypeError(f"environment override for {base.name!r}: params must be an object")
     entrypoint = str(override.get("entrypoint", base.entrypoint))
     if not entrypoint:
         raise ValueError(f"environment '{base.name}' has empty entrypoint")
-    tr = override.get("task_range", base.task_range)
-    if not (isinstance(tr, (list, tuple)) and len(tr) == 2 and int(tr[0]) <= int(tr[1])):
-        raise ValueError(f"environment '{base.name}' has invalid task_range: {tr!r}")
+    tr = _validate_task_range(base.name, override.get("task_range", base.task_range))
     return replace(base,
         name=str(override.get("name", base.name)),
         entrypoint=entrypoint,
-        params={**base.params, **override.get("params", {})},
-        task_range=(int(tr[0]), int(tr[1])),
+        params={**base.params, **params},
+        task_range=tr,
     )
+
+
+def _validate_task_range(name: str, raw) -> tuple[int, int]:
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        raise ValueError(f"environment '{name}' has invalid task_range: {raw!r}")
+    lo, hi = raw
+    if any(isinstance(x, bool) or not isinstance(x, int) for x in (lo, hi)):
+        raise ValueError(f"environment '{name}' task_range endpoints must be integers, got {raw!r}")
+    if not (0 <= lo <= hi <= (1 << 31) - 1):
+        raise ValueError(f"environment '{name}' task_range must be within [0, {((1 << 31) - 1)}], got {raw!r}")
+    if lo > hi:
+        raise ValueError(f"environment '{name}' has invalid task_range: {raw!r}")
+    return lo, hi
 
 
 # Cold-start baseline: on empty evidence, elect the first registered miner whose
@@ -225,6 +365,37 @@ ENV_REGISTRY: dict[str, EnvSpec] = {
         name="python",
         entrypoint="affine.envs.python_interpreter:PythonInterpreterEnv",
         params={"lines": 64, "temperature": 0.0, "max_tokens": 4096, "timeout": 600},
+    ),
+    "nfa": EnvSpec(
+        name="nfa",
+        entrypoint="affine.envs.nfa_trace:NFATraceEnv",
+        params={"states": 10, "length": 16, "accept_count": 3, "temperature": 0.0, "max_tokens": 1024, "timeout": 600},
+    ),
+    "graph": EnvSpec(
+        name="graph",
+        entrypoint="affine.envs.graph_path:GraphPathEnv",
+        params={"nodes": 16, "edges": 46, "min_path_len": 5, "temperature": 0.0, "max_tokens": 2048, "timeout": 600},
+    ),
+    "modular": EnvSpec(
+        name="modular",
+        entrypoint="affine.envs.modular_crt:ModularCRTEnv",
+        params={"moduli": 3, "steps": 5, "temperature": 0.0, "max_tokens": 2048, "timeout": 600},
+    ),
+    "sudoku": EnvSpec(
+        name="sudoku",
+        entrypoint="affine.envs.sudoku:SudokuEnv",
+        params={"clues": 36, "min_branch_points": 2, "temperature": 0.0, "max_tokens": 4096, "timeout": 600},
+    ),
+    "boolean": EnvSpec(
+        name="boolean",
+        entrypoint="affine.envs.boolean_circuit:BooleanCircuitEnv",
+        params={"variables": 9, "gates": 18, "min_influence": 7, "temperature": 0.0, "max_tokens": 2048, "timeout": 600},
+    ),
+    "tree": EnvSpec(
+        name="tree",
+        entrypoint="affine.envs.tree_reconstruction:TreeReconstructionEnv",
+        params={"n": 20, "method": "prufer", "max_queries": 64, "max_turns": 32,
+                "temperature": 0.0, "max_tokens": 4096, "timeout": 600},
     ),
 }
 
