@@ -1,46 +1,39 @@
 import collections
-import io
 import random
-import re
-import sys
-import typing
 
-from ._base import Env
+from ._base import ExactAnswerEnv, Spec, int_param
 
-static = ("In the following, we will test your ability to understand and execute python code.\n\n"
-          "RULES:\n"
-          "* You will not be able to use any external tools, such as a calculator or python during this test\n"
-          "* You will see the python code precisely once\n"
-          "* You may think and decypher the test for as long as you want\n"
-          "* Return the *exact* printout the python interpreter would otherwise return, including formatting and potential typos in the challenge\n"
-          "* Only outputs wrapped in XML-style <ANSWER></ANSWER> tags will be evaluated\n"
-          "* You may write any text outside of the <ANSWER> tags\n\n"
-          "Example:\n"
-          "CHALLENGE:\n"
-          ">>> var1 = [62139]\n"
-          ">>> var2 = [62598]\n"
-          ">>> print(var1)\n"
-          ">>> var4 = [40899]\n"
-          ">>> var5 = sorted(var2)\n"
-          ">>> var7 = 86093\n"
-          ">>> var7 += 35501\n"
-          ">>> print(var7)\n"
-          "RESPONSE:\n"
-          "Okay, I've processed the code you provided.\n<ANSWER>[62139]\n121594\n</ANSWER>\n\n"
-          "Below, you will see the real task. Remember and follow the rules.\n\n"
-          "CHALLENGE:\n")
+_all_ops = ("PRINT", "SORT", "APPEND", "ADD", "ASSIGN", "NOOP", "REVERSE", "POP",
+            "ZIP", "EXTEND", "INSERT", "MIN", "MAX")
 
-_all_ops = ('PRINT', 'SORT', "APPEND", "ADD", "ASSIGN", "NOOP", "REVERSE", "POP", "ZIP", "EXTEND", "INSERT", "MIN",
-            "MAX")
+_SPEC = Spec(
+    title="In the following, we will test your ability to understand and execute python code.",
+    rules=(
+        "You will not be able to use any external tools, such as a calculator or python during this test",
+        "You will see the python code precisely once",
+        "You may think and decypher the test for as long as you want",
+        "Return the *exact* printout the python interpreter would otherwise return, including formatting and potential typos in the challenge",
+        "Only outputs wrapped in XML-style <ANSWER></ANSWER> tags will be evaluated",
+        "You may write any text outside of the <ANSWER> tags",
+    ),
+    example_challenge=(
+        ">>> var1 = [62139]\n"
+        ">>> var2 = [62598]\n"
+        ">>> print(var1)\n"
+        ">>> var4 = [40899]\n"
+        ">>> var5 = sorted(var2)\n"
+        ">>> var7 = 86093\n"
+        ">>> var7 += 35501\n"
+        ">>> print(var7)"
+    ),
+    example_answer="[62139]\n121594\n",
+)
 
 
-def _flatten_dict(x: dict[str, dict[str, typing.Any]]) -> list[str]:
-    return [_k for k, v in x.items() for _k in v.keys()]
-
-
-def codegen(op_count: int, allowed_ops: list, max_digits: int = 5, rng: random.Random | None = None):
-    code = []
-    vars = collections.defaultdict(dict)
+def codegen(op_count: int, allowed_ops, max_digits: int = 5, rng: random.Random | None = None):
+    code: list[str] = []
+    target: list[str] = []
+    vars: dict[str, dict[str, object]] = collections.defaultdict(dict)
     rng = rng or random.Random()
     counter = 0
 
@@ -54,165 +47,150 @@ def codegen(op_count: int, allowed_ops: list, max_digits: int = 5, rng: random.R
         return rng.choice(vals)
 
     def _print():
-        flat = _flatten_dict(vars)
+        flat = [(cat, name) for cat, items in vars.items() for name in items]
         if not flat:
-            code.append('print()')
+            code.append("print()")
+            target.append("\n")
             return
-        code.append(f'print({rng.choice(flat)})')
+        cat, name = rng.choice(flat)
+        code.append(f"print({name})")
+        target.append(f"{vars[cat][name]}\n")
 
     def _sort():
-        key = _rand_key('list')
+        key = _rand_key("list")
         if key is None:
             return
-        new = f'var{counter}'
-        code.append(f'{new} = sorted({key})')
-        vars['list'][new] = sorted(vars['list'][key])
+        new = f"var{counter}"
+        code.append(f"{new} = sorted({key})")
+        vars["list"][new] = sorted(vars["list"][key])
 
     def _append():
-        chosen_val_name = _rand_key('raw')
-        chosen_list = _rand_key('list')
+        chosen_val_name = _rand_key("raw")
+        chosen_list = _rand_key("list")
         if chosen_val_name is None:
             chosen_val = _randint()
             chosen_val_name = chosen_val
         else:
-            chosen_val = vars['raw'][chosen_val_name]
+            chosen_val = vars["raw"][chosen_val_name]
         if chosen_list is None:
-            new = f'var{counter}'
-            vars['list'][new] = [chosen_val]
-            code.append(f'{new} = [{chosen_val_name}]')
+            new = f"var{counter}"
+            vars["list"][new] = [chosen_val]
+            code.append(f"{new} = [{chosen_val_name}]")
             return
-
-        vars['list'][chosen_list].append(chosen_val)
-        code.append(f'{chosen_list}.append({chosen_val_name})')
+        vars["list"][chosen_list].append(chosen_val)
+        code.append(f"{chosen_list}.append({chosen_val_name})")
 
     def _add():
-        chosen_val = _rand_key('raw')
+        chosen_val = _rand_key("raw")
         new = _randint()
         if chosen_val is None:
-            chosen_val = f'var{counter}'
-            code.append(f'{chosen_val} = {new}')
-            vars['raw'][chosen_val] = new
+            chosen_val = f"var{counter}"
+            code.append(f"{chosen_val} = {new}")
+            vars["raw"][chosen_val] = new
             return
-
-        vars['raw'][chosen_val] += new
-        code.append(f'{chosen_val} += {new}')
+        vars["raw"][chosen_val] += new
+        code.append(f"{chosen_val} += {new}")
 
     def _assign():
-        chosen_val = _rand_key('raw')
+        chosen_val = _rand_key("raw")
         new = _randint()
         if chosen_val is None:
-            chosen_val = f'var{counter}'
-            code.append(f'{chosen_val} = {new}')
-            vars['raw'][chosen_val] = new
+            chosen_val = f"var{counter}"
+            code.append(f"{chosen_val} = {new}")
+            vars["raw"][chosen_val] = new
             return
-
-        vars['raw'][chosen_val] = new
-        code.append(f'{chosen_val} = {new}')
+        vars["raw"][chosen_val] = new
+        code.append(f"{chosen_val} = {new}")
 
     def _reverse():
-        lst_key = _rand_key('list')
+        lst_key = _rand_key("list")
         if lst_key is None:
             return
-        vars['list'][lst_key].reverse()
-        code.append(f'{lst_key}.reverse()')
+        vars["list"][lst_key].reverse()
+        code.append(f"{lst_key}.reverse()")
 
     def _pop():
-        lst_key = _rand_key('list')
-        if lst_key is None or not vars['list'][lst_key]:
+        lst_key = _rand_key("list")
+        if lst_key is None or not vars["list"][lst_key]:
             return
-        vars['list'][lst_key].pop()
-        code.append(f'{lst_key}.pop()')
+        vars["list"][lst_key].pop()
+        code.append(f"{lst_key}.pop()")
 
     def _zip():
-        a = _rand_key('list')
-        b = _rand_key('list')
+        a = _rand_key("list")
+        b = _rand_key("list")
         if a is None or b is None:
             return
-        new = f'var{counter}'
-        merged = [x for z in zip(vars['list'][a], vars['list'][b]) for x in z]
-        vars['list'][new] = merged
-        code.append(f'{new} = [x for z in zip({a}, {b}) for x in z]')
+        new = f"var{counter}"
+        merged = [x for z in zip(vars["list"][a], vars["list"][b]) for x in z]
+        vars["list"][new] = merged
+        code.append(f"{new} = [x for z in zip({a}, {b}) for x in z]")
 
     def _noop():
         if rng.random() < 0.5:
-            code.append('')
+            code.append("")
 
     def _extend():
-        lst1 = _rand_key('list')
-        lst2 = _rand_key('list')
+        lst1 = _rand_key("list")
+        lst2 = _rand_key("list")
         if lst2 is None:
             lst2 = lst2_val = []
         else:
-            lst2_val = vars['list'][lst2]
+            lst2_val = vars["list"][lst2]
         if lst1 is None:
-            new = f'var{counter}'
-            vars['list'][new] = lst2_val[:]
+            new = f"var{counter}"
+            vars["list"][new] = lst2_val[:]
             code.append(f"{new} = {lst2}[:]")
             return
         if lst2:
-            vars['list'][lst1].extend(lst2_val)
+            vars["list"][lst1].extend(lst2_val)
         code.append(f"{lst1}.extend({lst2})")
 
     def _insert():
-        lst = _rand_key('list')
+        lst = _rand_key("list")
         val = _randint()
         if lst is None:
-            new = f'var{counter}'
-            vars['list'][new] = [val]
-            code.append(f'{new} = [{val}]')
+            new = f"var{counter}"
+            vars["list"][new] = [val]
+            code.append(f"{new} = [{val}]")
             return
-        idx = rng.randint(0, len(vars['list'][lst])) if vars['list'][lst] else 0
-        vars['list'][lst].insert(idx, val)
+        idx = rng.randint(0, len(vars["list"][lst])) if vars["list"][lst] else 0
+        vars["list"][lst].insert(idx, val)
         code.append(f"{lst}.insert({idx}, {val})")
 
     def _min():
-        target = _rand_key('list')
-        if target is None or not vars['list'][target]:
+        target_key = _rand_key("list")
+        if target_key is None or not vars["list"][target_key]:
             return
-
-        new = f'var{counter}'
-        vars['raw'][new] = min(vars['list'][target])
-        code.append(f'{new} = min({target})')
+        new = f"var{counter}"
+        vars["raw"][new] = min(vars["list"][target_key])
+        code.append(f"{new} = min({target_key})")
 
     def _max():
-        target = _rand_key('list')
-        if target is None or not vars['list'][target]:
+        target_key = _rand_key("list")
+        if target_key is None or not vars["list"][target_key]:
             return
+        new = f"var{counter}"
+        vars["raw"][new] = max(vars["list"][target_key])
+        code.append(f"{new} = max({target_key})")
 
-        new = f'var{counter}'
-        vars['raw'][new] = max(vars['list'][target])
-        code.append(f'{new} = max({target})')
-
-    ops = {'PRINT': _print, 'SORT': _sort, "APPEND": _append, "ADD": _add, "ASSIGN": _assign, "NOOP": _noop,
-           "REVERSE": _reverse, "POP": _pop, "ZIP": _zip, "EXTEND": _extend, "INSERT": _insert, "MIN": _min,
-           "MAX": _max}
+    ops = {"PRINT": _print, "SORT": _sort, "APPEND": _append, "ADD": _add, "ASSIGN": _assign,
+           "NOOP": _noop, "REVERSE": _reverse, "POP": _pop, "ZIP": _zip, "EXTEND": _extend,
+           "INSERT": _insert, "MIN": _min, "MAX": _max}
 
     for _ in range(op_count):
         counter += 1
-        op = rng.choice(allowed_ops)
-        ops[op]()
-
+        ops[rng.choice(allowed_ops)]()
     _print()
-    return '\n'.join(f'>>> {x}' for x in code)
+
+    return "\n".join(f">>> {x}" for x in code), "".join(target)
 
 
-def _run_code(code):
-    stdout = sys.stdout
-    buf = io.StringIO()
-    try:
-        sys.stdout = buf
-        exec(code.replace('>>> ', ''))
-    finally:
-        sys.stdout = stdout
-    buf.seek(0)
-    return buf.read()
-
-
-class PythonInterpreterEnv(Env):
-    __version__: str = "0.0.1"
-    lines: int
-    ops: list
-    max_digits: int
+class PythonInterpreterEnv(ExactAnswerEnv):
+    env_id = "python_interpreter"
+    option_keys = frozenset({"lines", "ops", "max_digits"})
+    spec = _SPEC
+    strip_answer = False
 
     def __init__(self, lines: int = 64, ops=_all_ops, max_digits: int = 5):
         self._defaults = self.validate_options({"lines": lines, "ops": ops, "max_digits": max_digits})
@@ -220,30 +198,17 @@ class PythonInterpreterEnv(Env):
         self.ops = list(self._defaults["ops"])
         self.max_digits = self._defaults["max_digits"]
 
-    def reset(self, *, seed: int | None = None, options: dict | None = None):
-        opts = options or {}
-        params = self.validate_options({**self._defaults, **opts})
-        lines = params["lines"]
-        ops = list(params["ops"])
-        max_digits = params["max_digits"]
-        code = codegen(lines, ops, max_digits, random.Random(0 if seed is None else seed))
-        self._target = _run_code(code)
-        return static + code, {
-            "challenge_id": str(seed if seed is not None else 0),
-            "env_id": "python_interpreter",
-            "spec_version": self.__version__,
-            **params,
-        }
+    def _generate(self, params, rng):
+        code, self._target = codegen(params["lines"], list(params["ops"]), params["max_digits"], rng)
+        return code, {}
 
-    def step(self, action: str):
-        matches = re.findall(r"<ANSWER>(.*?)</ANSWER>", action or "", re.IGNORECASE | re.DOTALL)
-        ok = len(matches) == 1 and matches[0] == self._target
-        return None, float(ok), True, False, {"score": float(ok)}
+    def parse_answer(self, body: str):
+        return body
 
-    @staticmethod
-    def validate_options(options: dict) -> dict:
-        lines = _int_param(options, "lines", default=64, min_value=1, max_value=256)
-        max_digits = _int_param(options, "max_digits", default=5, min_value=1, max_value=8)
+    @classmethod
+    def validate_options(cls, options: dict) -> dict:
+        lines = int_param(options, "lines", default=64, lo=1, hi=256)
+        max_digits = int_param(options, "max_digits", default=5, lo=1, hi=8)
         ops = options.get("ops", _all_ops)
         if isinstance(ops, str) or not isinstance(ops, (list, tuple)) or not ops:
             raise ValueError("ops must be a non-empty list")
@@ -251,21 +216,3 @@ class PythonInterpreterEnv(Env):
         if unknown:
             raise ValueError(f"unknown ops: {unknown}")
         return {"lines": lines, "ops": tuple(str(op) for op in ops), "max_digits": max_digits}
-
-
-def _int_param(options: dict, key: str, *, default: int, min_value: int, max_value: int) -> int:
-    value = options.get(key, default)
-    if isinstance(value, bool):
-        raise ValueError(f"{key} must be an integer, got {value!r}")
-    try:
-        out = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{key} must be an integer, got {value!r}") from exc
-    if out != value and not isinstance(value, str):
-        raise ValueError(f"{key} must be an integer, got {value!r}")
-    if not min_value <= out <= max_value:
-        raise ValueError(f"{key} must be in [{min_value}, {max_value}], got {out}")
-    return out
-
-
-PYI = PythonInterpreterEnv
