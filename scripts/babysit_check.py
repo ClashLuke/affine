@@ -101,12 +101,18 @@ for s, e, body in _verdict_blocks(log_text):
     elif ab is not None and ab.group(1) != f"{side}_slot_dead":
         warns.append(f"slot-dead ({side}) but abort reason = {ab.group(1)}")
 
-# Recent traceback (last 200 lines)
-tail = "\n".join(log_text.splitlines()[-200:])
-if "Traceback (most recent call last):" in tail:
-    # Allow expected ones from sampler/env wrappers (logged as WARNING via affine.sampler)
-    if re.search(r"^(?!.*affine\.sampler).*Traceback", tail, re.M):
-        problems.append("unhandled Traceback in recent stderr")
+# Recent traceback (last 200 lines). A traceback printed via logger.exception /
+# exc_info=True is preceded by its WARNING/ERROR header on the prior line — that
+# is where the module name sits, not on the `Traceback (most recent call last):`
+# line itself. Treat sampler-attributed tracebacks as expected (infra failures
+# already counted as synth rows); flag anything else.
+tail_lines = log_text.splitlines()[-200:]
+for i, line in enumerate(tail_lines):
+    if "Traceback (most recent call last):" not in line: continue
+    prev = tail_lines[i-1] if i else ""
+    if "affine.sampler" in prev: continue
+    problems.append("unhandled Traceback in recent stderr")
+    break
 
 # 5. fit on full evidence (sanity)
 if rows:
