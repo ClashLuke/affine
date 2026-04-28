@@ -904,99 +904,26 @@ def test_task_id_depends_on_salt():
 
 
 @pytest.mark.asyncio
-async def test_load_envs_injects_openai_api_key(monkeypatch):
-    """Env containers need OPENAI_API_KEY set (vLLM ignores the value but the
-    openai SDK refuses to instantiate without it). Regression: without this,
-    every evaluate() failed instantly with OpenAIError and every duel aborted."""
-    calls: list[dict] = []
-    def fake_load_env(image, mode, env_vars, mem_limit, pull, cleanup):
-        calls.append(env_vars or {})
-        return SimpleNamespace(_backend=None)
-    monkeypatch.setattr("affinetes.load_env", fake_load_env)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+async def test_load_envs_builds_local_factories():
+    entrypoint = "affine.envs.python_interpreter:PythonInterpreterEnv"
     cfg = Config(environments=(
-        EnvSpec(name="a", image="img-a"),
-        EnvSpec(name="b", image="img-b", env_vars={"OPENAI_API_KEY": "override"}),
-    ))
-    await _load_envs(cfg)
-    assert calls[0]["OPENAI_API_KEY"] == "vllm"
-    assert calls[1]["OPENAI_API_KEY"] == "override"
-
-
-@pytest.mark.asyncio
-async def test_load_envs_shares_wrapper_for_duplicate_images(monkeypatch):
-    """Two envs with the same image (eg affine:ded + affine:abd on affine-env:v4)
-    must share one container wrapper but keep per-env params.
-
-    Regression: spec._replace() was called on a frozen dataclass — crashed on
-    every production startup with AttributeError before this test existed."""
-    built: list[str] = []
-    def fake_load_env(image, mode, env_vars, mem_limit, pull, cleanup):
-        built.append(image)
-        return SimpleNamespace(_backend=None, image=image)
-    monkeypatch.setattr("affinetes.load_env", fake_load_env)
-    cfg = Config(environments=(
-        EnvSpec(name="ded", image="shared", params={"task_type": "ded"}),
-        EnvSpec(name="abd", image="shared", params={"task_type": "abd"}),
-        EnvSpec(name="other", image="distinct"),
+        EnvSpec(name="a", entrypoint=entrypoint, params={"lines": 1}),
+        EnvSpec(name="b", entrypoint=entrypoint, params={"lines": 2}),
     ))
     envs = await _load_envs(cfg)
-    assert built == ["shared", "distinct"]                 # one wrapper per unique image
-    assert envs["ded"][0] is envs["abd"][0]                # shared wrapper
-    assert envs["ded"][1].params["task_type"] == "ded"     # but per-env params kept
-    assert envs["abd"][1].params["task_type"] == "abd"
-    assert envs["other"][0].image == "distinct"
+    assert envs["a"][0] is envs["b"][0]
+    assert envs["a"][1].params["lines"] == 1
+    assert envs["b"][1].params["lines"] == 2
+    assert hasattr(envs["a"][0].make(), "reset")
 
 
 @pytest.mark.asyncio
-async def test_load_envs_rejects_shared_image_with_different_env_vars(monkeypatch):
-    """Same image but different env_vars/mem_limit must NOT silently share a
-    wrapper — the second env's container-init config would be lost."""
-    monkeypatch.setattr("affinetes.load_env",
-        lambda image, mode, env_vars, mem_limit, pull, cleanup: SimpleNamespace(_backend=None))
+async def test_load_envs_rejects_bad_entrypoint():
     cfg = Config(environments=(
-        EnvSpec(name="a", image="shared", env_vars={"K": "1"}),
-        EnvSpec(name="b", image="shared", env_vars={"K": "2"}),
+        EnvSpec(name="bad", entrypoint="not_a_real_module:Env"),
     ))
-    with pytest.raises(ValueError, match="env_vars/mem_limit differ"):
+    with pytest.raises(ModuleNotFoundError):
         await _load_envs(cfg)
-
-
-@pytest.mark.asyncio
-async def test_load_envs_rejects_shared_image_with_different_mem_limit(monkeypatch):
-    monkeypatch.setattr("affinetes.load_env",
-        lambda image, mode, env_vars, mem_limit, pull, cleanup: SimpleNamespace(_backend=None))
-    cfg = Config(environments=(
-        EnvSpec(name="a", image="shared", mem_limit="4g"),
-        EnvSpec(name="b", image="shared", mem_limit="8g"),
-    ))
-    with pytest.raises(ValueError, match="env_vars/mem_limit differ"):
-        await _load_envs(cfg)
-
-
-@pytest.mark.asyncio
-async def test_load_envs_cleans_up_wrappers_on_partial_init_failure(monkeypatch):
-    """If af.load_env raises mid-loop, already-loaded wrappers must be cleaned
-    up — otherwise their Docker containers leak."""
-    cleaned: list[str] = []
-    def make_wrapper(image):
-        async def cleanup(): cleaned.append(image)
-        return SimpleNamespace(_backend=None, image=image, cleanup=cleanup)
-    call_count = [0]
-    def fake_load_env(image, mode, env_vars, mem_limit, pull, cleanup):
-        call_count[0] += 1
-        if call_count[0] == 3:
-            raise RuntimeError("docker daemon vanished")
-        return make_wrapper(image)
-    monkeypatch.setattr("affinetes.load_env", fake_load_env)
-    cfg = Config(environments=(
-        EnvSpec(name="a", image="img-a"),
-        EnvSpec(name="b", image="img-b"),
-        EnvSpec(name="c", image="img-c"),
-    ))
-    with pytest.raises(RuntimeError, match="docker daemon"):
-        await _load_envs(cfg)
-    assert sorted(cleaned) == ["img-a", "img-b"]
 
 
 @pytest.mark.asyncio
@@ -1095,7 +1022,7 @@ def _env(err=False):
         if err: raise RuntimeError("boom")
         return {"success": True}
     wrapper = SimpleNamespace(evaluate=AsyncMock(side_effect=evaluate))
-    return {"E": (wrapper, EnvSpec(name="E", image="img", params={"timeout": 5}))}
+    return {"E": (wrapper, EnvSpec(name="E", entrypoint="img", params={"timeout": 5}))}
 
 
 def _stop_after_pairs(stop, n, base):
@@ -1162,7 +1089,7 @@ async def test_dwell_batch_dispatches_in_parallel_with_unique_counters(tmp_path,
         inflight[0] -= 1
         return True, 0.01, 0
     envs = {n: (SimpleNamespace(evaluate=AsyncMock()),
-                EnvSpec(name=n, image="i", params={"timeout": 5}))
+                EnvSpec(name=n, entrypoint="i", params={"timeout": 5}))
             for n in ("A", "B")}
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
@@ -1203,7 +1130,7 @@ async def test_dwell_queue_keeps_slot_saturated_under_mixed_latency(tmp_path, mo
         inflight[0] -= 1; samples.append((_time.monotonic(), inflight[0]))
         return True, 0.0, 0
     envs = {n: (SimpleNamespace(evaluate=AsyncMock()),
-                EnvSpec(name=n, image="i", params={"timeout": 5}))
+                EnvSpec(name=n, entrypoint="i", params={"timeout": 5}))
             for n in ("A", "B")}
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
@@ -1247,8 +1174,8 @@ async def test_dwell_keeps_sampling_through_zero_variance(tmp_path, monkeypatch)
     # dwell would otherwise loop forever. Cap with stop after 10 pairs.
     monkeypatch.setattr("affine.loop.run_one", _stop_after_pairs(stop, 10, _all_pass))
     envs = {
-        "A": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="A", image="i", params={"timeout": 5})),
-        "B": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="B", image="i", params={"timeout": 5})),
+        "A": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="A", entrypoint="i", params={"timeout": 5})),
+        "B": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="B", entrypoint="i", params={"timeout": 5})),
     }
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
@@ -1291,8 +1218,8 @@ async def test_dwell_routes_around_fisher_env_when_fit_is_degenerate(tmp_path, m
         return True, 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", _stop_after_pairs(stop, 5, _ok))
     envs = {
-        "A": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="A", image="i", params={"timeout": 5})),
-        "B": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="B", image="i", params={"timeout": 5})),
+        "A": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="A", entrypoint="i", params={"timeout": 5})),
+        "B": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="B", entrypoint="i", params={"timeout": 5})),
     }
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
@@ -1395,7 +1322,7 @@ async def test_dwell_aborts_on_king_slot_dead_only(tmp_path, monkeypatch):
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
         return (None if slot.model == "mk" else False), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", split)
-    envs = {"E": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="E", image="i", params={"timeout": 5}))}
+    envs = {"E": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="E", entrypoint="i", params={"timeout": 5}))}
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
@@ -1417,7 +1344,7 @@ async def test_dwell_aborts_on_chal_slot_dead_only(tmp_path, monkeypatch):
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
         return (None if slot.model == "mc" else False), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", split)
-    envs = {"E": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="E", image="i", params={"timeout": 5}))}
+    envs = {"E": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="E", entrypoint="i", params={"timeout": 5}))}
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
@@ -1443,7 +1370,7 @@ async def test_dwell_persistent_chal_infra_failure_aborts_via_chal_slot_dead(tmp
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
         return (True if slot.model == "mk" else None), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", split)
-    envs = {n: (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name=n, image="i", params={"timeout": 5}))
+    envs = {n: (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name=n, entrypoint="i", params={"timeout": 5}))
             for n in ("A", "B", "C")}
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
@@ -1476,7 +1403,7 @@ async def test_dwell_broken_king_aborts_via_king_slot_dead(tmp_path, monkeypatch
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
         return (None if slot.model == "mk" else True), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", split)
-    envs = {n: (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name=n, image="i", params={"timeout": 5}))
+    envs = {n: (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name=n, entrypoint="i", params={"timeout": 5}))
             for n in ("A", "B", "C")}
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
@@ -1509,7 +1436,7 @@ async def test_dwell_both_sides_fail_appends_two_synthetic_zero_rows(tmp_path, m
     async def both_fail(wrapper, params, timeout, slot, seed, task_id=0):
         return None, 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", both_fail)
-    envs = {"E": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="E", image="i", params={"timeout": 5}))}
+    envs = {"E": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="E", entrypoint="i", params={"timeout": 5}))}
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
@@ -1541,7 +1468,7 @@ async def test_cross_duel_real_row_evidence_drives_dethrone(tmp_path, monkeypatc
     async def king_loses(wrapper, params, timeout, slot, seed, task_id=0):
         return (slot.model != "mk"), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", king_loses)
-    envs = {n: (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name=n, image="i", params={"timeout": 5}))
+    envs = {n: (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name=n, entrypoint="i", params={"timeout": 5}))
             for n in ("A", "B", "C", "D")}
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
@@ -1588,7 +1515,7 @@ async def test_dwell_intermittent_one_side_does_not_abort(tmp_path, monkeypatch)
         counter["n"] += 1
         return (None if counter["n"] % 4 == 0 else False), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", alternating)
-    envs = {"A": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="A", image="i", params={"timeout": 5}))}
+    envs = {"A": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="A", entrypoint="i", params={"timeout": 5}))}
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
@@ -1628,7 +1555,7 @@ async def test_run_cold_starts_and_dethrones(tmp_path, monkeypatch):
     from affine.loop import run
 
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
-        "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
+        "E": (SimpleNamespace(), EnvSpec(name="E", entrypoint="img", params={"timeout": 5})),
     }))
 
 
@@ -1654,7 +1581,7 @@ async def test_run_cold_starts_and_dethrones(tmp_path, monkeypatch):
                   current_block=current_block, publish_winner=publish)
 
     cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
-                 environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
+                 environments=(EnvSpec(name="E", entrypoint="img", params={"timeout": 5}),),
                  k_init=0.5, k_final=0.5, k_halflife=1)   # easy to dethrone for the test
 
     await run(cfg, chain, slots=_FakeSlots())
@@ -1677,7 +1604,7 @@ async def test_dethrone_skipped_when_chal_deregisters_mid_dwell(tmp_path, monkey
     from affine.loop import run
 
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
-        "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
+        "E": (SimpleNamespace(), EnvSpec(name="E", entrypoint="img", params={"timeout": 5})),
     }))
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
@@ -1708,7 +1635,7 @@ async def test_dethrone_skipped_when_chal_deregisters_mid_dwell(tmp_path, monkey
     chain = Chain(hotkey="V", list_miners=list_miners,
                   current_block=current_block, publish_winner=publish)
     cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
-                 environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
+                 environments=(EnvSpec(name="E", entrypoint="img", params={"timeout": 5}),),
                  k_init=0.5, k_final=0.5, k_halflife=1)
     try:
         await asyncio.wait_for(run(cfg, chain, slots=_FakeSlots()), timeout=2.0)
@@ -1728,7 +1655,7 @@ async def test_dethrone_resilient_to_king_teardown_error(tmp_path, monkeypatch):
     from affine.loop import run
 
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
-        "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
+        "E": (SimpleNamespace(), EnvSpec(name="E", entrypoint="img", params={"timeout": 5})),
     }))
 
 
@@ -1752,7 +1679,7 @@ async def test_dethrone_resilient_to_king_teardown_error(tmp_path, monkeypatch):
     chain = Chain(hotkey="V", list_miners=list_miners,
                   current_block=current_block, publish_winner=publish)
     cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
-                 environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
+                 environments=(EnvSpec(name="E", entrypoint="img", params={"timeout": 5}),),
                  k_init=0.5, k_final=0.5, k_halflife=1)
 
     class _FlakyTeardown(_FakeSlots):
@@ -1786,7 +1713,7 @@ async def test_run_caches_king_across_duels_in_reign(tmp_path, monkeypatch):
     from affine.loop import run
 
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
-        "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
+        "E": (SimpleNamespace(), EnvSpec(name="E", entrypoint="img", params={"timeout": 5})),
     }))
 
 
@@ -1815,7 +1742,7 @@ async def test_run_caches_king_across_duels_in_reign(tmp_path, monkeypatch):
     chain = Chain(hotkey="V", list_miners=list_miners,
                   current_block=current_block, publish_winner=publish)
     cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
-                 environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
+                 environments=(EnvSpec(name="E", entrypoint="img", params={"timeout": 5}),),
                  k_init=0.5, k_final=0.5, k_halflife=1)   # chal failing → z<-k Hold
 
     slots = _FakeSlots()
@@ -1838,7 +1765,7 @@ async def test_chal_transient_advances_queue_then_exhaustion_sleeps(tmp_path, mo
     import httpx
 
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
-        "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
+        "E": (SimpleNamespace(), EnvSpec(name="E", entrypoint="img", params={"timeout": 5})),
     }))
 
     async def _run_one(*a, **kw): return True, 0.01, 0
@@ -1859,7 +1786,7 @@ async def test_chal_transient_advances_queue_then_exhaustion_sleeps(tmp_path, mo
     chain = Chain(hotkey="V", list_miners=list_miners,
                   current_block=current_block, publish_winner=publish)
     cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
-                 environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
+                 environments=(EnvSpec(name="E", entrypoint="img", params={"timeout": 5}),),
                  k_init=10.0, k_final=10.0, k_halflife=1)
 
     class _ChalTransientSlots(_FakeSlots):
@@ -1882,7 +1809,7 @@ async def test_publish_failure_retries_next_iteration(tmp_path, monkeypatch):
     from affine.loop import run
 
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
-        "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
+        "E": (SimpleNamespace(), EnvSpec(name="E", entrypoint="img", params={"timeout": 5})),
     }))
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
@@ -1909,7 +1836,7 @@ async def test_publish_failure_retries_next_iteration(tmp_path, monkeypatch):
     chain = Chain(hotkey="V", list_miners=list_miners,
                   current_block=current_block, publish_winner=publish)
     cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
-                 environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
+                 environments=(EnvSpec(name="E", entrypoint="img", params={"timeout": 5}),),
                  k_init=0.5, k_final=0.5, k_halflife=1)   # chal fails every pick → z<-k Hold
 
     await run(cfg, chain, slots=_FakeSlots())
@@ -1929,7 +1856,7 @@ async def test_dry_run_does_not_persist_last_published_uid(tmp_path, monkeypatch
 
     monkeypatch.setenv("AFFINE_DRY_RUN", "1")
     monkeypatch.setattr("affine.loop._load_envs", AsyncMock(return_value={
-        "E": (SimpleNamespace(), EnvSpec(name="E", image="img", params={"timeout": 5})),
+        "E": (SimpleNamespace(), EnvSpec(name="E", entrypoint="img", params={"timeout": 5})),
     }))
 
     async def _run_one(wrapper, params, timeout, slot, seed, task_id=0):
@@ -1953,7 +1880,7 @@ async def test_dry_run_does_not_persist_last_published_uid(tmp_path, monkeypatch
     chain = Chain(hotkey="V", list_miners=list_miners,
                   current_block=current_block, publish_winner=publish)
     cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
-                 environments=(EnvSpec(name="E", image="img", params={"timeout": 5}),),
+                 environments=(EnvSpec(name="E", entrypoint="img", params={"timeout": 5}),),
                  k_init=0.5, k_final=0.5, k_halflife=1)
 
     await run(cfg, chain, slots=_FakeSlots())
@@ -1985,7 +1912,7 @@ async def test_dwell_interrupts_inflight_sample_on_stop(tmp_path):
         await asyncio.sleep(60)
         return {"success": True}
     wrapper = SimpleNamespace(evaluate=AsyncMock(side_effect=slow_evaluate))
-    envs = {"E": (wrapper, EnvSpec(name="E", image="img", params={"timeout": 600}))}
+    envs = {"E": (wrapper, EnvSpec(name="E", entrypoint="img", params={"timeout": 600}))}
 
     async def trigger():
         await sample_started.wait(); stop.set()
@@ -2005,9 +1932,9 @@ async def test_dwell_interrupts_inflight_sample_on_stop(tmp_path):
 
 
 def test_seed_fits_signed_int32():
-    """game's openspiel env feeds seed into np.random.RandomState which only
-    accepts [0, 2^32-1], and internally computes seed+1..seed+100, so we mask
-    to 2^31-1 (universal int32 ceiling) for portability across all envs."""
+    """np.random.RandomState only accepts [0, 2^32-1] and internally adds small
+    offsets, so we mask to 2^31-1 (signed int32 ceiling) for portability across
+    any env stack that touches numpy."""
     maxv = (1 << 31) - 1
     for uid in range(16):
         for c in range(16):

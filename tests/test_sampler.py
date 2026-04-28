@@ -59,11 +59,11 @@ async def test_run_one_timeout_is_false():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [
-    "llm_failure",      # affine env: vLLM EngineCore crashed → validator-side
-    "connect_error",    # distill env: couldn't reach student → validator-side
-    "empty_response",   # distill env: 200 OK with zero choices → validator-side parsing
-    "no_logprobs",      # distill env: missing logprobs → validator-side parsing
-    "unexpected",       # distill env: any other HTTPError/exception → validator-side
+    "llm_failure",      # vLLM EngineCore crashed → validator-side
+    "connect_error",    # couldn't reach student → validator-side
+    "empty_response",   # 200 OK with zero choices → validator-side parsing
+    "no_logprobs",      # missing logprobs → validator-side parsing
+    "unexpected",       # any other HTTPError/exception → validator-side
 ])
 async def test_run_one_validator_side_error_type_is_infra(error_type):
     """Non-timeout error_types are validator-side (vLLM is our config, env
@@ -119,6 +119,36 @@ async def test_run_one_passes_seed_and_params():
     assert kwargs["temperature"] == 0.2
     assert kwargs["model"] == "m"
     assert kwargs["base_url"] == "http://s/v1"
+
+
+@pytest.mark.asyncio
+async def test_run_one_uses_gym_reset_step(monkeypatch):
+    from affine import sampler
+    calls = {}
+
+    class Env:
+        def reset(self, *, seed=None, options=None):
+            calls["reset"] = (seed, options)
+            return "prompt", {"challenge_id": str(seed)}
+
+        def step(self, action):
+            calls["action"] = action
+            return None, 1.0, True, False, {"score": 1.0}
+
+    async def fake_chat(slot, obs, params, seed):
+        calls["chat"] = (slot.model, obs, params, seed)
+        return {
+            "choices": [{"message": {"content": "<ANSWER>ok</ANSWER>"}}],
+            "usage": {"completion_tokens": 5},
+        }
+
+    monkeypatch.setattr(sampler, "_chat", fake_chat)
+    passed, _, tok = await run_one(Env(), {"temperature": 0.2}, 10, _slot(), seed=42, task_id=7)
+    assert passed is True
+    assert tok == 5
+    assert calls["reset"] == (7, {"temperature": 0.2})
+    assert calls["chat"] == ("m", "prompt", {"temperature": 0.2}, 42)
+    assert calls["action"] == "<ANSWER>ok</ANSWER>"
 
 
 @pytest.mark.asyncio

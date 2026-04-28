@@ -40,11 +40,11 @@ from typing import Awaitable, Callable
 
 import httpx
 import numpy as np
-import affinetes as af
 
 from .audit import audit
 from .chain import Miner, Subtensor, _tiebreak, _truthy_env, get_miners, set_weights
 from .config import BASELINE_MODELS, Config
+from .envs import EnvFactory
 from .evidence import EvidenceStore, Row, atomic_append
 from .irt import Fit, Priors, compute_k, fisher_env, fit_2pl
 from .sampler import run_one
@@ -206,40 +206,22 @@ def _fit(rows: list[Row], miners: list[Miner], env_names: list[str],
 
 
 async def _load_envs(cfg: Config) -> dict[str, tuple]:
-    # Dedupe by image: load each unique image once, share across envs that use it.
-    # params are call-time (passed in /call body) so each env carries its own;
-    # env_vars and mem_limit are container-init so they MUST match across shared envs.
-    loaded: dict[str, tuple] = {}
+    loaded: dict[str, EnvFactory] = {}
     out = {}
     try:
         for spec in cfg.environments:
-            if spec.image in loaded:
-                wrapper, shared_spec = loaded[spec.image]
-                if spec.env_vars != shared_spec.env_vars or spec.mem_limit != shared_spec.mem_limit:
-                    raise ValueError(
-                        f"env '{spec.name}' shares image {spec.image} with '{shared_spec.name}' "
-                        f"but env_vars/mem_limit differ — split into distinct images or align config"
-                    )
+            if spec.entrypoint in loaded:
+                wrapper = loaded[spec.entrypoint]
                 out[spec.name] = (wrapper, spec)
-                log.info(f"env: {spec.name} ({spec.image}) [shared]")
+                log.info(f"env: {spec.name} ({spec.entrypoint}) [shared]")
                 continue
-            env_vars = dict(spec.env_vars)
-            for k in ("CHUTES_API_KEY", "HF_TOKEN"):
-                if (v := os.environ.get(k)):
-                    env_vars.setdefault(k, v)
-            env_vars.setdefault("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", "vllm"))
-            # pull=False: rely on cached images (significant startup speedup)
-            wrapper = af.load_env(image=spec.image, mode="docker", env_vars=env_vars or None,
-                                  mem_limit=spec.mem_limit, pull=False, cleanup=True)
-            backend = getattr(wrapper, "_backend", None)
-            if backend is not None and hasattr(backend, "_check_container_restart"):
-                backend._check_container_restart = lambda: False
-            loaded[spec.image] = (wrapper, spec)
+            wrapper = EnvFactory(spec.entrypoint)
+            loaded[spec.entrypoint] = wrapper
             out[spec.name] = (wrapper, spec)
-            log.info(f"env: {spec.name} ({spec.image})")
+            log.info(f"env: {spec.name} ({spec.entrypoint})")
         return out
     except BaseException:
-        for wrapper, _ in loaded.values():
+        for wrapper in loaded.values():
             try: await asyncio.wait_for(wrapper.cleanup(), timeout=30.0)
             except Exception as e:
                 log.warning(f"env cleanup-on-fail: {e}")
@@ -434,9 +416,9 @@ async def _provision_pair(slots, king: Miner, chal: Miner, states: MinerStates,
 
 
 def _seed(uid: int, rev: str, env: str, c: int, salt: str = "") -> int:
-    """31 bits (signed int32 max). vLLM accepts ≤ 2^63-1, but game's openspiel env
-    feeds the seed into np.random.RandomState which only accepts [0, 2^32-1] and
-    internally computes seed+1..seed+100, so we mask to 2^31-1 for portability.
+    """Mask to signed int32 max. vLLM accepts ≤ 2^63-1, but np.random.RandomState
+    only accepts [0, 2^32-1] and internally adds small offsets, so 2^31-1 is the
+    portable ceiling across env stacks that touch numpy.
     `salt` is mixed in to give per-validator task sequences; it's the validator's
     public hotkey today (placeholder for the commit-reveal seed described in
     notes/design.md). Replay verification requires the salt be recoverable by

@@ -9,15 +9,11 @@ from pathlib import Path
 @dataclass(frozen=True)
 class EnvSpec:
     name: str
-    image: str
+    entrypoint: str
     params: dict = field(default_factory=dict)
-    env_vars: dict = field(default_factory=dict)
-    mem_limit: str = "8g"
-    # Inclusive task-id range. Distill's R2 bucket is 1-indexed and ~2000 entries;
-    # affine-env's HF dataset has ~23k rows; game encodes config in task_id (no upper
-    # bound). The validator draws task_ids uniformly per duel iteration so both miners
-    # see the same task. Default chosen to be safe for all known envs.
-    task_range: tuple[int, int] = (1, 2000)
+    # Inclusive challenge-id range. The validator draws task_ids uniformly per
+    # duel iteration so both miners see the same task.
+    task_range: tuple[int, int] = (0, (1 << 31) - 1)
 
 
 @dataclass
@@ -90,19 +86,13 @@ _PROFILES: dict[str, dict] = {
     "full": {
         "k_init": 3.0,
         "env_overrides": {
-            "affine:ded": {"params": {"timeout": 300}},
-            "affine:abd": {"params": {"timeout": 300}},
-            "game": {"params": {"timeout": 1800}},
-            "distill": {"params": {"timeout": 300}},
+            "python": {"params": {"timeout": 300}},
         },
     },
     "smoke": {
         "k_init": 1.0,
         "env_overrides": {
-            "affine:ded": {"params": {"timeout": 90}},
-            "affine:abd": {"params": {"timeout": 90}},
-            "game": {"params": {"timeout": 420}},
-            "distill": {"params": {"timeout": 90}},
+            "python": {"params": {"timeout": 90, "lines": 16}},
         },
     },
 }
@@ -157,7 +147,7 @@ def _apply_env_overrides(current: tuple[EnvSpec, ...], raw: dict) -> tuple[EnvSp
             if name in seen:
                 raise ValueError(f"duplicate environment name in 'environments': {name!r}")
             seen.add(name)
-            base = by_name.get(name, EnvSpec(name=name, image=str(item.get("image", ""))))
+            base = by_name.get(name, EnvSpec(name=name, entrypoint=str(item.get("entrypoint", ""))))
             rebuilt.append(_merge_env(base, item))
         return tuple(rebuilt)
 
@@ -196,6 +186,8 @@ def _validate(cfg: Config) -> None:
         if spec.name in seen:
             raise ValueError(f"duplicate environment name: {spec.name!r}")
         seen.add(spec.name)
+        if not spec.entrypoint:
+            raise ValueError(f"environment '{spec.name}' has empty entrypoint")
         # Per-env timeout drives asyncio.wait deadlines. NaN/Infinity make
         # asyncio.wait return immediately with empty done set → sample looks
         # timed out → False (miner-loss) for every sample. Negative is
@@ -208,18 +200,16 @@ def _validate(cfg: Config) -> None:
 
 
 def _merge_env(base: EnvSpec, override: dict) -> EnvSpec:
-    image = str(override.get("image", base.image))
-    if not image:
-        raise ValueError(f"environment '{base.name}' has empty image")
+    entrypoint = str(override.get("entrypoint", base.entrypoint))
+    if not entrypoint:
+        raise ValueError(f"environment '{base.name}' has empty entrypoint")
     tr = override.get("task_range", base.task_range)
     if not (isinstance(tr, (list, tuple)) and len(tr) == 2 and int(tr[0]) <= int(tr[1])):
         raise ValueError(f"environment '{base.name}' has invalid task_range: {tr!r}")
     return replace(base,
         name=str(override.get("name", base.name)),
-        image=image,
+        entrypoint=entrypoint,
         params={**base.params, **override.get("params", {})},
-        env_vars={**base.env_vars, **override.get("env_vars", {})},
-        mem_limit=str(override.get("mem_limit", base.mem_limit)),
         task_range=(int(tr[0]), int(tr[1])),
     )
 
@@ -231,32 +221,10 @@ BASELINE_MODELS: tuple[str, ...] = ("Qwen/Qwen3-32B", "openai/gpt-oss-120b")
 
 
 ENV_REGISTRY: dict[str, EnvSpec] = {
-    # Ranges verified by scripts/probe_envs.py against the live container images:
-    #   ded/abd: HF dataset AffineFoundation/rl-python has 23303 rows, 0-indexed.
-    #   distill: R2 bucket has rollouts task_00000000001..task_00000000002399 only;
-    #            task_id=0 is 404 (file uses 1-indexed naming).
-    #   game:    task_id encodes game_idx*1e8 + config_id; game_idx=0 (goofspiel)
-    #            with 1e8 configs is plenty of variety and keeps the IRT "game"
-    #            env homogeneous (mixing 22 games under one β_game inflates noise).
-    "ded": EnvSpec(
-        name="affine:ded", image="affinefoundation/affine-env:v4",
-        params={"task_type": "ded", "temperature": 0.0, "timeout": 600},
-        task_range=(0, 23302),
-    ),
-    "abd": EnvSpec(
-        name="affine:abd", image="affinefoundation/affine-env:v4",
-        params={"task_type": "abd", "temperature": 0.0, "timeout": 600},
-        task_range=(0, 23302),
-    ),
-    "game": EnvSpec(
-        name="game", image="affinefoundation/game:openspiel",
-        params={"temperature": 0.0, "timeout": 7200},
-        task_range=(0, 99_999_999),
-    ),
-    "distill": EnvSpec(
-        name="distill", image="affinefoundation/distill:latest",
-        params={"temperature": 0.0, "timeout": 600}, mem_limit="2g",
-        task_range=(1, 2399),
+    "python": EnvSpec(
+        name="python",
+        entrypoint="affine.envs.python_interpreter:PythonInterpreterEnv",
+        params={"lines": 64, "temperature": 0.0, "max_tokens": 4096, "timeout": 600},
     ),
 }
 

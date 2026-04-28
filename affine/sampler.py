@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
+import os
 import time
+
+import httpx
 
 log = logging.getLogger(__name__)
 
 CLEANUP_TIMEOUT_S = 30.0
+GENERATION_KEYS = {
+    "frequency_penalty", "logit_bias", "max_tokens", "min_p", "presence_penalty",
+    "repetition_penalty", "stop", "temperature", "top_k", "top_p",
+}
 
 
 async def _drain(task: asyncio.Task, slot) -> None:
@@ -57,6 +65,89 @@ def _tokens(r) -> int:
     return 0
 
 
+async def _maybe_await(x):
+    return await x if inspect.isawaitable(x) else x
+
+
+def _messages(obs) -> list[dict]:
+    if isinstance(obs, str):
+        return [{"role": "user", "content": obs}]
+    if isinstance(obs, list) and all(isinstance(m, dict) for m in obs):
+        return obs
+    if isinstance(obs, dict):
+        if isinstance(obs.get("messages"), list):
+            return obs["messages"]
+        if isinstance(obs.get("prompt"), str):
+            return [{"role": "user", "content": obs["prompt"]}]
+    raise TypeError(f"unsupported env observation: {type(obs).__name__}")
+
+
+def _content(r: dict) -> str:
+    choices = r.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("OpenAI response has no choices")
+    ch = choices[0]
+    if not isinstance(ch, dict):
+        raise ValueError("OpenAI choice is not an object")
+    msg = ch.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+        return msg["content"]
+    if isinstance(ch.get("text"), str):
+        return ch["text"]
+    raise ValueError("OpenAI choice has no text content")
+
+
+async def _chat(slot, obs, params: dict, seed: int) -> dict:
+    payload = {
+        "model": slot.model,
+        "messages": _messages(obs),
+        "temperature": 0.0,
+        "seed": seed,
+    }
+    payload.update({k: v for k, v in params.items() if k in GENERATION_KEYS})
+    headers = {}
+    api_key = params.get("api_key") or os.getenv("OPENAI_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    async with httpx.AsyncClient(timeout=None) as client:
+        r = await client.post(f"{slot.base_url.rstrip('/')}/chat/completions",
+                              json=payload, headers=headers)
+    if r.status_code != 200:
+        raise RuntimeError(f"chat/completions returned {r.status_code}: {r.text[:400]}")
+    data = r.json()
+    if not isinstance(data, dict):
+        raise TypeError(f"chat/completions returned {type(data).__name__}")
+    return data
+
+
+async def _legacy_eval(env_wrapper, params: dict, slot, seed: int, task_id: int):
+    return await env_wrapper.evaluate(
+        model=slot.model, base_url=slot.base_url,
+        seed=seed, task_id=task_id, **params,
+    )
+
+
+async def _gym_eval(env_wrapper, params: dict, slot, seed: int, task_id: int):
+    env = env_wrapper.make() if hasattr(env_wrapper, "make") else env_wrapper
+    try:
+        obs, reset_info = await _maybe_await(env.reset(seed=task_id, options=params))
+        raw = await _chat(slot, obs, params, seed)
+        answer = _content(raw)
+        _obs, reward, terminated, truncated, info = await _maybe_await(env.step(answer))
+        if not (terminated or truncated):
+            raise RuntimeError("env.step did not terminate or truncate the episode")
+        return {
+            "score": float(reward),
+            "success": float(reward) > 0.0,
+            "usage": raw.get("usage"),
+            "extra": {"reset": reset_info, "step": info},
+        }
+    finally:
+        close = getattr(env, "close", None)
+        if close is not None:
+            await _maybe_await(close())
+
+
 async def run_one(
     env_wrapper,
     params: dict,
@@ -90,10 +181,9 @@ async def run_one(
     as miner losses.
     """
     async def _call():
-        return await env_wrapper.evaluate(
-            model=slot.model, base_url=slot.base_url,
-            seed=seed, task_id=task_id, **params,
-        )
+        if hasattr(env_wrapper, "evaluate"):
+            return await _legacy_eval(env_wrapper, params, slot, seed, task_id)
+        return await _gym_eval(env_wrapper, params, slot, seed, task_id)
     t0 = time.monotonic()
     task = asyncio.create_task(_call())
     try:
@@ -114,7 +204,7 @@ async def run_one(
         log.warning(f"infra failure ({slot.model}) in {dt:.2f}s — non-dict response: {str(r)[:200]}")
         return None, dt, 0
     if r.get("status") == "failed":
-        log.warning(f"infra failure ({slot.model}) in {dt:.2f}s — affinetes wrapper status=failed: {str(r.get('error', ''))[:200]}")
+        log.warning(f"infra failure ({slot.model}) in {dt:.2f}s: wrapper status=failed: {str(r.get('error', ''))[:200]}")
         return None, dt, 0
     if (err := r.get("error_type")) is not None:
         if err == "timeout":

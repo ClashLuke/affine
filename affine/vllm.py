@@ -133,6 +133,41 @@ async def _extract_url(uid: str) -> str | None:
     return None
 
 
+async def _warm_hit(base_url: str, model: str, timeout: float = 120.0) -> None:
+    """Fire a single 1-token completion before flipping the slot into rotation.
+
+    `/v1/models` returning 200 means vLLM's busy loop is up — it does NOT mean
+    the engine has done any inference. FlashInfer workspace (~394 MiB,
+    vllm/v1/attention/backends/flashinfer.py:745) and per-shape kernel JIT both
+    happen lazily on the first request. A 256-wide cold burst against an
+    un-warmed pod has been seen to OOM-kill the engine on the first scheduler
+    step (PR #30515 documents the profiling gap; PR #40383 documents the
+    workspace overflow). One serialized warm hit forces those allocations on
+    a non-load-bearing call.
+
+    Treated as miner-fault on failure: a pod that can't serve a 1-token
+    completion can't serve dwell traffic — surface as SlotProvisionFailed so
+    the (model, revision) gets skiplisted instead of bouncing the validator.
+    """
+    t0 = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(
+                f"{base_url}/chat/completions",
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1,
+                    "temperature": 0.0,
+                },
+            )
+    except Exception as e:
+        raise SlotProvisionFailed(f"warm hit failed for {base_url}: {type(e).__name__}: {e}") from e
+    if r.status_code != 200:
+        raise SlotProvisionFailed(f"warm hit returned {r.status_code} for {base_url}: {r.text[:200]}")
+    log.info(f"warm hit ok in {time.monotonic() - t0:.1f}s: {base_url}")
+
+
 async def _wait_for_ready(uid: str, timeout: int, interval: float = 5.0) -> str:
     """Poll state+events+/models until the slot is ready. One unified loop so
     crashloops are detected before a URL is exposed and after /models starts
@@ -208,17 +243,26 @@ class TargonSlots:
             "--port", "8000",
             "--enable-prefix-caching",
             "--enable-chunked-prefill",
-            "--gpu-memory-utilization", "0.95",
-            # We rent the GPU and run vLLM ourselves. Defaults are conservative
-            # (max-num-seqs=256, max-num-batched-tokens=8192) and become the
-            # validator-side concurrency ceiling: queue dispatches B=512 streams
-            # but vLLM only batches 256 at a time, the rest sit at the gateway,
-            # per-stream tok/s collapses. Bump both well past the dwell_batch
-            # we actually drive.
+            # 0.85 (was 0.90/0.95): leaves ~7 GiB on H200 for lazy first-burst
+            # allocations the startup profiler underestimates — FlashInfer
+            # workspace (~394 MiB, allocated on first call), per-shape kernel
+            # JIT, cudagraph slop. PR #30515 documents the profiling gap; the
+            # 150 MiB built-in cushion is not enough under 256-wide cold bursts.
+            "--gpu-memory-utilization", "0.85",
+            # Steady-state concurrency ceiling for dwell_batch=512 streams.
+            # Defaults (256/8192) cap us at half the dispatch. batched-tokens
+            # is a per-step compute budget, not a memory knob — scheduler
+            # preempts on KV pressure (vllm scheduler.py:504), it doesn't OOM.
             "--max-num-seqs", "1024",
             "--max-num-batched-tokens", "65536",
         ]
-        env = {"HF_HUB_ENABLE_HF_TRANSFER": "1"}
+        env = {
+            "HF_HUB_ENABLE_HF_TRANSFER": "1",
+            # PR #30515: fold cudagraph cost into startup memory profiling so the
+            # KV pool is sized smaller and real headroom remains for FlashInfer
+            # workspace + JIT arenas + transient prefill activations.
+            "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "1",
+        }
         for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
             v = os.environ.get(k)
             if v:
@@ -253,6 +297,7 @@ class TargonSlots:
             await http._async_post(f"{_WORKLOADS}/{uid}/deploy")
             log.info(f"targon rental uid={uid}; waiting for ready (timeout {timeout}s)")
             base_url = await _wait_for_ready(uid, timeout=timeout)
+            await _warm_hit(base_url, model)
         except BaseException:
             # Shield: if the outer task is being cancelled (SIGTERM during a
             # parallel provision, _cancellable timeout), still finish deletion

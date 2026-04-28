@@ -21,7 +21,7 @@ def test_config_defaults():
     assert cfg.sigma_beta == 1.0
     assert cfg.sigma_alpha == 0.5
     assert cfg.evidence_path.endswith("evidence.jsonl")
-    assert {spec.name for spec in cfg.environments} >= {"affine:ded", "affine:abd", "game", "distill"}
+    assert [spec.name for spec in cfg.environments] == ["python"]
 
 
 def test_config_env_overrides(monkeypatch):
@@ -46,17 +46,16 @@ def test_config_json_override(monkeypatch, tmp_path):
         "dwell_batch": 12,
         "k_init": 2.0,
         "env_overrides": {
-            "affine:ded": {"params": {"timeout": 45}},
-            "distill": {"mem_limit": "3g"},
+            "python": {"params": {"timeout": 45, "lines": 8}},
         },
     }))
     monkeypatch.setenv("AFFINE_CONFIG_SPEC", str(spec_path))
     cfg = Config.from_env()
     assert cfg.dwell_batch == 12
     assert cfg.k_init == 2.0
-    assert _env_timeout(cfg, "affine:ded") == 45
-    distill = [spec for spec in cfg.environments if spec.name == "distill"][0]
-    assert distill.mem_limit == "3g"
+    assert _env_timeout(cfg, "python") == 45
+    py = [spec for spec in cfg.environments if spec.name == "python"][0]
+    assert py.params["lines"] == 8
 
 
 def test_config_env_overrides_as_list_rejected(monkeypatch, tmp_path):
@@ -66,7 +65,7 @@ def test_config_env_overrides_as_list_rejected(monkeypatch, tmp_path):
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps({
         "env_overrides": [
-            {"name": "affine:ded", "params": {"timeout": 45}},
+            {"name": "python", "params": {"timeout": 45}},
         ],
     }))
     monkeypatch.setenv("AFFINE_CONFIG_SPEC", str(spec_path))
@@ -84,16 +83,15 @@ def test_config_smoke_profile(monkeypatch):
     monkeypatch.setenv("AFFINE_CONFIG_SPEC", "smoke")
     cfg = Config.from_env()
     assert cfg.k_init == 1.0
-    assert _env_timeout(cfg, "affine:ded") == 90
-    assert _env_timeout(cfg, "game") == 420
+    assert _env_timeout(cfg, "python") == 90
+    assert cfg.environments[0].params["lines"] == 16
 
 
 def test_config_full_profile(monkeypatch):
     monkeypatch.setenv("AFFINE_CONFIG_SPEC", "full")
     cfg = Config.from_env()
     assert cfg.k_init == 3.0
-    assert _env_timeout(cfg, "affine:abd") == 300
-    assert _env_timeout(cfg, "game") == 1800
+    assert _env_timeout(cfg, "python") == 300
 
 
 def test_config_default_profile(monkeypatch):
@@ -101,7 +99,7 @@ def test_config_default_profile(monkeypatch):
     cfg = Config.from_env()
     # default profile is a no-op overlay on Config.from_env() defaults
     assert cfg.k_init == 3.0
-    assert _env_timeout(cfg, "affine:ded") == 600
+    assert _env_timeout(cfg, "python") == 600
 
 
 @pytest.mark.parametrize("var,val,msg", [
@@ -136,11 +134,11 @@ def test_config_rejects_nonfinite_or_nonpositive_env_timeout(monkeypatch, tmp_pa
     # because parse_constant defaults to permissive. We force the issue by
     # rendering them as JSON literals here; the loader must reject the file.
     if bad != bad:  # NaN
-        spec.write_text('{"env_overrides":{"affine:ded":{"params":{"timeout":NaN}}}}')
+        spec.write_text('{"env_overrides":{"python":{"params":{"timeout":NaN}}}}')
     elif bad in (float("inf"), float("-inf")):
-        spec.write_text('{"env_overrides":{"affine:ded":{"params":{"timeout":Infinity}}}}')
+        spec.write_text('{"env_overrides":{"python":{"params":{"timeout":Infinity}}}}')
     else:
-        spec.write_text(json.dumps({"env_overrides":{"affine:ded":{"params":{"timeout": bad}}}}))
+        spec.write_text(json.dumps({"env_overrides":{"python":{"params":{"timeout": bad}}}}))
     monkeypatch.setenv("AFFINE_CONFIG_SPEC", str(spec))
     with pytest.raises(ValueError):
         Config.from_env()

@@ -61,7 +61,7 @@ def sample(
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         stream=sys.stderr,
     )
-    env_names = env or ["ded"]
+    env_names = env or ["python"]
     for n in env_names:
         if n not in ENV_REGISTRY:
             raise typer.BadParameter(f"unknown environment: {n}")
@@ -74,7 +74,7 @@ def sample(
     miners = [m for m, _ in pairs]
     url_map = {(m.model, m.revision): url for m, url in pairs}
 
-    cfg = Config(environments=environments, evidence_path=evidence_path, dwell=dwell)
+    cfg = Config(environments=environments, evidence_path=evidence_path, dwell_batch=dwell)
     asyncio.run(run(cfg, static_chain(miners), FixedSlots(url_map)))
 
 

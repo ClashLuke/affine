@@ -20,12 +20,6 @@ DETHRONE_TIMEOUT="${DETHRONE_TIMEOUT:-900}"
 SKIP_TESTS="${SKIP_TESTS:-}"
 SKIP_PULL="${SKIP_PULL:-}"
 
-ENV_IMAGES=(
-    "affinefoundation/affine-env:v4"
-    "affinefoundation/game:openspiel"
-    "affinefoundation/distill:latest"
-)
-
 log() { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31mFATAL: %s\033[0m\n' "$*" >&2; exit 1; }
 
@@ -150,11 +144,6 @@ fi
 if [ -z "$SKIP_PULL" ]; then
     log "pulling subtensor image"
     docker pull "$SUBTENSOR_IMAGE"
-
-    log "pulling environment images"
-    for img in "${ENV_IMAGES[@]}"; do
-        docker pull "$img"
-    done
 fi
 
 # ------------------------------------------------------------------
