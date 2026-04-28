@@ -80,11 +80,6 @@ class NFATraceEnv(ExactAnswerEnv):
     option_keys = frozenset({"states", "length", "alphabet", "accept_count"})
     spec = _SPEC
 
-    def __init__(self, states: int = 10, length: int = 16, alphabet: str = "abc", accept_count: int = 3):
-        self._defaults = self.validate_options({
-            "states": states, "length": length, "alphabet": alphabet, "accept_count": accept_count,
-        })
-
     def _generate(self, params, rng):
         prompt, self._final, self._accept = _generate_nfa(
             params["states"], params["length"], params["alphabet"], params["accept_count"], rng
@@ -102,7 +97,7 @@ class NFATraceEnv(ExactAnswerEnv):
         return tuple(sorted(reachable)), obj["accept"]
 
     @classmethod
-    def validate_options(cls, options: dict) -> dict:
+    def _validate(cls, options: dict) -> dict:
         states = int_param(options, "states", default=10, lo=4, hi=64)
         length = int_param(options, "length", default=16, lo=1, hi=256)
         alphabet = str(options.get("alphabet", "abc"))

@@ -68,9 +68,6 @@ class ModularCRTEnv(ExactAnswerEnv):
     option_keys = frozenset({"moduli", "steps"})
     spec = _SPEC
 
-    def __init__(self, moduli: int = 3, steps: int = 5):
-        self._defaults = self.validate_options({"moduli": moduli, "steps": steps})
-
     def _generate(self, params, rng):
         mods = sorted(rng.sample(_primes, params["moduli"]))
         lines: list[str] = []
@@ -105,7 +102,7 @@ class ModularCRTEnv(ExactAnswerEnv):
         return out, obj["crt"]
 
     @classmethod
-    def validate_options(cls, options: dict) -> dict:
+    def _validate(cls, options: dict) -> dict:
         return {
             "moduli": int_param(options, "moduli", default=3, lo=1, hi=len(_primes)),
             "steps": int_param(options, "steps", default=5, lo=1, hi=64),

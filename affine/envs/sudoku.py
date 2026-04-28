@@ -138,11 +138,6 @@ class SudokuEnv(ExactAnswerEnv):
     option_keys = frozenset({"clues", "min_branch_points"})
     spec = _SPEC
 
-    def __init__(self, clues: int = 36, min_branch_points: int = 2):
-        self._defaults = self.validate_options({"clues": clues, "min_branch_points": min_branch_points})
-        self.clues = self._defaults["clues"]
-        self.min_branch_points = self._defaults["min_branch_points"]
-
     def _generate(self, params, rng):
         prompt, self._grid, self._branch_points = _generate_sudoku(
             params["clues"], params["min_branch_points"], rng
@@ -162,7 +157,7 @@ class SudokuEnv(ExactAnswerEnv):
         return grid
 
     @classmethod
-    def validate_options(cls, options: dict) -> dict:
+    def _validate(cls, options: dict) -> dict:
         clues = int_param(options, "clues", default=36, lo=24, hi=45)
         min_branch_points = int_param(options, "min_branch_points", default=2, lo=0, hi=4)
         max_clues = (45, 38, 36, 35, 34)[min_branch_points]

@@ -94,9 +94,6 @@ class GraphPathEnv(ExactAnswerEnv):
     option_keys = frozenset({"nodes", "edges", "min_path_len"})
     spec = _SPEC
 
-    def __init__(self, nodes: int = 16, edges: int = 46, min_path_len: int = 5):
-        self._defaults = self.validate_options({"nodes": nodes, "edges": edges, "min_path_len": min_path_len})
-
     def _generate(self, params, rng):
         prompt, self._distance, self._path, self._edge_count = _generate_graph(
             params["nodes"], params["edges"], params["min_path_len"], rng
@@ -114,7 +111,7 @@ class GraphPathEnv(ExactAnswerEnv):
         return obj["distance"], tuple(path)
 
     @classmethod
-    def validate_options(cls, options: dict) -> dict:
+    def _validate(cls, options: dict) -> dict:
         nodes = int_param(options, "nodes", default=16, lo=3, hi=64)
         min_path_len = int_param(options, "min_path_len", default=5, lo=2, hi=nodes)
         max_edges = nodes * (nodes - 1) // 2

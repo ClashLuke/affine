@@ -29,7 +29,7 @@ def test_known_correct_scores_one():
     env = SudokuEnv()
     env.reset(seed=4)
     assert _score(env, env._target) == 1.0
-    assert env._branch_points >= env.min_branch_points
+    assert env._branch_points >= env.options["min_branch_points"]
 
 
 def test_known_wrong_scores_zero():

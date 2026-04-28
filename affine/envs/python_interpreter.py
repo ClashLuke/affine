@@ -192,12 +192,6 @@ class PythonInterpreterEnv(ExactAnswerEnv):
     spec = _SPEC
     strip_answer = False
 
-    def __init__(self, lines: int = 64, ops=_all_ops, max_digits: int = 5):
-        self._defaults = self.validate_options({"lines": lines, "ops": ops, "max_digits": max_digits})
-        self.lines = self._defaults["lines"]
-        self.ops = list(self._defaults["ops"])
-        self.max_digits = self._defaults["max_digits"]
-
     def _generate(self, params, rng):
         code, self._target = codegen(params["lines"], list(params["ops"]), params["max_digits"], rng)
         return code, {}
@@ -206,7 +200,7 @@ class PythonInterpreterEnv(ExactAnswerEnv):
         return body
 
     @classmethod
-    def validate_options(cls, options: dict) -> dict:
+    def _validate(cls, options: dict) -> dict:
         lines = int_param(options, "lines", default=64, lo=1, hi=256)
         max_digits = int_param(options, "max_digits", default=5, lo=1, hi=8)
         ops = options.get("ops", _all_ops)

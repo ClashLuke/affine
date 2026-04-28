@@ -190,21 +190,9 @@ class TreeReconstructionEnv(Env):
     QUERY_RE = re.compile(r"^QUERY\s+(ANCESTOR|LCA|DEPTH|CHILDREN|PATH)\s+(-?\d+)(?:\s+(-?\d+))?$", re.I)
     SUBMIT_RE = re.compile(r"^SUBMIT(?:\s+(?P<body>.*))?$", re.I)
 
-    def __init__(
-        self,
-        n: int = 20,
-        method: str = "prufer",
-        max_queries: int = 64,
-        max_turns: int = 32,
-        allowed_queries: tuple[str, ...] = ("ANCESTOR", "LCA", "DEPTH"),
-    ):
-        self._defaults = self.validate_options({
-            "n": n, "method": method, "max_queries": max_queries,
-            "max_turns": max_turns, "allowed_queries": allowed_queries,
-        })
-
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
-        cfg = self.validate_options({**self._defaults, **(options or {})})
+        overrides = {k: v for k, v in (options or {}).items() if k in self.option_keys}
+        cfg = self.validate_options({**self.options, **overrides})
         self._n = cfg["n"]
         self._method = cfg["method"]
         self._max_queries = cfg["max_queries"]
@@ -327,7 +315,7 @@ Rules:
 A complete reconstruction must identify every parent exactly."""
 
     @classmethod
-    def validate_options(cls, options: dict) -> dict[str, Any]:
+    def _validate(cls, options: dict) -> dict[str, Any]:
         n = int_param(options, "n", default=20, lo=2, hi=10**9)
         max_queries = int_param(options, "max_queries", default=64, lo=0, hi=10**9)
         max_turns = int_param(options, "max_turns", default=32, lo=1, hi=10**9)

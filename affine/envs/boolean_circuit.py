@@ -142,14 +142,6 @@ class BooleanCircuitEnv(ExactAnswerEnv):
     option_keys = frozenset({"variables", "gates", "min_influence"})
     spec = _SPEC
 
-    def __init__(self, variables: int = 9, gates: int = 18, min_influence: int = 7):
-        self._defaults = self.validate_options({
-            "variables": variables, "gates": gates, "min_influence": min_influence,
-        })
-        self.variables = self._defaults["variables"]
-        self.gates = self._defaults["gates"]
-        self.min_influence = self._defaults["min_influence"]
-
     def _generate(self, params, rng):
         lines, self._count, self._influence, self._depth = _generate_circuit(
             params["variables"], params["gates"], params["min_influence"], rng
@@ -164,7 +156,7 @@ class BooleanCircuitEnv(ExactAnswerEnv):
         return obj["count"]
 
     @classmethod
-    def validate_options(cls, options: dict) -> dict:
+    def _validate(cls, options: dict) -> dict:
         variables = int_param(options, "variables", default=9, lo=3, hi=12)
         gates = int_param(options, "gates", default=18, lo=6, hi=64)
         min_influence = int_param(options, "min_influence", default=7, lo=1, hi=min(variables - 1, gates + 1))

@@ -228,18 +228,12 @@ def _validate_env_params(name: str, entrypoint: str, params: dict) -> None:
     if not isinstance(params, dict):
         raise TypeError(f"env '{name}': params must be an object, got {type(params).__name__}")
     from affine.envs._base import load_env_class
-    try:
-        cls = load_env_class(entrypoint)
-    except (ImportError, AttributeError, ValueError):
-        return
-    option_keys = getattr(cls, "option_keys", None)
-    if option_keys is None:
-        return
-    unknown = set(params) - set(option_keys) - _GENERATION_KEYS - {"timeout"}
+    cls = load_env_class(entrypoint)
+    unknown = set(params) - cls.option_keys - _GENERATION_KEYS - {"timeout"}
     if unknown:
         raise KeyError(f"env '{name}': unknown params: {sorted(unknown)}")
     _validate_generation_params(name, {k: v for k, v in params.items() if k in _GENERATION_KEYS})
-    task_params = {k: v for k, v in params.items() if k in option_keys}
+    task_params = {k: v for k, v in params.items() if k in cls.option_keys}
     try:
         cls.validate_options(task_params)
     except ValueError as exc:

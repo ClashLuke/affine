@@ -27,15 +27,15 @@ def test_known_correct_scores_one():
     env = BooleanCircuitEnv()
     env.reset(seed=4)
     assert _score(env, env._target) == 1.0
-    assert env._influence >= env.min_influence
+    assert env._influence >= env.options["min_influence"]
 
 
 def test_fallback_preserves_generation_constraints():
     env = BooleanCircuitEnv()
     env.reset(seed=387)
     assert _score(env, env._target) == 1.0
-    assert env._influence >= env.min_influence
-    assert (1 << env.variables) // 8 <= env._count <= (1 << env.variables) * 7 // 8
+    assert env._influence >= env.options["min_influence"]
+    assert (1 << env.options["variables"]) // 8 <= env._count <= (1 << env.options["variables"]) * 7 // 8
 
 
 def test_extreme_valid_config_uses_bounded_generation():
@@ -46,7 +46,7 @@ def test_extreme_valid_config_uses_bounded_generation():
         prompt, _info = env.reset(seed=seed)
         prompts.add(prompt)
         assert _score(env, env._target) == 1.0
-        assert env._influence >= env.min_influence
+        assert env._influence >= env.options["min_influence"]
     assert len(prompts) > 1
     assert time.monotonic() - t0 < 10.0
 
@@ -59,7 +59,7 @@ def test_fallback_varies_by_seed_for_tight_valid_config():
         prompt, _info = env.reset(seed=seed, options={"variables": 9, "gates": 6, "min_influence": 7})
         prompts.add(prompt)
         counts.add(env._count)
-        assert env._influence >= env.min_influence
+        assert env._influence >= env.options["min_influence"]
     assert len(prompts) > 1
     assert len(counts) > 1
 

@@ -84,6 +84,22 @@ class EnvFactory:
 
 class Env:
     __version__ = "0.0.0"
+    env_id: str = ""
+    option_keys: frozenset[str] = frozenset()
+
+    def __init__(self, **opts):
+        self.options = self.validate_options(opts)
+
+    @classmethod
+    def validate_options(cls, opts: dict) -> dict:
+        unknown = set(opts) - cls.option_keys
+        if unknown:
+            raise ValueError(f"unknown options: {sorted(unknown)}")
+        return cls._validate(opts)
+
+    @classmethod
+    def _validate(cls, opts: dict) -> dict:
+        raise NotImplementedError
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         raise NotImplementedError
@@ -96,23 +112,9 @@ class Env:
 
 
 class ExactAnswerEnv(Env):
-    """Single-turn exact-match env.
-
-    Subclass declares: env_id, option_keys, spec; overrides validate_options
-    (classmethod), _generate, and parse_answer. _generate sets self._target to the
-    canonical answer string (for round-trip checking and test convenience), sets
-    any task-specific attrs as side effects, and returns (challenge_text, info_extra).
-    info_extra is merged into reset_info."""
-
     __version__ = "0.0.1"
-    env_id: str = ""
-    option_keys: frozenset[str] = frozenset()
     spec: Spec
     strip_answer: bool = True
-
-    @classmethod
-    def validate_options(cls, opts: dict) -> dict:
-        raise NotImplementedError
 
     def _generate(self, params: dict, rng: random.Random) -> tuple[str, dict]:
         raise NotImplementedError
@@ -121,7 +123,8 @@ class ExactAnswerEnv(Env):
         raise NotImplementedError
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
-        params = self.validate_options({**self._defaults, **(options or {})})
+        overrides = {k: v for k, v in (options or {}).items() if k in self.option_keys}
+        params = self.validate_options({**self.options, **overrides})
         challenge, info_extra = self._generate(params, random.Random(0 if seed is None else seed))
         self._answer = self.parse_answer(self._target)
         if self._answer is None:
