@@ -59,25 +59,32 @@ async def test_run_one_timeout_is_false():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [
-    "llm_failure",      # affine env
-    "timeout",          # distill env: student LLM didn't respond in time
-    "connect_error",    # distill env: couldn't reach student
-    "empty_response",   # distill env: 200 OK with zero choices
-    "no_logprobs",      # distill env: structured response but missing logprobs
-    "unexpected",       # distill env: any other HTTPError/exception
+    "llm_failure",      # affine env: vLLM EngineCore crashed → validator-side
+    "connect_error",    # distill env: couldn't reach student → validator-side
+    "empty_response",   # distill env: 200 OK with zero choices → validator-side parsing
+    "no_logprobs",      # distill env: missing logprobs → validator-side parsing
+    "unexpected",       # distill env: any other HTTPError/exception → validator-side
 ])
-async def test_run_one_any_error_type_is_infra(error_type):
-    """success=False paired with any error_type is infra, not a miner loss.
-
-    Envs use inconsistent strings ('llm_failure' in affine, 'timeout'/'connect_error'/...
-    in distill). The sampler must not couple itself to one env's vocabulary — real
-    miner losses have no error_type set, so the presence of any error_type is the signal.
-    """
+async def test_run_one_validator_side_error_type_is_infra(error_type):
+    """Non-timeout error_types are validator-side (vLLM is our config, env
+    containers are our infra) and must return None for the dwell to drop."""
     env = SimpleNamespace(evaluate=AsyncMock(return_value={
         "success": False, "error_type": error_type, "error": f"simulated {error_type}",
     }))
     passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
     assert passed is None
+
+
+@pytest.mark.asyncio
+async def test_run_one_wrapper_timeout_is_miner_loss():
+    """error_type=timeout means the env wrapper timed out talking to the model.
+    Per notes/plan.md:46 'Challenger times out on a task → that task is a loss
+    for the challenger', this is decisive miner loss (False), not infra (None)."""
+    env = SimpleNamespace(evaluate=AsyncMock(return_value={
+        "success": False, "error_type": "timeout", "error": "wrapper timeout",
+    }))
+    passed, _, _ = await run_one(env, {}, 10, _slot(), seed=1)
+    assert passed is False
 
 
 @pytest.mark.asyncio

@@ -13,7 +13,7 @@ from affine.config import Config, EnvSpec
 from affine.evidence import EvidenceStore, Row
 from affine.irt import Priors
 from affine.loop import (
-    ENV_FAIL_QUARANTINE, Chain, LoopState, MinerStates, Reign, _apply_skip, _cancellable,
+    SLOT_DEAD, Chain, LoopState, MinerStates, Reign, _apply_skip, _cancellable,
     art_key, _drop_next_chal, dwell, _fit, _load_envs, _provision, _provision_pair,
     _respondents, _seed, _slot_from_task, _start_prefetch, _take_prefetched, static_chain,
 )
@@ -27,7 +27,7 @@ def _miner(uid, model=None, rev="r"):
 
 
 def _row(**kw):
-    d = dict(m=0, r="r", e="E", c=0, p=1, t=0, l=0.0)
+    d = dict(m=0, r="r", e="E", c=0, p=1, t=0, l=1.0)
     d.update(kw)
     return Row(**d)
 
@@ -1346,7 +1346,10 @@ async def test_dwell_z_below_neg_k_fires_for_lopsided_chal(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_dwell_aborts_on_infra_streak(tmp_path):
+async def test_dwell_aborts_when_both_slots_dead(tmp_path):
+    """Every wrapper call raises → run_one returns None for both sides every
+    pair → both synthetic p=0,l=0 rows appended; both consec counters cross
+    SLOT_DEAD → abort with KING_SLOT_DEAD (both-dead branch)."""
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
@@ -1358,63 +1361,64 @@ async def test_dwell_aborts_on_infra_streak(tmp_path):
         [king, chal], [], _env(err=True), ["E"], store, cfg, Priors(),
         np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
     )
-    rows, fit, status = out.rows, out.fit, out.status
-    assert rows == []
-    assert status is DuelStatus.ENVS_QUARANTINED
-    assert store.read() == []
-    assert fit.n_m == 2
+    assert out.status is DuelStatus.KING_SLOT_DEAD
+    assert all(r.p == 0 and r.l == 0.0 for r in out.rows)
+    assert out.rows == store.read()
+    assert out.fit.n_m == 2
 
 
 @pytest.mark.asyncio
-async def test_dwell_quarantines_broken_env_keeps_sampling_healthy(tmp_path, monkeypatch):
-    """One broken env, one healthy env: dwell must quarantine the broken one
-    after ENV_FAIL_QUARANTINE fails and keep collecting rows from the healthy
-    one. With healthy env returning all-pass, the fit stays degenerate and no
-    z-stop fires — bound runtime with an injected stop after enough pairs to
-    observe the quarantine + healthy-env pickup."""
-    broken_calls = healthy_calls = 0
-    async def evaluate_broken(*a, **kw):
-        nonlocal broken_calls; broken_calls += 1
-        raise RuntimeError("env_broken")
-    async def evaluate_healthy(*a, **kw):
-        nonlocal healthy_calls; healthy_calls += 1
-        return {"success": True}
-    envs = {
-        "bad":  (SimpleNamespace(evaluate=AsyncMock(side_effect=evaluate_broken)),
-                 EnvSpec(name="bad",  image="i1", params={"timeout": 5})),
-        "good": (SimpleNamespace(evaluate=AsyncMock(side_effect=evaluate_healthy)),
-                 EnvSpec(name="good", image="i2", params={"timeout": 5})),
-    }
+async def test_dwell_aborts_on_king_slot_dead_only(tmp_path, monkeypatch):
+    """King-side never delivers, chal-side delivers every pair → king consec
+    grows past SLOT_DEAD, chal consec stays at 0 → CHAL_SLOT_DEAD."""
+    async def split(wrapper, params, timeout, slot, seed, task_id=0):
+        return (None if slot.model == "mk" else False), 0.01, 0
+    monkeypatch.setattr("affine.loop.run_one", split)
+    envs = {"E": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="E", image="i", params={"timeout": 5}))}
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
     cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
-    stop = asyncio.Event()
-    from affine.loop import run_one as _real_run_one
-    monkeypatch.setattr("affine.loop.run_one", _stop_after_pairs(stop, 30, _real_run_one))
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
-        [king, chal], [], envs, ["bad", "good"], store, cfg, Priors(),
-        np.random.default_rng(0), stop, reign_start_block=0,
+        [king, chal], [], envs, list(envs), store, cfg, Priors(),
+        np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
     )
-    rows, _, _abort = out.rows, out.fit, out.status
-    by_env = {r.e: 0 for r in rows}
-    for r in rows: by_env[r.e] = by_env.get(r.e, 0) + 1
-    assert by_env.get("bad", 0) == 0                                  # broken env contributed zero rows
-    assert by_env.get("good", 0) > 0                                  # healthy env kept producing
-    # Bad env gets ≤ ENV_FAIL_QUARANTINE × 2 evaluate calls (2 for king+chal concurrent per pick)
-    assert broken_calls <= 2 * ENV_FAIL_QUARANTINE
+    assert out.status is DuelStatus.KING_SLOT_DEAD
 
 
 @pytest.mark.asyncio
-async def test_dwell_records_synthetic_loss_for_persistently_failing_chal(tmp_path, monkeypatch):
-    """Failure-to-deliver is recorded as a synthetic-loss row (p=0, l=0). With
-    chal returning None every pick and king delivering, the dwell appends both
-    a synthetic chal-loss and the real king row each iter — accumulated synthetic
-    losses pin chal's θ̂ low and Hold via z<<-k. There is no CHAL_BROKEN abort:
-    that was an arbitrary-K=3 heuristic conflating our infra with miner fault."""
+async def test_dwell_aborts_on_chal_slot_dead_only(tmp_path, monkeypatch):
+    """Chal-side never delivers, king-side always does → chal consec grows past
+    SLOT_DEAD while king consec stays at 0 → CHAL_SLOT_DEAD."""
+    async def split(wrapper, params, timeout, slot, seed, task_id=0):
+        return (None if slot.model == "mc" else False), 0.01, 0
+    monkeypatch.setattr("affine.loop.run_one", split)
+    envs = {"E": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="E", image="i", params={"timeout": 5}))}
+    store = EvidenceStore(tmp_path / "ev.jsonl")
+    chain = Chain(hotkey="V", list_miners=AsyncMock(),
+                  current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
+    king, chal = _miner(0, model="mk"), _miner(1, model="mc")
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
+    out = await dwell(
+        chain, king, SimpleNamespace(model="mk", base_url="uk"),
+        chal, SimpleNamespace(model="mc", base_url="uc"),
+        [king, chal], [], envs, list(envs), store, cfg, Priors(),
+        np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
+    )
+    assert out.status is DuelStatus.CHAL_SLOT_DEAD
+
+
+@pytest.mark.asyncio
+async def test_dwell_persistent_chal_infra_failure_holds_via_synthetic_loss(tmp_path, monkeypatch):
+    """Chal endpoint failing every pick (validator sees `run_one`-None) is
+    matched against a delivering king — asymmetry produces a synthetic chal-loss
+    row paired with a real king-pass row. The IRT contrast plunges below −k and
+    dwell exits with COMPLETED via z<−k. Closes the selective-failure gaming
+    attack: an attacker that 5xxs hard tasks no longer evades the loss."""
+    monkeypatch.setattr("affine.loop.compute_k", lambda *a, **kw: 1.0)
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
         return (True if slot.model == "mk" else None), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", split)
@@ -1431,26 +1435,26 @@ async def test_dwell_records_synthetic_loss_for_persistently_failing_chal(tmp_pa
         [king, chal], [], envs, list(envs), store, cfg, Priors(),
         np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
     )
-    rows = out.rows
     assert out.status is DuelStatus.COMPLETED
-    king_rows = [r for r in rows if r.m == king.uid]
-    chal_rows = [r for r in rows if r.m == chal.uid]
-    assert len(king_rows) == len(chal_rows) > 0  # all iters paired
-    assert all(r.p == 1 for r in king_rows)
-    assert all(r.p == 0 and r.l == 0.0 for r in chal_rows)    # synthetic losses
-    assert rows == store.read()
     delta, se = out.fit.contrast(1, 0)
-    z = delta / se if se > 0 else 0
-    assert z < 0, f"chal failing every iter must yield negative z; got {z:+.2f}"
+    assert delta / se < -1.0, f"expected z<−k=−1; got z={delta/se:+.2f}"
+    king_rows = [r for r in out.rows if r.m == king.uid]
+    chal_rows = [r for r in out.rows if r.m == chal.uid]
+    assert king_rows and all(r.p == 1 and r.l > 0 for r in king_rows), "king delivered → real p=1"
+    assert chal_rows and all(r.p == 0 and r.l == 0.0 for r in chal_rows), "chal failed paired with king-pass → synthetic p=0,l=0"
+    assert len(king_rows) == len(chal_rows), "matched-pair count: every kept pair appends both rows"
+    assert out.rows == store.read()
 
 
 @pytest.mark.asyncio
-async def test_dwell_dethrones_broken_king_via_synthetic_loss(tmp_path, monkeypatch):
-    """Per notes/plan.md ('first functioning challenger wins by default'), a
-    king whose endpoint persistently fails must dethrone within a single duel
-    via accumulated synthetic losses + z>k early-stop. There is no KING_BROKEN
-    abort — that path was removed because it interrupted the principled
-    dethrone path with an arbitrary K=3 streak threshold."""
+async def test_dwell_broken_king_dethrones_via_synthetic_loss(tmp_path, monkeypatch):
+    """plan.md L47 'first functioning challenger wins by default': a king
+    failing to deliver every pick paired with a delivering chal contributes a
+    synthetic king-loss row + real chal-pass row per pair. The contrast crosses
+    z>k and dwell exits with COMPLETED. The verdict path then produces Dethrone
+    on those rows. Without conditional synthetic-loss, the broken-king duel
+    would loop forever (slot-dead → reprovision → same broken king again)."""
+    monkeypatch.setattr("affine.loop.compute_k", lambda *a, **kw: 1.0)
     async def split(wrapper, params, timeout, slot, seed, task_id=0):
         return (None if slot.model == "mk" else True), 0.01, 0
     monkeypatch.setattr("affine.loop.run_one", split)
@@ -1460,8 +1464,7 @@ async def test_dwell_dethrones_broken_king_via_synthetic_loss(tmp_path, monkeypa
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
-    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"),
-                 k_init=3.0, k_final=3.0, k_halflife=1)
+    cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
@@ -1470,70 +1473,59 @@ async def test_dwell_dethrones_broken_king_via_synthetic_loss(tmp_path, monkeypa
     )
     assert out.status is DuelStatus.COMPLETED
     delta, se = out.fit.contrast(1, 0)
-    z = delta / se if se > 0 else 0
-    assert z > 3.0, f"broken king should yield dethrone-grade z; got {z:+.2f}"
+    assert delta / se > 1.0, f"expected z>k=1; got z={delta/se:+.2f}"
     king_rows = [r for r in out.rows if r.m == king.uid]
     chal_rows = [r for r in out.rows if r.m == chal.uid]
-    assert all(r.p == 0 and r.l == 0.0 for r in king_rows)
-    assert all(r.p == 1 for r in chal_rows)
-
-
+    assert king_rows and all(r.p == 0 and r.l == 0.0 for r in king_rows), "king failed paired with chal-pass → synthetic p=0,l=0"
+    assert chal_rows and all(r.p == 1 and r.l > 0 for r in chal_rows), "chal delivered → real p=1"
+    assert len(king_rows) == len(chal_rows), "matched-pair count: every kept pair appends both rows"
 
 
 @pytest.mark.asyncio
-async def test_dwell_env_fails_resets_on_single_side_success(tmp_path, monkeypatch):
-    """env_fails[e] tracks consecutive *both-None* failures on env e — the env-side
-    signal. A single-side success means the env produced a valid result for at least
-    one model: the env is fine. Without resetting env_fails on single-side success,
-    a long-running session accumulates spurious quarantine pressure across picks."""
-    seq: list[tuple[bool | None, bool | None]] = [
-        (None, None),                                                     # pick 1: both-None → env_fails=1
-        (None, None),                                                     # pick 2: both-None → env_fails=2
-        (True, None),                                                     # pick 3: chal-None, king-ok → env_fails should reset
-        (None, None),                                                     # pick 4: both-None → env_fails=1 (fix) vs 3=quarantine (bug)
-        (None, None),                                                     # pick 5: both-None → env_fails=2 (fix)
-    ]
-    pick = {"i": 0}
-    last_pick = {"slot_count": 0}
-    async def scripted(wrapper, params, timeout, slot, seed, task_id=0):
-        last_pick["slot_count"] += 1
-        idx = (last_pick["slot_count"] + 1) // 2 - 1
-        if idx >= len(seq):
-            return False, 0.01, 0                                            # productive failures keep dwell going
-        k, c = seq[idx]
-        return (k if slot.model == "mk" else c), 0.01, 0
-    envs = {"X": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="X", image="i", params={"timeout": 5}))}
+async def test_dwell_both_sides_fail_appends_two_synthetic_zero_rows(tmp_path, monkeypatch):
+    """Both-side simultaneous failure (env outage or both endpoints
+    unreachable) appends BOTH synthetic p=0,l=0 rows. Matched-pair contrast
+    contribution is zero (Δp=0) either way — drop and append-both produce
+    identical contrast effects — but appending honestly logs the loss rate.
+    Drop would let an attacker suppress their loss rate by crashing on tasks
+    that happen to coincide with king failures (rate ≈ P(king_fail) in hard
+    envs); appending closes that loophole. Slot-dead consec counters still
+    climb on both sides → eventual KING_SLOT_DEAD (both-dead branch)."""
+    async def both_fail(wrapper, params, timeout, slot, seed, task_id=0):
+        return None, 0.01, 0
+    monkeypatch.setattr("affine.loop.run_one", both_fail)
+    envs = {"E": (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name="E", image="i", params={"timeout": 5}))}
     store = EvidenceStore(tmp_path / "ev.jsonl")
     chain = Chain(hotkey="V", list_miners=AsyncMock(),
                   current_block=AsyncMock(return_value=0), publish_winner=AsyncMock())
     king, chal = _miner(0, model="mk"), _miner(1, model="mc")
     cfg = Config(evidence_path=str(tmp_path / "ev.jsonl"))
-    stop = asyncio.Event()
-    # Both-False past pick 5 keeps z near 0 (neither side wins) — no z-stop, so
-    # cap with our stop after enough pairs to observe the env_fails reset.
-    monkeypatch.setattr("affine.loop.run_one", _stop_after_pairs(stop, 10, scripted))
     out = await dwell(
         chain, king, SimpleNamespace(model="mk", base_url="uk"),
         chal, SimpleNamespace(model="mc", base_url="uc"),
         [king, chal], [], envs, list(envs), store, cfg, Priors(),
-        np.random.default_rng(0), stop, reign_start_block=0,
+        np.random.default_rng(0), asyncio.Event(), reign_start_block=0,
     )
-    rows, _, abort = out.rows, out.fit, out.status
-    # After fix, picks 6+ produce both-False (productive failures) → rows accumulate.
-    # Before fix, abort at pick 4 (envs_quarantined) → no rows from later picks.
-    assert abort is not DuelStatus.ENVS_QUARANTINED, "env_fails must reset after single-side success"
-    assert len(rows) > 0, "dwell must reach productive picks after fix"
+    assert out.status is DuelStatus.KING_SLOT_DEAD  # both-dead branch
+    king_rows = [r for r in out.rows if r.m == king.uid]
+    chal_rows = [r for r in out.rows if r.m == chal.uid]
+    assert len(king_rows) == len(chal_rows) >= SLOT_DEAD
+    assert all(r.p == 0 and r.l == 0.0 for r in out.rows), "all synthetic on both-fail"
+    assert out.rows == store.read()
+
+
 
 
 @pytest.mark.asyncio
-async def test_dwell_synthetic_loss_drives_dethrone_against_broken_king(tmp_path, monkeypatch):
-    """Cross-duel evidence accumulation against a broken king. Each duel ends
-    via z>k early-stop (single-duel dethrone path is verified separately); this
-    test's purpose is to confirm the rows persist across duels and the joint
-    fit on accumulated evidence produces dethrone-grade z for the latest chal."""
-    async def king_broken(wrapper, params, timeout, slot, seed, task_id=0):
-        return (None if slot.model == "mk" else True), 0.01, 0
-    monkeypatch.setattr("affine.loop.run_one", king_broken)
+async def test_cross_duel_real_row_evidence_drives_dethrone(tmp_path, monkeypatch):
+    """Rows persist across duels and the joint fit on accumulated real-row
+    evidence drives dethrone-grade z for a chal that consistently beats the
+    king. King answers wrong (real-loss row, p=0, l>0), chal answers right
+    (real-pass row); no infra failures, no synthetic rows. After 8 duels each
+    contributing real rows, the latest chal's contrast must exceed k_init=3."""
+    async def king_loses(wrapper, params, timeout, slot, seed, task_id=0):
+        return (slot.model != "mk"), 0.01, 0
+    monkeypatch.setattr("affine.loop.run_one", king_loses)
     envs = {n: (SimpleNamespace(evaluate=AsyncMock()), EnvSpec(name=n, image="i", params={"timeout": 5}))
             for n in ("A", "B", "C", "D")}
     store = EvidenceStore(tmp_path / "ev.jsonl")
@@ -1554,10 +1546,6 @@ async def test_dwell_synthetic_loss_drives_dethrone_against_broken_king(tmp_path
         )
         rows = out.rows
 
-    # After ~8 duels each producing 3 synthetic-loss rows for the broken king,
-    # accumulated cross-duel evidence drives king's θ̂ down. The latest chal's
-    # contrast should exceed k_init=3 — the design's "first functioning
-    # challenger wins by default" reached via accumulated negative evidence.
     from affine.loop import _fit, _respondents
     all_miners = [king] + [_miner(u, model=f"mc{u}") for u in chal_uids]
     fit = _fit(rows, all_miners, list(envs), Priors())
@@ -1566,13 +1554,17 @@ async def test_dwell_synthetic_loss_drives_dethrone_against_broken_king(tmp_path
     king_idx = art_keys.index(("mk", "r"))
     delta, se = fit.contrast(chal_idx, king_idx)
     assert delta > 0
-    assert delta / se > 3.0, f"chronically-broken king must yield dethrone-grade z; got {delta/se:.2f}"
+    assert delta / se > 3.0, f"consistently-better chal must yield dethrone-grade z; got {delta/se:.2f}"
+    assert all(r.l > 0.0 for r in rows), "no synthetic rows: every appended row has real latency"
 
 
 @pytest.mark.asyncio
 async def test_dwell_intermittent_one_side_does_not_abort(tmp_path, monkeypatch):
-    """Dwell must complete normally with intermittent chal failures — no early
-    abort. Synthetic losses on chal-fail iters drive the contrast naturally."""
+    """Dwell must complete normally with intermittent chal failures — no
+    slot-dead abort. The infra-failure pairs (every 4th sample) append a
+    synthetic chal p=0 + real king p=1 since king delivers, but consec_fails
+    resets on the next delivered chal pair so SLOT_DEAD never trips. The
+    chal's real-loss rows + synthetic-loss rows together drive z<-k."""
     counter = {"n": 0}
     async def alternating(wrapper, params, timeout, slot, seed, task_id=0):
         if slot.model == "mk":

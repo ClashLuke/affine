@@ -27,7 +27,7 @@ class Config:
     hotkey_name: str = "default"
     subtensor_endpoint: str = "finney"
     subtensor_fallback: str = "wss://lite.sub.latent.to:443"
-    dwell_batch: int = 1                  # matched-task pairs kept in flight at all times; sets the parallelism ceiling. Dwell exits only on principled stops (z>k, z<-k, shutdown, env-quarantine) — there is no iter cap.
+    dwell_batch: int = 1                  # matched-task pairs kept in flight at all times; sets the parallelism ceiling. Dwell exits only on principled stops (z>k, z<-k, shutdown, slot-dead) — there is no iter cap.
     k_init: float = 3.0                   # starting dethronement threshold
     k_final: float = 1.0                  # asymptotic threshold
     k_halflife: int = 7200                # blocks for k decay half-life (~24h on 12s blocks)

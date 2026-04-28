@@ -67,19 +67,25 @@ async def run_one(
 ) -> tuple[bool | None, float, int]:
     """Run one inference sample. Returns (outcome, latency_seconds, tokens).
 
-    outcome is True/False for decisive pass/fail, None for infrastructure error
-    (connection refused, wrapper-reported failure, or exception in env wrapper).
-    Callers use None to detect slot/infra problems and discard the row; False is
-    a legitimate loss (real inference that produced a wrong answer or ran to the
-    sample timeout).
+    outcome is True/False for decisive pass/fail, None for validator-side
+    infrastructure error (vLLM 5xx, connection refused, env BackendError,
+    wrapper-side exception). Per `feedback_we_own_vllm` and notes/plan.md
+    "Targon node disconnects mid-duel → do not resume partial evidence",
+    callers must drop None-outcome rows: vLLM is our config; failures there
+    are not the miner's fault.
+
+    False is a legitimate miner loss: a wrong answer, our outer-deadline
+    timeout, or wrapper-reported `error_type=timeout` (the model didn't
+    respond inside the env's per-task budget — plan.md:46 "Challenger
+    times out on a task → that task is a loss").
 
     tokens is best-effort completion-token count parsed from env usage stats; 0
     if the env doesn't surface it. Throughput logging in the dwell uses this to
     compute generation tok/s.
 
     The outer deadline is enforced by an explicit task + wait so we can tell our
-    timeout (miner-loss = False) from any inner asyncio.TimeoutError that the
-    wrapper might surface (its own client timeout = infra = None). asyncio.wait_for
+    timeout (miner-loss = False) from inner asyncio.TimeoutError surfaced by
+    the wrapper (its own client timeout = infra = None). asyncio.wait_for
     collapses both into the same exception class, mis-attributing infra timeouts
     as miner losses.
     """
@@ -111,6 +117,9 @@ async def run_one(
         log.warning(f"infra failure ({slot.model}) in {dt:.2f}s — affinetes wrapper status=failed: {str(r.get('error', ''))[:200]}")
         return None, dt, 0
     if (err := r.get("error_type")) is not None:
+        if err == "timeout":
+            log.warning(f"sample timeout ({slot.model}) in {dt:.2f}s: {str(r.get('error', ''))[:200]}")
+            return False, dt, 0
         log.warning(f"infra failure ({slot.model}) in {dt:.2f}s, error_type={err}: {str(r.get('error', ''))[:200]}")
         return None, dt, 0
     tok = _tokens(r)

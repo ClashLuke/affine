@@ -13,7 +13,9 @@ Each outer iteration:
      (θ_chal − θ_king), sample both models concurrently, append two rows,
      refit. The posterior sharpens as evidence accrues. Exits only on
      principled stops: z > k (dethrone), z < −k (chal can't recover under
-     unbounded future info), shutdown, or all envs quarantined. No budget cap.
+     unbounded future info), shutdown, or one side's endpoint is
+     persistently dead (≥ SLOT_DEAD consec same-side delivery failures).
+     No budget cap.
   5. Teardown. Contrast z = (θ̂_chal − θ̂_king) / √Var against a ratcheting
      threshold k(reign). If z > k, challenger dethrones; reset the reign
      block; publish. Else champion holds; try the next challenger.
@@ -51,7 +53,7 @@ from .vllm import Slot, SlotProvisionFailed, TargonSlots
 
 log = logging.getLogger(__name__)
 
-ENV_FAIL_QUARANTINE = 3   # consecutive infra fails on one env → stop picking it this dwell
+SLOT_DEAD = 30   # consecutive same-slot delivery failures → abort dwell, reprovision
 
 
 @dataclass
@@ -175,11 +177,20 @@ def _fit(rows: list[Row], miners: list[Miner], env_names: list[str],
     e2i = {n: i for i, n in enumerate(env_names)}
     by_uid_rev = {(m.uid, m.revision): m for m in miners}
     outcomes: dict[str, set[int]] = {}
+    pairs: dict[tuple[str, int, int], list[float]] = {}
     for r in rows:
         if r.e in e2i:
             outcomes.setdefault(r.e, set()).add(r.p)
+        pairs.setdefault((r.e, r.t, r.i), []).append(r.l)
     drop = {n for n, outs in outcomes.items() if len(outs) < 2}
-    filtered = [r for r in rows if r.e in e2i and r.e not in drop]
+    # Synth-on-both pairs (both sides l=0) carry no information but in 2PL add
+    # Hessian mass α²σ(η)(1-σ(η)) per row, sharply tightening any wide posterior
+    # (e.g. fresh chal at prior). One such pair shifted z from -0.35 → -3.56 in
+    # the 2026-04-28 incident — fit-time drop is the principled fix; gaming
+    # defense via single-side synth-loss rows (l=0 with l>0 partner) is preserved.
+    synth = {g for g, ls in pairs.items() if all(l == 0.0 for l in ls)}
+    filtered = [r for r in rows if r.e in e2i and r.e not in drop
+                and (r.e, r.t, r.i) not in synth]
     m_idx = np.fromiter((k2i[_row_art(r, by_uid_rev)] for r in filtered),
                         dtype=np.intp, count=len(filtered))
     e_idx = np.fromiter((e2i[r.e] for r in filtered), dtype=np.intp, count=len(filtered))
@@ -302,9 +313,10 @@ async def _provision(slots, miner: Miner, stop: asyncio.Event) -> tuple[Slot | N
     vLLM crashed loading the artifact. `timeout`/`transient`/`error` are our
     infrastructure (we picked the resource, image, timeout). The slot is *not*
     further probed here: a `/chat/completions` health check is our test of our
-    slot, and a failure would conflate orchestration with miner fault. If the
-    provisioned slot can't actually serve, dwell samples fail and synthetic
-    losses drive dethrone via the design's z>k path (notes/design.md §27)."""
+    slot, and a failure would conflate orchestration with miner fault. A slot
+    that provisions but can't actually serve produces no rows for that side;
+    SLOT_DEAD aborts the dwell and the outer loop reprovisions or marks
+    durable as appropriate."""
     try:
         slot = await _cancellable(
             slots.provision(miner.model, miner.revision), stop,
@@ -444,16 +456,16 @@ async def _sample(chain: Chain, wrapper, params: dict, timeout: float, slot: Slo
                   miner: Miner, env_name: str, c: int,
                   task_id: int, block: int) -> tuple[Row, bool, int]:
     """One evaluation of `miner` in `env_name` on `slot`. Returns
-    (row, delivered, tokens). `delivered=False` iff the miner's endpoint failed
-    to produce a verdict (None from run_one); the row is then a synthetic loss
-    (p=0, l=0). `tokens` is best-effort completion-token count for throughput
-    logging (0 if the env doesn't surface usage).
+    (row, delivered, tokens). `delivered=False` iff `run_one` returned None —
+    the miner's endpoint failed to produce a parseable response (vLLM 5xx,
+    conn refused, env-side error, wrapper exception). The synthetic row
+    (p=0, l=0) is constructed regardless; the caller decides whether to keep
+    it based on the *paired* sample's outcome — see dwell's row-append block.
 
-    Per notes/plan.md ("Challenger times out on a task → that task is a loss
-    for the challenger"), failure-to-deliver is a loss for the miner. Recording
-    the loss instead of dropping the row makes a chronically-broken endpoint
-    accumulate negative evidence so the IRT contrast eventually surfaces the
-    "first functioning challenger wins by default" semantics the design specifies.
+    Real per-task miner timeouts (the outer asyncio.wait deadline in run_one)
+    return outcome=False, not None: those are decisive misses per plan.md
+    "Challenger times out on a task → that task is a loss" and yield a
+    real-loss row (p=0, l=actual_latency, delivered=True).
 
     `c` is pre-allocated by the caller: the dwell may dispatch many samples for
     the same (uid, rev, env) in parallel before any append, and reading
@@ -464,11 +476,12 @@ async def _sample(chain: Chain, wrapper, params: dict, timeout: float, slot: Slo
         wrapper, params, timeout, slot,
         seed=_seed(miner.uid, miner.revision, env_name, c, salt=chain.hotkey),
         task_id=task_id)
-    delivered = outcome is not None
+    if outcome is None:
+        return Row(m=miner.uid, r=miner.revision, e=env_name, c=c,
+                   p=0, t=int(block), l=0.0, i=int(task_id), k=miner.model), False, 0
     return Row(m=miner.uid, r=miner.revision, e=env_name, c=c,
                p=int(bool(outcome)), t=int(block),
-               l=float(latency) if delivered else 0.0,
-               i=int(task_id), k=miner.model), delivered, int(tokens)
+               l=float(latency), i=int(task_id), k=miner.model), True, int(tokens)
 
 
 async def _pair_sample(chain: Chain, wrapper, params: dict, timeout: float,
@@ -504,14 +517,27 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
       - z < −k(reign) → asymptotic mirror; under unbounded future info the chal
         cannot reach k, so HOLDS is decided (DuelStatus.COMPLETED)
       - stop event   → shutdown (DuelStatus.CANCELLED)
-      - all envs quarantined and nothing in flight → DuelStatus.ENVS_QUARANTINED
+      - king-side delivery dead (>= SLOT_DEAD consec) → DuelStatus.KING_SLOT_DEAD
+      - chal-side delivery dead (>= SLOT_DEAD consec) → DuelStatus.CHAL_SLOT_DEAD
 
-    Both sides failing on env e (or a sample raising) is attributed to env-side
-    plumbing — env_fails[e] increments, env quarantined after ENV_FAIL_QUARANTINE
-    consecutive same-env fails. Single-side failures append a synthetic-loss
-    row (p=0, l=0.0) for the failing miner; accumulated synthetic losses drive
-    the IRT contrast toward dethrone via z>k (notes/plan.md "first functioning
-    challenger wins by default").
+    Slot health is tracked per-side as `king_consec_fails` / `chal_consec_fails`:
+    consecutive pair-completions where that side's endpoint failed to deliver,
+    reset on any delivery. Crossing SLOT_DEAD aborts with KING_SLOT_DEAD or
+    CHAL_SLOT_DEAD so the outer loop reprovisions the dead side.
+
+    Row-append rule: always append both rows; failing sides get synthetic
+    p=0,l=0 (constructed in `_sample`). Matched-pair contrast contribution
+    is zero either way on both-fail (Δp=0), but appending preserves row
+    count and prevents an attacker from suppressing their loss rate via
+    selective crashes that coincide with king failures (drop would inflate
+    θ̂_chal by P(king_fail) — non-trivial in hard envs at reign-end k≈1).
+    Asymmetric pairs (one delivered, one not) implement plan.md L47 "first
+    functioning challenger wins by default": broken-king pairs contribute
+    chal-pass + king-synthetic-loss rows that drive z>k → Dethrone.
+
+    Real per-task miner timeouts come back as outcome=False (not None) from
+    run_one and produce real-loss rows (delivered=True, p=0, l=actual).
+    Synthetic vs real is distinguishable downstream by l==0.0.
 
     Counter allocation is local to the dwell: store.next_counter is read once
     per (uid, rev, env) at first dispatch, then incremented in-process.
@@ -530,7 +556,8 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
     art_keys = _respondents(miners, rows)
     k_idx = art_keys.index(art_key(king))
     c_idx = art_keys.index(art_key(challenger))
-    env_fails = [0] * len(env_names)
+    king_consec_fails = 0
+    chal_consec_fails = 0
     next_c: dict[tuple[int, str, str], int] = {}
     inflight: set[asyncio.Task] = set()
     iters_started = 0
@@ -544,11 +571,10 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
         next_c[key] = c + 1
         return c
 
-    def pick_env(excluded: frozenset[int]) -> int:
+    def pick_env() -> int:
         if fit.degenerate:
-            choices = [j for j in range(len(env_names)) if j not in excluded]
-            return int(rng.choice(choices))
-        return fisher_env(fit, c_idx, k_idx, rng, excluded=excluded)
+            return int(rng.choice(len(env_names)))
+        return fisher_env(fit, c_idx, k_idx, rng, excluded=frozenset())
 
     def dispatch_one(e_idx: int, iter_idx: int, block: int) -> asyncio.Task:
         env_name = env_names[e_idx]
@@ -581,16 +607,9 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
     while True:
         if stop.is_set():
             await drain("stop"); return _out(DuelStatus.CANCELLED, fit)
-        excluded = frozenset(j for j, n in enumerate(env_fails) if n >= ENV_FAIL_QUARANTINE)
-        # Refill: maintain `dwell_batch` in flight; skip if all envs quarantined.
-        if len(excluded) < len(env_names):
-            while len(inflight) < cfg.dwell_batch:
-                e_idx = pick_env(excluded)
-                inflight.add(dispatch_one(e_idx, iters_started, block))
-                iters_started += 1
-        if not inflight:
-            log.warning(f"all envs quarantined at i={iters_done}; aborting dwell (king={king.uid} chal={challenger.uid})")
-            return _out(DuelStatus.ENVS_QUARANTINED, fit)
+        while len(inflight) < cfg.dwell_batch:
+            inflight.add(dispatch_one(pick_env(), iters_started, block))
+            iters_started += 1
         try:
             done, _pending = await _cancellable(
                 asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED), stop)
@@ -598,34 +617,52 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
             await drain("cancel"); return _out(DuelStatus.CANCELLED, fit)
 
         new_rows: list[Row] = []
-        succeeded_envs: set[int] = set()
         for t in done:
             inflight.discard(t)
-            e_idx, env_name, rk, rc = t.result()
+            _e_idx, env_name, rk, rc = t.result()
             iters_done += 1
-            if isinstance(rk, BaseException) or isinstance(rc, BaseException):
-                for ex in (rk, rc):
-                    if isinstance(ex, BaseException):
-                        log.warning(f"dwell sample raised on env={env_name}: {type(ex).__name__}: {ex}")
-                env_fails[e_idx] += 1
-                continue
-            (k_row, k_ok, k_tok), (c_row, c_ok, c_tok) = rk, rc
-            for row, ok, tok in ((k_row, k_ok, k_tok), (c_row, c_ok, c_tok)):
-                if ok:
-                    samples_done += 1; tokens_done += tok; latency_sum += row.l
-            if not k_ok and not c_ok:
-                env_fails[e_idx] += 1
-                continue
-            new_rows.extend((k_row, c_row))
-            succeeded_envs.add(e_idx)
-        for e in succeeded_envs:
-            env_fails[e] = 0
-        for e, n in enumerate(env_fails):
-            if n >= ENV_FAIL_QUARANTINE and e not in excluded:
-                log.warning(f"quarantine env '{env_names[e]}' after {n} consecutive fails (king={king.uid} chal={challenger.uid})")
-
+            if isinstance(rk, BaseException):
+                log.warning(f"dwell king-side raised on env={env_name}: {type(rk).__name__}: {rk}")
+                k_row, k_ok, k_tok = None, False, 0
+            else:
+                k_row, k_ok, k_tok = rk
+            if isinstance(rc, BaseException):
+                log.warning(f"dwell chal-side raised on env={env_name}: {type(rc).__name__}: {rc}")
+                c_row, c_ok, c_tok = None, False, 0
+            else:
+                c_row, c_ok, c_tok = rc
+            king_consec_fails = 0 if k_ok else king_consec_fails + 1
+            chal_consec_fails = 0 if c_ok else chal_consec_fails + 1
+            # Always append both rows. Failing sides get synthetic p=0,l=0
+            # (constructed in _sample). The matched-pair contrast contribution
+            # is identical whether we drop or append-zero on both-fail (Δp=0
+            # either way), but appending preserves the row count: an attacker
+            # who crashes selectively on tasks they'd lose cannot suppress
+            # their loss rate by hiding behind a coinciding king-fail. Drop
+            # would let θ̂_chal float above true ability proportional to
+            # P(king_fail) — non-trivial in hard envs at reign-end k≈1.
+            # Validator-side env outages still inflate row count but not the
+            # contrast (both p=0 → zero matched-pair contribution).
+            if k_ok:
+                samples_done += 1; tokens_done += k_tok; latency_sum += k_row.l
+            if c_ok:
+                samples_done += 1; tokens_done += c_tok; latency_sum += c_row.l
+            if k_row is not None: new_rows.append(k_row)
+            if c_row is not None: new_rows.append(c_row)
         if new_rows:
             store.append(*new_rows); rows.extend(new_rows)
+        if king_consec_fails >= SLOT_DEAD and chal_consec_fails >= SLOT_DEAD:
+            log.warning(f"dwell abort: BOTH slots dead (king={king.uid} consec={king_consec_fails}, "
+                        f"chal={challenger.uid} consec={chal_consec_fails})")
+            await drain("both_dead"); return _out(DuelStatus.KING_SLOT_DEAD, fit)
+        if king_consec_fails >= SLOT_DEAD:
+            log.warning(f"dwell abort: king slot dead after {king_consec_fails} consec fails (uid {king.uid})")
+            await drain("king_dead"); return _out(DuelStatus.KING_SLOT_DEAD, fit)
+        if chal_consec_fails >= SLOT_DEAD:
+            log.warning(f"dwell abort: chal slot dead after {chal_consec_fails} consec fails (uid {challenger.uid})")
+            await drain("chal_dead"); return _out(DuelStatus.CHAL_SLOT_DEAD, fit)
+
+        if new_rows:
             try: block = await chain.current_block()
             except Exception as ex:
                 log.warning(f"current_block refresh failed at i={iters_done}: {ex}; reusing previous")
@@ -1019,6 +1056,18 @@ async def run(cfg: Config, chain: Chain, slots=None):
                     verdict = decide(duel_rows, out.fit, out.status,
                                      king=king, chal=challenger, art_keys=duel_art_keys,
                                      reign_blocks=reign_blocks, cfg=cfg)
+
+                    if not isinstance(verdict, Dethrone):
+                        # Slot-dead ⇒ tear down the dead slot. Durable-marking
+                        # is now driven by the verdict path (Hold over synthetic
+                        # rows): if chal really lost, decide() returns Hold and
+                        # the standard mark_attempted/durable flow applies. The
+                        # chal side does not need an extra mark_durable on
+                        # CHAL_SLOT_DEAD — that was asymmetric with king-side
+                        # handling and was attributing slot health (validator
+                        # signal) as a model-quality decision (mark_durable).
+                        if out.status is DuelStatus.KING_SLOT_DEAD:
+                            await _drop_king(state, slots)
 
                     match verdict:
                         case Skip(reason=reason):
