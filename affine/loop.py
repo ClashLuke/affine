@@ -159,6 +159,23 @@ def _respondents(miners: list[Miner], rows: list[Row]) -> list[ArtKey]:
     return keys
 
 
+def _init_x_from_prev(prev_fit: Fit | None, prev_keys: list[ArtKey], prev_envs: list[str],
+                       cur_keys: list[ArtKey], cur_envs: list[str]) -> np.ndarray | None:
+    if prev_fit is None or prev_fit.degenerate:
+        return None
+    n_m, n_e = len(cur_keys), len(cur_envs)
+    theta = np.zeros(n_m); beta = np.zeros(n_e); alpha = np.zeros(n_e)
+    pk = {k: i for i, k in enumerate(prev_keys)}
+    pe = {n: i for i, n in enumerate(prev_envs)}
+    for i, k in enumerate(cur_keys):
+        if k in pk: theta[i] = prev_fit.theta[pk[k]]
+    for j, e in enumerate(cur_envs):
+        if e in pe:
+            beta[j] = prev_fit.beta[pe[e]]
+            alpha[j] = prev_fit.alpha[pe[e]]
+    return np.concatenate([theta, beta, alpha])
+
+
 def _fit(rows: list[Row], miners: list[Miner], env_names: list[str],
          priors: Priors, init_x: np.ndarray | None = None) -> Fit:
     """Drops envs whose every observed outcome is identical (all-pass or all-fail)
@@ -485,6 +502,7 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
                 cfg: Config, priors: Priors,
                 rng: np.random.Generator, stop: asyncio.Event,
                 reign_start_block: int,
+                init_x: np.ndarray | None = None,
                 ) -> DuelOutcome:
     """Queue-driven dwell: keep `cfg.dwell_batch` matched-task pairs in flight at
     all times, harvest via FIRST_COMPLETED, refill on completion. Refit on every
@@ -529,7 +547,7 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
     rows0 = len(rows)
     def _out(status: DuelStatus, fit: Fit) -> DuelOutcome:
         return DuelOutcome(rows=rows, fit=fit, status=status, rows_added=len(rows) - rows0)
-    fit = _fit(rows, miners, env_names, priors)
+    fit = _fit(rows, miners, env_names, priors, init_x=init_x)
     init_x = (np.concatenate([fit.theta, fit.beta, fit.alpha])
               if not fit.degenerate else None)
     art_keys = _respondents(miners, rows)
@@ -546,7 +564,9 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
 
     def alloc_c(uid: int, rev: str, env: str) -> int:
         key = (uid, rev, env)
-        c = next_c.setdefault(key, store.next_counter(uid, rev, env))
+        if key not in next_c:
+            next_c[key] = store.next_counter(uid, rev, env)
+        c = next_c[key]
         next_c[key] = c + 1
         return c
 
@@ -583,12 +603,13 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
         log.warning(f"current_block failed at dwell start: {ex}; using 0")
         block = 0
 
+    while len(inflight) < cfg.dwell_batch:
+        inflight.add(dispatch_one(pick_env(), iters_started, block))
+        iters_started += 1
+
     while True:
         if stop.is_set():
             await drain("stop"); return _out(DuelStatus.CANCELLED, fit)
-        while len(inflight) < cfg.dwell_batch:
-            inflight.add(dispatch_one(pick_env(), iters_started, block))
-            iters_started += 1
         try:
             done, _pending = await _cancellable(
                 asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED), stop)
@@ -641,6 +662,10 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
             log.warning(f"dwell abort: chal slot dead after {chal_consec_fails} consec fails (uid {challenger.uid})")
             await drain("chal_dead"); return _out(DuelStatus.CHAL_SLOT_DEAD, fit)
 
+        while len(inflight) < cfg.dwell_batch:
+            inflight.add(dispatch_one(pick_env(), iters_started, block))
+            iters_started += 1
+
         if new_rows:
             try: block = await chain.current_block()
             except Exception as ex:
@@ -652,19 +677,20 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
             log.info(f"dwell pairs={iters_done} (in_flight={len(inflight)}/{cfg.dwell_batch}) "
                      f"samples={samples_done} tokens={tokens_done} elapsed={elapsed:.1f}s "
                      f"throughput={sps:.2f} sample/s {tok_s:.0f} tok/s mean_lat={mean_lat:.1f}s")
-            fit = _fit(rows, miners, env_names, priors, init_x=init_x)
-            if not fit.degenerate:
-                init_x = np.concatenate([fit.theta, fit.beta, fit.alpha])
-                delta, se = fit.contrast(c_idx, k_idx)
-                z = delta / se if se > 0 else 0.0
-                k = compute_k(block - reign_start_block,
-                              cfg.k_init, cfg.k_final, cfg.k_halflife)
-                if z > k:
-                    log.info(f"dwell dethrone after {iters_done} iters: z={z:+.2f} > k={k:.2f}")
-                    await drain("z>k"); return _out(DuelStatus.COMPLETED, fit)
-                if z < -k:
-                    log.info(f"dwell hold after {iters_done} iters: z={z:+.2f} < -k={-k:.2f}")
-                    await drain("z<-k"); return _out(DuelStatus.COMPLETED, fit)
+            if any(r.l != 0.0 for r in new_rows):
+                fit = _fit(rows, miners, env_names, priors, init_x=init_x)
+                if not fit.degenerate:
+                    init_x = np.concatenate([fit.theta, fit.beta, fit.alpha])
+                    delta, se = fit.contrast(c_idx, k_idx)
+                    z = delta / se if se > 0 else 0.0
+                    k = compute_k(block - reign_start_block,
+                                  cfg.k_init, cfg.k_final, cfg.k_halflife)
+                    if z > k:
+                        log.info(f"dwell dethrone after {iters_done} iters: z={z:+.2f} > k={k:.2f}")
+                        await drain("z>k"); return _out(DuelStatus.COMPLETED, fit)
+                    if z < -k:
+                        log.info(f"dwell hold after {iters_done} iters: z={z:+.2f} < -k={-k:.2f}")
+                        await drain("z<-k"); return _out(DuelStatus.COMPLETED, fit)
 
 
 async def _elect(rows: list[Row], miners: list[Miner], env_names: list[str],
@@ -925,6 +951,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
             except (NotImplementedError, ValueError): signal.signal(s, lambda *_: stop.set())
 
         rows = store.read()
+        prev_fit_state: tuple[Fit, list[ArtKey], list[str]] | None = None
         state.reign = Reign.load(reign_state_path)
         if state.reign is not None:
             log.info(f"resuming reign: uid {state.reign.champion[0]}@{state.reign.champion[1]} "
@@ -1009,10 +1036,18 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 promoted = False
                 try:
                     log.info(f"duel: king uid{king.uid} vs chal uid{challenger.uid} (rows={len(rows)})")
+                    cur_keys = _respondents(miners, rows)
+                    init_x = _init_x_from_prev(
+                        prev_fit_state[0] if prev_fit_state else None,
+                        prev_fit_state[1] if prev_fit_state else [],
+                        prev_fit_state[2] if prev_fit_state else [],
+                        cur_keys, env_names)
                     out = await dwell(chain, king, state.king_slot, challenger, chal_slot,
                                       miners, rows, envs, env_names, store, cfg,
                                       priors, rng, stop,
-                                      reign_start_block=state.reign.start_block)
+                                      reign_start_block=state.reign.start_block,
+                                      init_x=init_x)
+                    prev_fit_state = (out.fit, _respondents(miners, rows), list(env_names))
                     duel_rows = rows[-out.rows_added:] if out.rows_added > 0 else []
                     needs_reign = (out.status is DuelStatus.COMPLETED
                                    and out.rows_added > 0
