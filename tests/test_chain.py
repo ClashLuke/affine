@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from affine.chain import Miner, Subtensor, get_miners, set_weights
+from affine.chain import Miner, Subtensor, clear_weights, get_miners, set_weights
 
 
 @dataclass
@@ -135,6 +135,59 @@ async def test_set_weights_dry_run_skips_chain_call(monkeypatch):
     result = await set_weights(sub, wallet, netuid=1, winner_uid=0)
     assert result is True
     sub.set_weights.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_clear_weights_emits_zero_weight_vector():
+    meta = FakeMeta(["hk_me", "hk1"])
+    meta.W = [[0.0, 0.0], [0.0, 0.0]]
+    sub = _mock_sub(meta=meta, set_weights_result=FakeExtrinsicResponse(success=True))
+    wallet = AsyncMock()
+    wallet.hotkey.ss58_address = "hk_me"
+    with patch("affine.chain.asyncio.sleep", new_callable=AsyncMock):
+        result = await clear_weights(sub, wallet, netuid=1)
+    assert result is True
+    sub.set_weights.assert_awaited_once_with(
+        wallet=wallet, netuid=1,
+        uids=[0], weights=[0.0],
+        wait_for_inclusion=True, wait_for_finalization=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_clear_weights_rejects_uncleared_chain_row_after_success():
+    meta = FakeMeta(["hk_me", "hk1"])
+    meta.W = [[1.0, 0.0], [0.0, 0.0]]
+    sub = _mock_sub(meta=meta, set_weights_result=FakeExtrinsicResponse(success=True))
+    wallet = AsyncMock()
+    wallet.hotkey.ss58_address = "hk_me"
+    with patch("affine.chain.asyncio.sleep", new_callable=AsyncMock):
+        result = await clear_weights(sub, wallet, netuid=1)
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_clear_weights_dry_run_skips_chain_call(monkeypatch):
+    monkeypatch.setenv("AFFINE_DRY_RUN", "1")
+    sub = _mock_sub()
+    wallet = AsyncMock()
+    result = await clear_weights(sub, wallet, netuid=1)
+    assert result is True
+    sub.set_weights.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_clear_weights_exception_returns_true_when_chain_already_clear():
+    meta = FakeMeta(["hk_me", "hk1"])
+    meta.W = [[0.0, 0.0], [0.0, 0.0]]
+    sub = _mock_sub(meta=meta)
+    sub.set_weights = AsyncMock(side_effect=RuntimeError("transport drop"))
+    wallet = AsyncMock()
+    wallet.hotkey.ss58_address = "hk_me"
+    with patch("affine.chain.asyncio.sleep", new_callable=AsyncMock):
+        result = await clear_weights(sub, wallet, netuid=1, retries=3)
+    assert result is True
+    assert sub.set_weights.call_count == 1
 
 
 @pytest.mark.asyncio

@@ -16,12 +16,10 @@ def _env_timeout(cfg: Config, name: str) -> int:
 def test_config_defaults():
     cfg = Config.from_env()
     assert cfg.dwell_batch == 1
-    assert cfg.k_init == 3.0
-    assert cfg.k_final == 1.0
-    assert cfg.k_halflife == 7200
-    assert cfg.sigma_beta == 1.0
-    assert cfg.sigma_alpha == 0.5
-    assert cfg.evidence_path.endswith("evidence.jsonl")
+    assert cfg.duel_pairs_per_env == 32
+    assert cfg.duel_min_discordant == 16
+    assert cfg.alpha_start == 0.005
+    assert cfg.alpha_final == 0.05
     assert [spec.name for spec in cfg.environments] == [
         "python", "nfa", "graph", "modular", "sudoku", "boolean", "tree",
     ]
@@ -34,25 +32,21 @@ def test_default_env_entrypoints_import():
 
 def test_config_env_overrides(monkeypatch):
     monkeypatch.setenv("AFFINE_DWELL_BATCH", "7")
-    monkeypatch.setenv("AFFINE_K_INIT", "2.5")
-    monkeypatch.setenv("AFFINE_K_FINAL", "0.8")
-    monkeypatch.setenv("AFFINE_K_HALFLIFE", "3600")
-    monkeypatch.setenv("AFFINE_SIGMA_BETA", "2.0")
-    monkeypatch.setenv("AFFINE_EVIDENCE_PATH", "/tmp/ev.jsonl")
+    monkeypatch.setenv("AFFINE_ALPHA_START", "0.01")
+    monkeypatch.setenv("AFFINE_ALPHA_FINAL", "0.1")
+    monkeypatch.setenv("AFFINE_ALPHA_HALFLIFE", "3600")
     cfg = Config.from_env()
     assert cfg.dwell_batch == 7
-    assert cfg.k_init == 2.5
-    assert cfg.k_final == 0.8
-    assert cfg.k_halflife == 3600
-    assert cfg.sigma_beta == 2.0
-    assert cfg.evidence_path == "/tmp/ev.jsonl"
+    assert cfg.alpha_start == 0.01
+    assert cfg.alpha_final == 0.1
+    assert cfg.alpha_halflife == 3600
 
 
 def test_config_json_override(monkeypatch, tmp_path):
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps({
         "dwell_batch": 12,
-        "k_init": 2.0,
+        "alpha_start": 0.02,
         "env_overrides": {
             "python": {"params": {"timeout": 45, "lines": 8}},
         },
@@ -60,7 +54,7 @@ def test_config_json_override(monkeypatch, tmp_path):
     monkeypatch.setenv("AFFINE_CONFIG_SPEC", str(spec_path))
     cfg = Config.from_env()
     assert cfg.dwell_batch == 12
-    assert cfg.k_init == 2.0
+    assert cfg.alpha_start == 0.02
     assert _env_timeout(cfg, "python") == 45
     py = [spec for spec in cfg.environments if spec.name == "python"][0]
     assert py.params["lines"] == 8
@@ -113,7 +107,6 @@ def test_config_missing_spec_path(monkeypatch):
 def test_config_smoke_profile(monkeypatch):
     monkeypatch.setenv("AFFINE_CONFIG_SPEC", "smoke")
     cfg = Config.from_env()
-    assert cfg.k_init == 1.0
     assert _env_timeout(cfg, "python") == 90
     assert cfg.environments[0].params["lines"] == 16
     assert _env_timeout(cfg, "nfa") == 90
@@ -129,7 +122,6 @@ def test_config_smoke_profile(monkeypatch):
 def test_config_full_profile(monkeypatch):
     monkeypatch.setenv("AFFINE_CONFIG_SPEC", "full")
     cfg = Config.from_env()
-    assert cfg.k_init == 3.0
     assert _env_timeout(cfg, "python") == 300
     assert _env_timeout(cfg, "boolean") == 300
     assert _env_timeout(cfg, "tree") == 300
@@ -138,24 +130,7 @@ def test_config_full_profile(monkeypatch):
 def test_config_default_profile(monkeypatch):
     monkeypatch.setenv("AFFINE_CONFIG_SPEC", "default")
     cfg = Config.from_env()
-    # default profile is a no-op overlay on Config.from_env() defaults
-    assert cfg.k_init == 3.0
     assert _env_timeout(cfg, "python") == 600
-
-
-@pytest.mark.parametrize("var,val,msg", [
-    ("AFFINE_SIGMA_ALPHA", "nan", "sigma_alpha"),
-    ("AFFINE_SIGMA_ALPHA", "inf", "sigma_alpha"),
-    ("AFFINE_SIGMA_BETA", "-1", "sigma_beta"),
-    ("AFFINE_K_INIT", "nan", "k_init"),
-    ("AFFINE_K_FINAL", "inf", "k_final"),
-    ("AFFINE_K_FINAL", "0", "k_final must be > 0"),
-    ("AFFINE_K_FINAL", "-0.5", "k_final must be > 0"),
-])
-def test_config_rejects_non_finite_or_nonpositive(monkeypatch, var, val, msg):
-    monkeypatch.setenv(var, val)
-    with pytest.raises(ValueError, match=msg):
-        Config.from_env()
 
 
 def test_config_rejects_empty_environments():
@@ -277,3 +252,9 @@ def test_config_rejects_invalid_task_range(task_range):
     ),))
     with pytest.raises(ValueError, match="task_range"):
         _validate(cfg)
+
+
+def test_config_json_rejects_dry_run_override():
+    from affine.config import _apply_json_overrides
+    with pytest.raises(KeyError, match="dry_run"):
+        _apply_json_overrides(Config(), {"dry_run": True})

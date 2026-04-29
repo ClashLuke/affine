@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -19,7 +20,7 @@ import typer
 from affine.chain import Miner
 from affine.config import Config, ENV_REGISTRY
 from affine.loop import run, static_chain
-from affine.vllm import FixedSlots
+from affine.vllm import Slot, SlotProvisionFailed, health_ping
 
 app = typer.Typer(help="Affine local development CLI.")
 log = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ def sample(
     env: Annotated[list[str], typer.Option()] = [],
     env_timeout: int = 120,
     dwell: int = 10,
-    evidence_path: str = "./.affine/local-evidence.jsonl",
+    db_path: str = "./.affine/local-affine.sqlite3",
     log_level: str = "INFO",
 ):
     """Active-sample a pool of local vLLM slots. Stops on SIGINT."""
@@ -73,9 +74,29 @@ def sample(
     pairs = _load_miners(miners_file, model_id, model_url)
     miners = [m for m, _ in pairs]
     url_map = {(m.model, m.revision): url for m, url in pairs}
+    os.environ["AFFINE_DRY_RUN"] = "1"
+    os.environ["AFFINE_BASELINE_MODEL"] = miners[0].model
+    os.environ["AFFINE_BASELINE_REVISION"] = miners[0].revision
 
-    cfg = Config(environments=environments, evidence_path=evidence_path, dwell_batch=dwell)
-    asyncio.run(run(cfg, static_chain(miners), FixedSlots(url_map)))
+    class _Slots:
+        def __init__(self, urls: dict):
+            self._urls = urls
+        async def provision(self, model: str, revision: str, **_kw) -> Slot:
+            url = self._urls.get((model, revision))
+            if url is None:
+                raise SlotProvisionFailed(f"no url for {model}@{revision}")
+            if not await health_ping(url):
+                raise SlotProvisionFailed(f"unhealthy: {url}")
+            return Slot(model=model, revision=revision, base_url=url, slot_id=f"fixed-{url}", name=f"fixed-{url}")
+        async def teardown(self, slot: Slot) -> None:
+            pass
+
+    cfg = Config(
+        environments=environments,
+        db_path=db_path,
+        dwell_batch=dwell,
+    )
+    asyncio.run(run(cfg, static_chain(miners), _Slots(url_map)))
 
 
 if __name__ == "__main__":

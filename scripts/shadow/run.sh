@@ -42,28 +42,33 @@ log "installing affine + deps into $VENV"
 
 # --- sanity check imports ---
 "$VENV/bin/python" - <<'PY' || exit 1
-from targon import Client, App, Image, Compute
+from targon import App, Image, Compute
+from targon.client.client import Client
 assert Compute.H200_SMALL == "h200-small", Compute.H200_SMALL
 print("targon-sdk OK; H200_SMALL =", Compute.H200_SMALL)
 PY
 
 # --- env for the shadow run ---
 export AFFINE_DRY_RUN=1
-export LOG_LEVEL="${LOG_LEVEL:-DEBUG}"
+export AFFINE_DB_PATH="$SHADOW_DIR/affine.sqlite3"
+export AFFINE_NAMESPACE="shadow"
+export LOG_LEVEL="${LOG_LEVEL:-INFO}"
 export NETUID="${NETUID:-120}"
 export SUBTENSOR_ENDPOINT="${SUBTENSOR_ENDPOINT:-finney}"
 export BT_WALLET_COLD="${BT_WALLET_COLD:-default}"
 export BT_WALLET_HOT="${BT_WALLET_HOT:-default}"
-export AFFINE_CONFIG_SPEC="${AFFINE_CONFIG_SPEC:-$SHADOW_DIR/config.json}"
+if [ -f "$SHADOW_DIR/config.json" ]; then
+    export AFFINE_CONFIG_SPEC="$SHADOW_DIR/config.json"
+fi
 export AFFINE_PROVISION_TIMEOUT="${AFFINE_PROVISION_TIMEOUT:-1200}"
+unset AFFINE_LOCAL CHAMPION_URL CHALLENGER_URL
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-export AFFINE_SHADOW_LOG="$SHADOW_DIR/duels-$TS.jsonl"
 STDERR_LOG="$SHADOW_DIR/stderr-$TS.log"
 
-log "shadow JSONL:  $AFFINE_SHADOW_LOG"
+log "shadow DB:     $AFFINE_DB_PATH"
 log "shadow stderr: $STDERR_LOG"
-log "config: NETUID=$NETUID SUBTENSOR=$SUBTENSOR_ENDPOINT SPEC=$AFFINE_CONFIG_SPEC wallet=$BT_WALLET_COLD/$BT_WALLET_HOT"
+log "config: NETUID=$NETUID SUBTENSOR=$SUBTENSOR_ENDPOINT SPEC=${AFFINE_CONFIG_SPEC:-default} wallet=$BT_WALLET_COLD/$BT_WALLET_HOT"
 
 # --- launch ---
 # Prepend venv bin so the `targon` subprocess invoked by TargonSlots resolves

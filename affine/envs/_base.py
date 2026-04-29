@@ -123,7 +123,10 @@ class ExactAnswerEnv(Env):
         raise NotImplementedError
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
-        overrides = {k: v for k, v in (options or {}).items() if k in self.option_keys}
+        overrides = dict(options or {})
+        unknown = set(overrides) - self.option_keys
+        if unknown:
+            raise ValueError(f"{type(self).__name__}: unknown reset options: {sorted(unknown)}")
         params = self.validate_options({**self.options, **overrides})
         challenge, info_extra = self._generate(params, random.Random(0 if seed is None else seed))
         self._answer = self.parse_answer(self._target)

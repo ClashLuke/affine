@@ -202,7 +202,7 @@ async def set_weights(
     # Uid recycling: a deregistered hotkey's slot can be taken over by a fresh
     # registration with a different hotkey. Without this guard we'd weight the
     # new occupant — a different miner — instead of who we elected. Caller
-    # passes the hotkey we elected against; mismatch aborts and re-elects.
+    # passes the hotkey we selected; mismatch aborts so the loop can burn.
     if expected_hotkey is not None and meta.hotkeys[winner_uid] != expected_hotkey:
         log.warning(
             f"winner uid {winner_uid} hotkey mismatch: expected {expected_hotkey[:8]} "
@@ -240,6 +240,38 @@ async def set_weights(
     return False
 
 
+async def clear_weights(sub: Subtensor, wallet, netuid: int, retries: int = 3) -> bool:
+    if _truthy_env("AFFINE_DRY_RUN"):
+        log.info("DRY RUN — would clear weights (baseline/no payable winner)")
+        return True
+    for attempt in range(retries):
+        try:
+            ok = await sub.set_weights(
+                wallet=wallet, netuid=netuid,
+                # Bittensor converts an all-zero vector to empty dests/weights.
+                # Passing a dummy uid avoids min([]) in the client-side converter.
+                uids=[0], weights=[0.0],
+                wait_for_inclusion=True, wait_for_finalization=True,
+            )
+        except Exception as e:
+            log.error(f"clear_weights raised (attempt {attempt + 1}/{retries}): {e}; verifying on chain")
+            if await _confirm_no_weights(sub, netuid, wallet.hotkey.ss58_address):
+                log.info("on-chain weights already clear; treating as success")
+                return True
+            return False
+        log.debug(f"clear_weights response: success={ok.success} message={ok.message}")
+        if ok.success:
+            if await _confirm_no_weights(sub, netuid, wallet.hotkey.ss58_address):
+                log.info("weights cleared: no payable winner")
+                return True
+            log.warning("clear_weights accepted but on-chain row is not clear yet")
+            return False
+        log.warning(f"clear_weights rejected (attempt {attempt + 1}/{retries}): {ok.message}")
+        if attempt < retries - 1:
+            await asyncio.sleep(60)
+    return False
+
+
 async def _confirm_on_chain(sub: Subtensor, netuid: int, my_hotkey: str,
                              winner_uid: int, settle_s: float = 12.0) -> bool:
     """Best-effort: did our last set_weights actually land? Re-read metagraph and
@@ -266,4 +298,24 @@ async def _confirm_on_chain(sub: Subtensor, netuid: int, my_hotkey: str,
         return float(row[winner_uid]) >= 0.99
     except Exception as e:
         log.warning(f"on-chain weight verification failed: {e}")
+        return False
+
+
+async def _confirm_no_weights(sub: Subtensor, netuid: int, my_hotkey: str,
+                              settle_s: float = 12.0) -> bool:
+    try:
+        await asyncio.sleep(settle_s)
+        meta = await sub.metagraph(netuid)
+        my_uid = next((i for i, h in enumerate(meta.hotkeys) if h == my_hotkey), None)
+        if my_uid is None:
+            return False
+        W = getattr(meta, "W", None)
+        if W is None or my_uid >= len(W):
+            return False
+        row = W[my_uid]
+        if hasattr(row, "tolist"):
+            row = row.tolist()
+        return not row or max(float(w) for w in row) <= 1e-6
+    except Exception as e:
+        log.warning(f"on-chain clear-weight verification failed: {e}")
         return False

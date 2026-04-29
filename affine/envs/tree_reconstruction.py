@@ -191,7 +191,10 @@ class TreeReconstructionEnv(Env):
     SUBMIT_RE = re.compile(r"^SUBMIT(?:\s+(?P<body>.*))?$", re.I)
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
-        overrides = {k: v for k, v in (options or {}).items() if k in self.option_keys}
+        overrides = dict(options or {})
+        unknown = set(overrides) - self.option_keys
+        if unknown:
+            raise ValueError(f"TreeReconstructionEnv: unknown reset options: {sorted(unknown)}")
         cfg = self.validate_options({**self.options, **overrides})
         self._n = cfg["n"]
         self._method = cfg["method"]

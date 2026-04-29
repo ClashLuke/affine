@@ -129,17 +129,12 @@ async def _chat(slot, obs, params: dict, seed: int) -> dict:
     return data
 
 
-async def _legacy_eval(env_wrapper, params: dict, slot, seed: int, task_id: int):
-    return await env_wrapper.evaluate(
-        model=slot.model, base_url=slot.base_url,
-        seed=seed, task_id=task_id, **params,
-    )
-
-
 async def _gym_eval(env_wrapper, params: dict, slot, seed: int, task_id: int):
     env = env_wrapper.make() if hasattr(env_wrapper, "make") else env_wrapper
+    env_keys = getattr(type(env), "option_keys", frozenset())
+    env_options = {k: v for k, v in params.items() if k in env_keys}
     try:
-        obs, reset_info = await _maybe_await(env.reset(seed=task_id, options=params))
+        obs, reset_info = await _maybe_await(env.reset(seed=task_id, options=env_options))
         reset_max = reset_info.get("max_turns") if isinstance(reset_info, dict) else None
         param_max = params.get("gym_max_steps")
         if reset_max is None:
@@ -215,8 +210,6 @@ async def run_one(
     as miner losses.
     """
     async def _call():
-        if hasattr(env_wrapper, "evaluate"):
-            return await _legacy_eval(env_wrapper, params, slot, seed, task_id)
         return await _gym_eval(env_wrapper, params, slot, seed, task_id)
     t0 = time.monotonic()
     task = asyncio.create_task(_call())
@@ -249,15 +242,6 @@ async def run_one(
         return None, dt, 0
     if not isinstance(r, dict):
         log.warning(f"infra failure ({slot.model}) in {dt:.2f}s — non-dict response: {str(r)[:200]}")
-        return None, dt, 0
-    if r.get("status") == "failed":
-        log.warning(f"infra failure ({slot.model}) in {dt:.2f}s: wrapper status=failed: {str(r.get('error', ''))[:200]}")
-        return None, dt, 0
-    if (err := r.get("error_type")) is not None:
-        if err == "timeout":
-            log.warning(f"sample timeout ({slot.model}) in {dt:.2f}s: {str(r.get('error', ''))[:200]}")
-            return False, dt, 0
-        log.warning(f"infra failure ({slot.model}) in {dt:.2f}s, error_type={err}: {str(r.get('error', ''))[:200]}")
         return None, dt, 0
     tok = _tokens(r)
     if isinstance(r.get("success"), bool):

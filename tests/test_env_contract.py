@@ -14,5 +14,6 @@ def test_reset_info_does_not_expose_answers():
     }
     for name, spec in ENV_REGISTRY.items():
         env = EnvFactory(spec.entrypoint).make()
-        _prompt, info = env.reset(seed=0, options=spec.params)
+        env_options = {k: v for k, v in spec.params.items() if k in env.option_keys}
+        _prompt, info = env.reset(seed=0, options=env_options)
         assert forbidden[name].isdisjoint(info), (name, info)

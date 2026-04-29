@@ -12,6 +12,10 @@ from affine.vllm import LocalSlots, Slot, SlotProvisionFailed, TargonSlots, heal
 HOTKEY = "test-hotkey"
 
 
+class _ExecCalled(Exception):
+    pass
+
+
 class _ClientFactory:
     def __init__(self, responses=None):
         self.responses = list(responses or [])
@@ -82,6 +86,63 @@ class _FakeHttp:
     async def _async_delete(self, path):
         self.deletes.append(path)
         return self.delete_resp or {}
+
+
+def test_vllm_entrypoint_forwards_hf_revision(monkeypatch):
+    import sys
+    from affine import vllm_entrypoint
+
+    captured = {}
+    monkeypatch.setattr(sys, "argv", [
+        "entrypoint", "--source", "hf", "--model", "model/a",
+        "--revision", "sha", "--served-model-name", "model/a",
+        "--", "--host", "0.0.0.0",
+    ])
+    def fake_execvp(prog, argv):
+        captured.update(prog=prog, argv=argv)
+        raise _ExecCalled
+    monkeypatch.setattr(vllm_entrypoint.os, "execvp", fake_execvp)
+
+    with pytest.raises(_ExecCalled):
+        vllm_entrypoint.main()
+
+    argv = captured["argv"]
+    assert argv[:5] == ["python", "-m", "vllm.entrypoints.openai.api_server", "--model", "model/a"]
+    assert argv[argv.index("--revision") + 1] == "sha"
+    assert "--host" in argv
+
+
+def test_vllm_entrypoint_restores_s3_without_revision_arg(monkeypatch, tmp_path):
+    import sys
+    from affine import vllm_entrypoint
+
+    captured = {}
+    monkeypatch.setenv("AFFINE_MODEL_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", [
+        "entrypoint", "--source", "s3", "--model", "model/a",
+        "--revision", "sha", "--served-model-name", "model/a",
+        "--manifest-key", "manifest.json", "--", "--host", "0.0.0.0",
+    ])
+    monkeypatch.setattr(vllm_entrypoint, "restore_from_env",
+                        lambda manifest, dest: captured.update(manifest=manifest, dest=dest))
+    def fake_execvp(prog, argv):
+        captured.update(prog=prog, argv=argv)
+        raise _ExecCalled
+    monkeypatch.setattr(vllm_entrypoint.os, "execvp", fake_execvp)
+
+    with pytest.raises(_ExecCalled):
+        vllm_entrypoint.main()
+
+    argv = captured["argv"]
+    assert captured["manifest"] == "manifest.json"
+    assert captured["dest"] == tmp_path / "model__a"
+    assert argv[argv.index("--model") + 1] == str(tmp_path / "model__a")
+    assert "--revision" not in argv
+
+
+def test_targon_client_import_path():
+    from targon.client.client import Client
+    assert Client is not None
 
 
 @pytest.mark.asyncio
@@ -189,6 +250,101 @@ async def test_targon_provision_registers_deploys_and_returns_slot_when_ready():
     assert register_body["ports"] == [{"port": 8000, "protocol": "TCP"}]
     assert "--enable-prefix-caching" in register_body["args"]
     assert deploy_path == "/tha/v2/workloads/wl-123/deploy"
+
+
+@pytest.mark.asyncio
+async def test_targon_hf_source_with_custom_image_runs_vllm_directly(monkeypatch):
+    monkeypatch.setenv("AFFINE_VLLM_IMAGE", "registry/affine-vllm:sha")
+    http = _FakeHttp(
+        register_resp={"uid": "wl-hf"},
+        state_responses=[{"urls": [{"port": 8000, "url": "http://rental.host"}]}],
+    )
+    factory = _ClientFactory([SimpleNamespace(status_code=200)])
+    with patch("affine.vllm._http", return_value=http), patch(
+        "affine.vllm.httpx.AsyncClient", factory,
+    ), patch("affine.vllm.asyncio.sleep", AsyncMock()):
+        await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).provision(
+            "model/a", "sha", timeout=10, source="hf",
+        )
+
+    body = http.posts[0][1]
+    assert body["image"] == "registry/affine-vllm:sha"
+    assert body["commands"] == ["python", "-m", "vllm.entrypoints.openai.api_server"]
+    assert body["args"][:6] == ["--model", "model/a", "--revision", "sha", "--served-model-name", "model/a"]
+    assert "--host" in body["args"]
+
+
+@pytest.mark.asyncio
+async def test_targon_payload_includes_private_registry_auth(monkeypatch):
+    monkeypatch.setenv("AFFINE_VLLM_IMAGE", "registry.example.com/affine-vllm:sha")
+    monkeypatch.setenv("AFFINE_VLLM_REGISTRY_SERVER", "registry.example.com")
+    monkeypatch.setenv("AFFINE_VLLM_REGISTRY_USERNAME", "user")
+    monkeypatch.setenv("AFFINE_VLLM_REGISTRY_PASSWORD", "pass")
+    http = _FakeHttp(
+        register_resp={"uid": "wl-auth"},
+        state_responses=[{"urls": [{"port": 8000, "url": "http://rental.host"}]}],
+    )
+    factory = _ClientFactory([SimpleNamespace(status_code=200)])
+    with patch("affine.vllm._http", return_value=http), patch(
+        "affine.vllm.httpx.AsyncClient", factory,
+    ), patch("affine.vllm.asyncio.sleep", AsyncMock()):
+        await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).provision(
+            "model/a", "sha", timeout=10,
+        )
+
+    assert http.posts[0][1]["registry_auth"] == {
+        "server": "registry.example.com",
+        "username": "user",
+        "password": "pass",
+    }
+
+
+@pytest.mark.asyncio
+async def test_targon_registry_auth_requires_complete_config(monkeypatch):
+    monkeypatch.setenv("AFFINE_VLLM_IMAGE", "registry.example.com/affine-vllm:sha")
+    monkeypatch.setenv("AFFINE_VLLM_REGISTRY_SERVER", "registry.example.com")
+    monkeypatch.delenv("AFFINE_VLLM_REGISTRY_USERNAME", raising=False)
+    monkeypatch.delenv("AFFINE_VLLM_REGISTRY_PASSWORD", raising=False)
+    with pytest.raises(RuntimeError, match="AFFINE_VLLM_REGISTRY"):
+        await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).provision(
+            "model/a", "sha", timeout=10,
+        )
+
+
+@pytest.mark.asyncio
+async def test_targon_s3_source_requires_affine_vllm_image(monkeypatch):
+    monkeypatch.delenv("AFFINE_VLLM_IMAGE", raising=False)
+    with pytest.raises(RuntimeError, match="AFFINE_VLLM_IMAGE"):
+        await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).provision(
+            "model/a", "rev1", timeout=1, source="s3", backup_manifest_key="[]",
+        )
+
+
+@pytest.mark.asyncio
+async def test_targon_s3_source_uses_affine_image_args(monkeypatch):
+    monkeypatch.setenv("AFFINE_VLLM_IMAGE", "registry/affine-vllm:sha")
+    monkeypatch.setenv("R2_S3_ACCESS_KEY_ID", "ak")
+    monkeypatch.setenv("R2_S3_SECRET_ACCESS_KEY", "sk")
+    monkeypatch.setenv("R2_S3_BUCKET", "bucket")
+    monkeypatch.setenv("R2_S3_ENDPOINT_URL", "https://acct.r2.cloudflarestorage.com")
+    http = _FakeHttp(
+        register_resp={"uid": "wl-s3"},
+        state_responses=[{"urls": [{"port": 8000, "url": "http://rental.host"}]}],
+    )
+    factory = _ClientFactory([SimpleNamespace(status_code=200)])
+    with patch("affine.vllm._http", return_value=http), patch(
+        "affine.vllm.httpx.AsyncClient", factory,
+    ), patch("affine.vllm.asyncio.sleep", AsyncMock()):
+        await TargonSlots(SimpleNamespace(), hotkey=HOTKEY).provision(
+            "model/a", "sha", timeout=10, source="s3", backup_manifest_key="[]",
+        )
+
+    body = http.posts[0][1]
+    assert body["image"] == "registry/affine-vllm:sha"
+    assert "commands" not in body
+    assert body["args"][:8] == [
+        "--source", "s3", "--model", "model/a", "--revision", "sha", "--served-model-name", "model/a",
+    ]
 
 
 @pytest.mark.asyncio
@@ -329,6 +485,14 @@ def test_targon_prefix_targon_safe():
     import re
     s = TargonSlots(SimpleNamespace(), hotkey="5C4iP8XYZ")
     assert re.fullmatch(r"af[0-9a-f]{6}", s._prefix), s._prefix
+
+
+def test_targon_prefix_includes_namespace(monkeypatch):
+    monkeypatch.setenv("AFFINE_NAMESPACE", "prod")
+    prod = TargonSlots(SimpleNamespace(), hotkey="5Hotkey")._prefix
+    monkeypatch.setenv("AFFINE_NAMESPACE", "shadow")
+    shadow = TargonSlots(SimpleNamespace(), hotkey="5Hotkey")._prefix
+    assert prod != shadow
 
 
 @pytest.mark.asyncio

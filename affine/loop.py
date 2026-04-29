@@ -1,29 +1,8 @@
-"""Pairwise king-of-the-hill validator loop backed by a global 2PL IRT fit.
+"""SQLite-backed king-of-the-hill validator loop.
 
-The champion reigns until a challenger statistically proves superiority.
-
-Each outer iteration:
-
-  1. Read miners. If the champion is unknown or no longer registered, elect
-     argmax(θ̂) from the global fit and publish them.
-  2. Pick the lowest-block challenger not yet attempted this reign.
-  3. Provision king and challenger on two slots in parallel.
-  4. Dwell: keep `cfg.dwell_batch` matched-task pairs in flight; for each
-     pick, choose the env maximizing Fisher info for the contrast
-     (θ_chal − θ_king), sample both models concurrently, append two rows,
-     refit. The posterior sharpens as evidence accrues. Exits only on
-     principled stops: z > k (dethrone), z < −k (chal can't recover under
-     unbounded future info), shutdown, or one side's endpoint is
-     persistently dead (≥ SLOT_DEAD consec same-side delivery failures).
-     No budget cap.
-  5. Teardown. Contrast z = (θ̂_chal − θ̂_king) / √Var against a ratcheting
-     threshold k(reign). If z > k, challenger dethrones; reset the reign
-     block; publish. Else champion holds; try the next challenger.
-
-Evidence rows are the durable unit of contribution. Validators contribute
-independent rows (validator-private seeds); a single global IRT fit over all
-rows produces θ̂ and its Laplace covariance, which drives both env selection
-and the dethronement test.
+A two-slot state machine: one active champion, one challenger, a fixed balanced
+task schedule, full paired evidence in SQLite, and an exact one-sided
+paired/binomial dethrone rule.
 """
 
 from __future__ import annotations
@@ -34,26 +13,27 @@ import logging
 import os
 import secrets
 import signal
-from dataclasses import asdict, dataclass
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
 import httpx
-import numpy as np
+from huggingface_hub.errors import RepositoryNotFoundError, RevisionNotFoundError
 
-from .audit import audit
-from .chain import Miner, Subtensor, _tiebreak, _truthy_env, get_miners, set_weights
+from .backup import BackupManager, S3Config
+from .chain import Miner, Subtensor, _tiebreak, _truthy_env, clear_weights, get_miners, set_weights
 from .config import BASELINE_MODELS, Config
 from .envs import EnvFactory
-from .evidence import EvidenceStore, Row, atomic_append
-from .irt import Fit, Priors, compute_k, fisher_env, fit_2pl
+from .paired import PairCounts, PairDecision, alpha_for_reign, decide_paired, pair_p_value
 from .sampler import run_one
-from .verdict import ArtKey, Dethrone, DuelStatus, Hold, Skip, VerdictEvidence, decide
+from .store import BackupRecord, Champion, PairSample, Store, artifact_id
 from .vllm import Slot, SlotProvisionFailed, TargonSlots
 
 log = logging.getLogger(__name__)
 
-SLOT_DEAD = 30   # consecutive same-slot delivery failures → abort dwell, reprovision
+ArtKey = tuple[str, str]
+SLOT_DEAD = 30   # consecutive same-slot delivery failures → abort duel, reprovision
 
 
 @dataclass
@@ -63,163 +43,8 @@ class Chain:
     list_miners: Callable[[], Awaitable[list[Miner]]]
     current_block: Callable[[], Awaitable[int]]
     publish_winner: Callable[[int, str], Awaitable[bool]]
-
-
-def art_key(m: Miner) -> ArtKey:
-    return (m.model, m.revision)
-
-
-class MinerStates:
-    """`durable` (disk-backed JSONL) is per-(uid, art_key): vLLM crashed loading
-    this artifact. Per-uid so a fresh uid that re-commits a known-broken artifact
-    gets one shot before being marked itself. `attempted` (in-memory) is
-    per-art_key: deduplicating multi-uid-per-artifact wastes — IRT pools evidence
-    by art_key, so one duel's worth is sufficient regardless of how many uids
-    share the artifact. Cleared on reign change or queue exhaustion. UNTRIED is
-    the implicit default (no record either side)."""
-    def __init__(self, excluded_models: set[str] = frozenset(),
-                 path: str | Path | None = None):
-        self._durable: set[tuple[int, ArtKey]] = set()
-        self._attempted: set[ArtKey] = set()
-        self._excluded_models = set(excluded_models)
-        self.path = Path(path) if path else None
-        if self.path and self.path.exists():
-            skipped = 0
-            for line in self.path.read_text().splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    d = json.loads(line)
-                    self._durable.add((int(d["uid"]), (d["model"], d["revision"])))
-                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                    skipped += 1
-            if self._durable or skipped:
-                log.info(f"states: loaded {len(self._durable)} durable entries"
-                         f"{f' (skipped {skipped} malformed lines)' if skipped else ''} from {self.path}")
-
-    def mark_durable(self, uid: int, k: ArtKey, reason: str) -> None:
-        if (uid, k) in self._durable:
-            return
-        # Disk first, memory second — a failed write must not leave us thinking
-        # we persisted a skip we'll lose on restart.
-        if self.path:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            payload = json.dumps({"uid": uid, "model": k[0],
-                                   "revision": k[1], "reason": reason}) + "\n"
-            atomic_append(self.path, payload.encode())
-        self._durable.add((uid, k))
-        log.info(f"durable: uid{uid} {k[0]}@{k[1]} ({reason})")
-
-    def mark_attempted(self, k: ArtKey) -> None:
-        self._attempted.add(k)
-
-    def is_attempted(self, k: ArtKey) -> bool:
-        return k in self._attempted
-
-    def is_durable(self, uid: int, k: ArtKey) -> bool:
-        return (uid, k) in self._durable
-
-    def filter(self, miners: list[Miner]) -> list[Miner]:
-        return [m for m in miners
-                if m.model not in self._excluded_models
-                and (m.uid, art_key(m)) not in self._durable]
-
-    def clear_attempted(self) -> None:
-        self._attempted.clear()
-
-
-def _row_art(r: Row, by_uid_rev: dict[tuple[int, str], Miner]) -> ArtKey:
-    """Resolve a row to its artifact key. New rows carry `k` (model) directly;
-    legacy rows fall back to (1) the current miner with (uid, revision), (2) a
-    per-uid ghost so two retired uids that happened to share a `revision` string
-    never accidentally pool. Ghost evidence still informs env parameters."""
-    if r.k is not None:
-        return (r.k, r.r)
-    m = by_uid_rev.get((r.m, r.r))
-    if m is not None:
-        return (m.model, r.r)
-    return (f"?ghost:{r.m}:{r.r}", r.r)
-
-
-def _respondents(miners: list[Miner], rows: list[Row]) -> list[ArtKey]:
-    """Registered artifacts first; historical ghosts at the tail so their evidence
-    still informs env parameters even after a re-commit replaces them. Two miners
-    sharing the same (model, revision) collapse to a single respondent."""
-    by_uid_rev = {(m.uid, m.revision): m for m in miners}
-    keys: list[ArtKey] = []
-    seen: set[ArtKey] = set()
-    for m in miners:
-        k = art_key(m)
-        if k not in seen:
-            keys.append(k); seen.add(k)
-    for r in rows:
-        k = _row_art(r, by_uid_rev)
-        if k not in seen:
-            keys.append(k); seen.add(k)
-    return keys
-
-
-def _init_x_from_prev(prev_fit: Fit | None, prev_keys: list[ArtKey], prev_envs: list[str],
-                       cur_keys: list[ArtKey], cur_envs: list[str]) -> np.ndarray | None:
-    if prev_fit is None or prev_fit.degenerate:
-        return None
-    n_m, n_e = len(cur_keys), len(cur_envs)
-    theta = np.zeros(n_m); beta = np.zeros(n_e); alpha = np.zeros(n_e)
-    pk = {k: i for i, k in enumerate(prev_keys)}
-    pe = {n: i for i, n in enumerate(prev_envs)}
-    for i, k in enumerate(cur_keys):
-        if k in pk: theta[i] = prev_fit.theta[pk[k]]
-    for j, e in enumerate(cur_envs):
-        if e in pe:
-            beta[j] = prev_fit.beta[pe[e]]
-            alpha[j] = prev_fit.alpha[pe[e]]
-    return np.concatenate([theta, beta, alpha])
-
-
-def _fit(rows: list[Row], miners: list[Miner], env_names: list[str],
-         priors: Priors, init_x: np.ndarray | None = None) -> Fit:
-    """Drops envs whose every observed outcome is identical (all-pass or all-fail)
-    from the fit data — they tighten the contrast SE based on Hessian mass that
-    has no per-miner discrimination. Filtered envs keep their slot in the returned
-    Fit at the prior (β=α=0).
-
-    Acquisition (fisher_env) is *not* told to mask these — degeneracy is the
-    posterior's job to express via wide marginals. Masking them at acquisition
-    time is what triggers "all envs quarantined at i=0" when an early run of
-    coincidental pass-pass on every env temporarily makes every env all-same:
-    we'd then refuse to ever sample those envs again, denying ourselves the one
-    fail that would un-degenerate them."""
-    keys = _respondents(miners, rows)
-    k2i = {k: i for i, k in enumerate(keys)}
-    e2i = {n: i for i, n in enumerate(env_names)}
-    by_uid_rev = {(m.uid, m.revision): m for m in miners}
-    outcomes: dict[str, set[int]] = {}
-    pairs: dict[tuple[str, int, int], list[float]] = {}
-    for r in rows:
-        if r.e in e2i:
-            outcomes.setdefault(r.e, set()).add(r.p)
-        pairs.setdefault((r.e, r.t, r.i), []).append(r.l)
-    drop = {n for n, outs in outcomes.items() if len(outs) < 2}
-    # Any pair with a synthetic (l=0) row is dropped from the fit. The l=0 row
-    # encodes a non-timeout infra failure, which under "we own vLLM/env/network"
-    # is validator-attributable, not miner-attributable: vLLM crashes are our
-    # config, env containers are our infra, Targon proxy 5xx is our network.
-    # Single-side synth (one l=0, one l>0) used to feed the gaming defense
-    # against selective miner crashes — but the same signal also biases the
-    # contrast against an incumbent during asymmetric Targon flake. Today's
-    # uid65→uid206 incident: 23s of HTTP 502 from king's URL produced 20
-    # king_synth+chal_pass pairs that shifted z from +2.54 (Hold) to +2.92
-    # (Dethrone). The on-disk synth rows remain for audit; the fit ignores
-    # them. Real miner-side timeouts are still classified as False (real l>0
-    # row, p=0) by the sampler and survive this filter.
-    synth = {g for g, ls in pairs.items() if any(l == 0.0 for l in ls)}
-    filtered = [r for r in rows if r.e in e2i and r.e not in drop
-                and (r.e, r.t, r.i) not in synth]
-    m_idx = np.fromiter((k2i[_row_art(r, by_uid_rev)] for r in filtered),
-                        dtype=np.intp, count=len(filtered))
-    e_idx = np.fromiter((e2i[r.e] for r in filtered), dtype=np.intp, count=len(filtered))
-    y = np.fromiter((r.p for r in filtered), dtype=np.float64, count=len(filtered))
-    return fit_2pl(m_idx, e_idx, y, len(keys), len(env_names), priors, init_x=init_x)
+    burn_weights: Callable[[], Awaitable[bool]] | None = None
+    uid_matches_hotkey: Callable[[int, str], Awaitable[bool]] | None = None
 
 
 async def _load_envs(cfg: Config) -> dict[str, tuple]:
@@ -314,27 +139,16 @@ def _install_signal_handlers(stop: asyncio.Event) -> None:
             signal.signal(sig, lambda *_args, request_stop=request_stop: request_stop())
 
 
-def _slot_from_task(t: asyncio.Task) -> Slot | None:
-    """Extract the slot from a task wrapping `_provision`. Returns None for any
-    not-clean state (still running, cancelled, raised). The not-done guard is
-    load-bearing: t.exception() raises InvalidStateError on a running task,
-    which can happen if `_cleanup`'s drain await is interrupted."""
-    if not t.done() or t.cancelled() or t.exception() is not None: return None
-    return t.result()[0]
-
-
-async def _provision(slots, miner: Miner, stop: asyncio.Event) -> tuple[Slot | None, str]:
+async def _provision(slots, miner: Miner, stop: asyncio.Event, **kwargs) -> tuple[Slot | None, str]:
     """Returns (slot|None, status). `crashloop` is the only miner-fault signal —
     vLLM crashed loading the artifact. `timeout`/`transient`/`error` are our
-    infrastructure (we picked the resource, image, timeout). The slot is *not*
-    further probed here: a `/chat/completions` health check is our test of our
-    slot, and a failure would conflate orchestration with miner fault. A slot
-    that provisions but can't actually serve produces no rows for that side;
-    SLOT_DEAD aborts the dwell and the outer loop reprovisions or marks
-    durable as appropriate."""
+    infrastructure (we picked the resource, image, timeout). A slot that
+    provisions but can't actually serve produces no rows for that side; the
+    duel's per-side SLOT_DEAD counter aborts the duel and the outer loop
+    reprovisions."""
     try:
         slot = await _cancellable(
-            slots.provision(miner.model, miner.revision), stop,
+            slots.provision(miner.model, miner.revision, **kwargs), stop,
             on_orphan=lambda s: _safe_teardown(slots, s, "provision-orphan"),
         )
     except SlotProvisionFailed as e:
@@ -352,93 +166,6 @@ async def _provision(slots, miner: Miner, stop: asyncio.Event) -> tuple[Slot | N
         log.error(f"provision error uid {miner.uid}: {e}")
         return None, "error"
     return slot, "ok"
-
-
-def _apply_skip(states: MinerStates, miner: Miner, status: str, *, is_king: bool) -> None:
-    """crashloop → durable (miner fault). Other non-king → attempted at
-    provision time, so the queue advances regardless of duel outcome. King
-    isn't queued; non-crashloop is a no-op."""
-    if status == "crashloop":
-        states.mark_durable(miner.uid, art_key(miner), reason=status)
-    elif not is_king:
-        states.mark_attempted(art_key(miner))
-
-
-async def _provision_pair(slots, king: Miner, chal: Miner, states: MinerStates,
-                          stop: asyncio.Event,
-                          ) -> tuple[Slot | None, Slot | None, bool]:
-    """Provision king and challenger concurrently with fail-fast cancellation.
-
-    Returns `(king_slot, chal_slot, king_attempt_failed)`. `king_attempt_failed`
-    is True iff king's provision ran to completion with a non-ok status (False
-    if king was cancelled because chal failed first). `_apply_skip` runs for both
-    miners; chal status doesn't propagate.
-
-    If the first finisher fails to produce a slot, the duel is dead — cancel the
-    sibling rather than wait out a 15-min Targon provision we'll discard. On
-    outer cancellation, drain pending tasks and teardown any completed slot;
-    gather() otherwise drops survivors and leaks rentals.
-    """
-    t_k = asyncio.create_task(_provision(slots, king, stop))
-    t_c = asyncio.create_task(_provision(slots, chal, stop))
-    tasks = (t_k, t_c)
-
-    async def _cleanup(reason: str, drain: bool = False) -> None:
-        if drain:
-            for t in tasks:
-                if not t.done(): t.cancel()
-            for t in tasks:
-                try: await asyncio.shield(t)
-                except BaseException as e:
-                    log.warning(f"_provision_pair drain interrupted ({type(e).__name__}); rental may leak")
-        for t in tasks:
-            if (slot := _slot_from_task(t)) is not None:
-                await _safe_teardown(slots, slot, reason)
-
-    pending = set(tasks)
-    fail_fast = False
-    try:
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for t in done:
-                if t.cancelled() or t.exception() is not None: continue
-                if t.result()[0] is None and pending:
-                    fail_fast = True
-                    for p in pending: p.cancel()
-    except asyncio.CancelledError:
-        await asyncio.shield(_cleanup("outer-cancelled", drain=True))
-        raise
-
-    # Outer-cancel during inner provision (stop fired): tasks ended cancelled
-    # but we didn't trigger fail_fast.
-    outer_cancelled = not fail_fast and any(t.cancelled() for t in tasks)
-
-    try:
-        for t, m, is_king in ((t_k, king, True), (t_c, chal, False)):
-            if t.cancelled(): continue
-            if (exc := t.exception()) is not None:
-                log.error(f"provision-pair unexpected exception uid {m.uid}: {exc}")
-                continue
-            _apply_skip(states, m, t.result()[1], is_king=is_king)
-    except BaseException:
-        await _cleanup("pair-error")
-        raise
-
-    if outer_cancelled:
-        await _cleanup("pair-cancelled")
-        raise asyncio.CancelledError()
-
-    king_slot, chal_slot = _slot_from_task(t_k), _slot_from_task(t_c)
-    king_attempt_failed = not t_k.cancelled() and king_slot is None
-    if fail_fast:
-        await _cleanup("pair-fail-fast")
-        return None, None, king_attempt_failed
-    # King-only failure: tear down the orphan chal slot. Chal-only failure
-    # (king ok) keeps king cached — the 600GB model download reuses across chals.
-    if king_slot is None and chal_slot is not None:
-        await _safe_teardown(slots, chal_slot, "king-failed-chal-orphan")
-        return None, None, king_attempt_failed
-    return king_slot, chal_slot, king_attempt_failed
 
 
 def _seed(uid: int, rev: str, env: str, c: int, salt: str = "") -> int:
@@ -469,677 +196,734 @@ def _task_id(king_uid: int, chal_uid: int, env: str, iter_idx: int,
 
 async def _sample(chain: Chain, wrapper, params: dict, timeout: float, slot: Slot,
                   miner: Miner, env_name: str, c: int,
-                  task_id: int, block: int) -> tuple[Row, bool, int]:
+                  task_id: int) -> tuple[int, float, bool, int]:
     """One evaluation of `miner` in `env_name` on `slot`. Returns
-    (row, delivered, tokens). `delivered=False` iff `run_one` returned None —
-    the miner's endpoint failed to produce a parseable response (vLLM 5xx,
-    conn refused, env-side error, wrapper exception). The synthetic row
-    (p=0, l=0) is constructed regardless; the caller decides whether to keep
-    it based on the *paired* sample's outcome — see dwell's row-append block.
+    (pass, latency, delivered, tokens). `delivered=False` iff `run_one` returned
+    None — the miner's endpoint failed to produce a parseable response (vLLM 5xx,
+    conn refused, env-side error, wrapper exception); pass=0, latency=0.0 then.
 
-    Real per-task miner timeouts (the outer asyncio.wait deadline in run_one)
-    return outcome=False, not None: those are decisive misses per plan.md
-    "Challenger times out on a task → that task is a loss" and yield a
-    real-loss row (p=0, l=actual_latency, delivered=True).
-
-    `c` is pre-allocated by the caller: the dwell may dispatch many samples for
-    the same (uid, rev, env) in parallel before any append, and reading
-    `store.next_counter` inside each call would return the same value for all of
-    them — colliding on Row identity and seed. Hoisting allocation lets the
-    caller assign sequential counters across the in-flight batch."""
+    Real per-task miner timeouts come back as outcome=False (decisive miss):
+    pass=0 with the actual latency, delivered=True."""
     outcome, latency, tokens = await run_one(
         wrapper, params, timeout, slot,
         seed=_seed(miner.uid, miner.revision, env_name, c, salt=chain.hotkey),
         task_id=task_id)
     if outcome is None:
-        return Row(m=miner.uid, r=miner.revision, e=env_name, c=c,
-                   p=0, t=int(block), l=0.0, i=int(task_id), k=miner.model), False, 0
-    return Row(m=miner.uid, r=miner.revision, e=env_name, c=c,
-               p=int(bool(outcome)), t=int(block),
-               l=float(latency), i=int(task_id), k=miner.model), True, int(tokens)
+        return 0, 0.0, False, 0
+    return int(bool(outcome)), float(latency), True, int(tokens)
 
 
 async def _pair_sample(chain: Chain, wrapper, params: dict, timeout: float,
                        king_slot: Slot, king: Miner, ck: int,
                        chal_slot: Slot, challenger: Miner, cc: int,
-                       env_name: str, task_id: int, block: int, e_idx: int):
-    """One matched-task king/chal pair on env e. Returns
-    (e_idx, env_name, king_result, chal_result) where each result is (Row, bool)
-    or BaseException — exception per-side is tolerated so the dwell can
-    attribute env-side plumbing failures separately from miner outcomes."""
+                       env_name: str, task_id: int, e_idx: int):
+    """One matched-task king/chal pair. Returns (e_idx, env_name, kr, cr) where
+    each result is `(p, l, delivered, tokens)` or BaseException."""
     rk, rc = await asyncio.gather(
-        _sample(chain, wrapper, params, timeout, king_slot, king, env_name, ck, task_id, block),
-        _sample(chain, wrapper, params, timeout, chal_slot, challenger, env_name, cc, task_id, block),
+        _sample(chain, wrapper, params, timeout, king_slot, king, env_name, ck, task_id),
+        _sample(chain, wrapper, params, timeout, chal_slot, challenger, env_name, cc, task_id),
         return_exceptions=True,
     )
     return e_idx, env_name, rk, rc
 
 
-async def dwell(chain: Chain, king: Miner, king_slot: Slot,
-                challenger: Miner, chal_slot: Slot, miners: list[Miner],
-                rows: list[Row], envs, env_names, store: EvidenceStore,
-                cfg: Config, priors: Priors,
-                rng: np.random.Generator, stop: asyncio.Event,
-                reign_start_block: int,
-                init_x: np.ndarray | None = None,
-                ) -> DuelOutcome:
-    """Queue-driven dwell: keep `cfg.dwell_batch` matched-task pairs in flight at
-    all times, harvest via FIRST_COMPLETED, refill on completion. Refit on every
-    wakeup that yielded new rows. Exits only when the evidence answers the
-    question — no budget cap.
+@dataclass
+class _RunState:
+    king_slot: Slot | None = None
+    attempted: set[ArtKey] = None
 
-    Termination:
-      - z > k(reign)  → dethrone (DuelStatus.COMPLETED)
-      - z < −k(reign) → asymptotic mirror; under unbounded future info the chal
-        cannot reach k, so HOLDS is decided (DuelStatus.COMPLETED)
-      - stop event   → shutdown (DuelStatus.CANCELLED)
-      - king-side delivery dead (>= SLOT_DEAD consec) → DuelStatus.KING_SLOT_DEAD
-      - chal-side delivery dead (>= SLOT_DEAD consec) → DuelStatus.CHAL_SLOT_DEAD
+    def __post_init__(self):
+        if self.attempted is None:
+            self.attempted = set()
 
-    Slot health is tracked per-side as `king_consec_fails` / `chal_consec_fails`:
-    consecutive pair-completions where that side's endpoint failed to deliver,
-    reset on any delivery. Crossing SLOT_DEAD aborts with KING_SLOT_DEAD or
-    CHAL_SLOT_DEAD so the outer loop reprovisions the dead side.
 
-    Row-append rule: always append both rows; failing sides get synthetic
-    p=0,l=0 (constructed in `_sample`). Matched-pair contrast contribution
-    is zero either way on both-fail (Δp=0), but appending preserves row
-    count and prevents an attacker from suppressing their loss rate via
-    selective crashes that coincide with king failures (drop would inflate
-    θ̂_chal by P(king_fail) — non-trivial in hard envs at reign-end k≈1).
-    Asymmetric pairs (one delivered, one not) implement plan.md L47 "first
-    functioning challenger wins by default": broken-king pairs contribute
-    chal-pass + king-synthetic-loss rows that drive z>k → Dethrone.
+@dataclass(frozen=True)
+class _DuelRun:
+    decision: PairDecision | None
+    status: str
+    counts: PairCounts
 
-    Real per-task miner timeouts come back as outcome=False (not None) from
-    run_one and produce real-loss rows (delivered=True, p=0, l=actual).
-    Synthetic vs real is distinguishable downstream by l==0.0.
 
-    Counter allocation is local to the dwell: store.next_counter is read once
-    per (uid, rev, env) at first dispatch, then incremented in-process.
+class _LocalBackupManager:
+    def __init__(self, root: Path):
+        self.root = root
 
-    The z<−k stop is the iters_remaining→∞ limit of the Bayesian projection
-    `Δθ̂_n < k·(SE_∞ − √(SE_n²−SE_∞²))`: with no cap, SE_∞ → 0, drift_var → SE_n²,
-    criterion collapses to z < −k. Symmetric mirror of dethrone, no
-    hyperparameters beyond k(reign)."""
-    import time as _time
-    rows0 = len(rows)
-    def _out(status: DuelStatus, fit: Fit) -> DuelOutcome:
-        return DuelOutcome(rows=rows, fit=fit, status=status, rows_added=len(rows) - rows0)
-    fit = _fit(rows, miners, env_names, priors, init_x=init_x)
-    init_x = (np.concatenate([fit.theta, fit.beta, fit.alpha])
-              if not fit.degenerate else None)
-    art_keys = _respondents(miners, rows)
-    k_idx = art_keys.index(art_key(king))
-    c_idx = art_keys.index(art_key(challenger))
-    king_consec_fails = 0
-    chal_consec_fails = 0
-    next_c: dict[tuple[int, str, str], int] = {}
+    def backup_hf_artifact(self, model: str, revision: str) -> BackupRecord:
+        art = artifact_id(model, revision)
+        prefix = self.root / art
+        prefix.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "schema": 1, "source": "local", "model": model, "revision": revision,
+            "artifact_id": art, "created_at": int(time.time()), "files": [],
+        }
+        body = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        key = str(prefix / "manifest.json")
+        (prefix / "manifest.json").write_bytes(body)
+        return BackupRecord(art, model, revision, str(prefix), key,
+                            hashlib.sha256(body).hexdigest(), "staging")
+
+    def verify(self, manifest_key: str, expected_manifest_sha: str | None = None) -> BackupRecord:
+        raw = Path(manifest_key).read_bytes()
+        actual = hashlib.sha256(raw).hexdigest()
+        if expected_manifest_sha is not None and actual != expected_manifest_sha:
+            raise ValueError(f"manifest sha mismatch: {actual} != {expected_manifest_sha}")
+        data = json.loads(raw)
+        return BackupRecord(data["artifact_id"], data["model"], data["revision"],
+                            str(Path(manifest_key).parent), manifest_key, actual, "verified")
+
+    def delete_prefix(self, prefix: str) -> bool:
+        import shutil
+        shutil.rmtree(prefix, ignore_errors=True)
+        return True
+
+
+def _make_backup_manager(cfg: Config, chain: Chain, slots) -> BackupManager | _LocalBackupManager:
+    if slots is not None or _truthy_env("AFFINE_LOCAL"):
+        return _LocalBackupManager(Path(cfg.db_path).parent / "local-backups")
+    if ((os.getenv("HIPPIUS_S3_ACCESS_KEY") and os.getenv("HIPPIUS_S3_SECRET_KEY"))
+            or (os.getenv("R2_S3_ACCESS_KEY_ID") and os.getenv("R2_S3_SECRET_ACCESS_KEY"))):
+        providers = S3Config.from_envs(hotkey=chain.hotkey, netuid=cfg.netuid)
+        for s3 in providers:
+            if s3.name == "hippius":
+                os.environ.setdefault("HIPPIUS_S3_BUCKET", s3.bucket)
+                os.environ.setdefault("HIPPIUS_S3_PREFIX", s3.prefix)
+                os.environ.setdefault("HIPPIUS_S3_ENDPOINT", s3.endpoint_url)
+                os.environ.setdefault("HIPPIUS_S3_REGION", s3.region)
+            elif s3.name == "r2":
+                os.environ.setdefault("R2_S3_BUCKET", s3.bucket)
+                os.environ.setdefault("R2_S3_PREFIX", s3.prefix)
+                os.environ.setdefault("R2_S3_ENDPOINT_URL", s3.endpoint_url)
+                os.environ.setdefault("R2_S3_REGION", s3.region)
+        return BackupManager(providers)
+    raise RuntimeError("Hippius S3 credentials are required for production runs")
+
+
+def _champion_miner(champ: Champion) -> Miner:
+    return Miner(
+        uid=champ.uid if champ.uid is not None else -1,
+        hotkey=champ.hotkey or "",
+        model=champ.model,
+        revision=champ.revision,
+        block=champ.reign_start,
+    )
+
+
+async def _backup_artifact(backup, model: str, revision: str) -> BackupRecord:
+    staged = await asyncio.to_thread(backup.backup_hf_artifact, model, revision)
+    return await asyncio.to_thread(backup.verify, staged.manifest_key, staged.manifest_sha256)
+
+
+async def _bootstrap_champion(
+    store: Store,
+    backup,
+    slots,
+    chain: Chain,
+    cfg: Config,
+    stop: asyncio.Event,
+) -> tuple[Champion, Slot]:
+    baseline_model = os.getenv("AFFINE_BASELINE_MODEL", BASELINE_MODELS[0]).strip() or BASELINE_MODELS[0]
+    baseline_revision = os.getenv("AFFINE_BASELINE_REVISION", "").strip()
+    miners = await chain.list_miners()
+    registered = next(
+        (m for m in miners
+         if m.model == baseline_model and (not baseline_revision or m.revision == baseline_revision)),
+        None,
+    )
+    model = registered.model if registered else baseline_model
+    revision = registered.revision if registered else baseline_revision
+    if not revision:
+        revision = "main" if isinstance(backup, _LocalBackupManager) else await asyncio.to_thread(_pin_hf_revision, model, "main")
+    if registered and not isinstance(backup, _LocalBackupManager):
+        revision = await asyncio.to_thread(_pin_hf_revision, model, revision)
+        registered = _with_revision(registered, revision)
+    verified = await _backup_artifact(backup, model, revision)
+    block = await chain.current_block()
+    champ = Champion(
+        artifact_id=verified.artifact_id,
+        model=model,
+        revision=verified.revision,
+        uid=registered.uid if registered else None,
+        hotkey=registered.hotkey if registered else None,
+        reign_start=block,
+        backup_manifest=verified.manifest_key,
+        backup_prefix=verified.prefix,
+        payable=registered is not None,
+    )
+    slot, status = await _provision(slots, _champion_miner(champ), stop, source="hf")
+    if slot is None:
+        log.warning(f"baseline HF provision failed ({status}); using backup")
+        slot, status = await _provision(
+            slots, _champion_miner(champ), stop,
+            source="s3", backup_manifest_key=verified.manifest_key,
+        )
+    if slot is None:
+        raise RuntimeError(f"baseline provision failed from HF and backup: {status}")
+    store.set_champion(champ, verified)
+    kind = f"uid{registered.uid}" if registered else "unregistered"
+    log.info(f"bootstrap champion: {kind} baseline {model}@{verified.revision}")
+    return champ, slot
+
+
+def _pin_hf_revision(model: str, revision: str) -> str:
+    from huggingface_hub import HfApi
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    return HfApi(token=token).model_info(model, revision=revision).sha
+
+
+def _hf_ref_missing(exc: Exception) -> bool:
+    return isinstance(exc, (RepositoryNotFoundError, RevisionNotFoundError))
+
+
+def _with_revision(miner: Miner, revision: str) -> Miner:
+    return Miner(
+        uid=miner.uid,
+        hotkey=miner.hotkey,
+        model=miner.model,
+        revision=revision,
+        block=miner.block,
+    )
+
+
+async def _pin_artifact(backup, miner: Miner) -> Miner:
+    if isinstance(backup, _LocalBackupManager):
+        return miner
+    revision = await asyncio.to_thread(_pin_hf_revision, miner.model, miner.revision)
+    return _with_revision(miner, revision)
+
+
+async def _registered_artifact_alive(backup, miners: list[Miner], registered: Miner,
+                                     pinned_revision: str) -> bool:
+    for m in miners:
+        if m.uid != registered.uid or m.hotkey != registered.hotkey or m.model != registered.model:
+            continue
+        if isinstance(backup, _LocalBackupManager):
+            return m.revision == registered.revision
+        try:
+            return await asyncio.to_thread(_pin_hf_revision, m.model, m.revision) == pinned_revision
+        except Exception as exc:
+            log.warning(f"fresh pin failed for uid{m.uid} {m.model}@{m.revision}: {exc}")
+            return False
+    return False
+
+
+async def _champion_registration_status(
+    backup,
+    miners: list[Miner],
+    champ: Champion,
+    *,
+    missing_ref_alive: bool = False,
+) -> str:
+    if not champ.payable or champ.uid is None or not champ.hotkey:
+        return "dead"
+    for m in miners:
+        if m.uid != champ.uid or m.hotkey != champ.hotkey or m.model != champ.model:
+            continue
+        if isinstance(backup, _LocalBackupManager):
+            return "alive" if m.revision == champ.revision else "dead"
+        if m.revision == champ.revision:
+            return "alive"
+        try:
+            return "alive" if await asyncio.to_thread(_pin_hf_revision, m.model, m.revision) == champ.revision else "dead"
+        except Exception as exc:
+            if _hf_ref_missing(exc):
+                if missing_ref_alive:
+                    log.warning(f"champion HF ref missing for uid{m.uid} {m.model}@{m.revision}; continuing from backup")
+                    return "alive"
+                log.warning(f"champion HF ref missing for uid{m.uid} {m.model}@{m.revision}")
+                return "dead"
+            log.warning(f"champion pin check failed for uid{m.uid} {m.model}@{m.revision}: {exc}")
+            return "unknown"
+    return "dead"
+
+
+def _is_current_champion_registration(m: Miner, champ: Champion, artifact_alive: bool = False) -> bool:
+    if champ.uid is not None and m.uid == champ.uid and m.hotkey == champ.hotkey:
+        return (m.model, m.revision) == (champ.model, champ.revision) or (artifact_alive and m.model == champ.model)
+    return (m.model, m.revision) == (champ.model, champ.revision)
+
+
+
+async def _ensure_king_slot(
+    state: _RunState,
+    champ: Champion,
+    slots,
+    stop: asyncio.Event,
+) -> Slot | None:
+    if state.king_slot is not None:
+        return state.king_slot
+    miner = _champion_miner(champ)
+    slot, status = await _provision(slots, miner, stop, source="hf")
+    if slot is None:
+        log.warning(f"champion HF reprovision failed ({status}); using backup")
+        slot, status = await _provision(
+            slots, miner, stop, source="s3", backup_manifest_key=champ.backup_manifest,
+        )
+    if slot is None:
+        log.error(f"champion reprovision failed from HF and backup: {status}")
+        return None
+    state.king_slot = slot
+    return slot
+
+
+async def _publish_champion(store: Store, chain: Chain, cfg: Config, champ: Champion) -> bool:
+    if not champ.payable or champ.uid is None or not champ.hotkey:
+        return await _publish_burn(store, chain, cfg, champ.artifact_id)
+    if chain.uid_matches_hotkey is not None and not await chain.uid_matches_hotkey(champ.uid, champ.hotkey):
+        log.warning(f"champion uid={champ.uid} hotkey mismatch; burning weights")
+        store.demote_champion(champ.artifact_id)
+        await _publish_burn(store, chain, cfg, champ.artifact_id)
+        return False
+    dry = cfg.dry_run
+    pub_id = store.publication_intent(champ.artifact_id, "set_weights", champ.uid, champ.hotkey, dry)
+    if store.publication_status(pub_id) in {"confirmed", "dry_run"}:
+        return True
+    if dry:
+        store.mark_publication(pub_id, "dry_run")
+        return True
+    ok = await chain.publish_winner(champ.uid, champ.hotkey)
+    if ok and chain.uid_matches_hotkey is not None and not await chain.uid_matches_hotkey(champ.uid, champ.hotkey):
+        log.warning(f"champion uid={champ.uid} hotkey changed after publish; burning weights")
+        store.demote_champion(champ.artifact_id)
+        await _publish_burn(store, chain, cfg, champ.artifact_id)
+        return False
+    store.mark_publication(pub_id, "confirmed" if ok else "failed")
+    return ok
+
+
+async def _publish_burn(store: Store, chain: Chain, cfg: Config, artifact: str) -> bool:
+    dry = cfg.dry_run
+    pub_id = store.publication_intent(artifact, "burn", None, None, dry)
+    if store.publication_status(pub_id) in {"confirmed", "dry_run"}:
+        return True
+    ok = True if dry else bool(chain.burn_weights and await chain.burn_weights())
+    if dry:
+        store.mark_publication(pub_id, "dry_run")
+    else:
+        store.mark_publication(pub_id, "confirmed" if ok else "failed")
+    return ok
+
+
+def _should_finalize(cfg: Config) -> bool:
+    """True if we should persist pending champion and finalize promotions.
+    Production (not dry_run) always finalizes. Shadow namespace also finalizes
+    to exercise the full state machine without touching the chain."""
+    return not cfg.dry_run or os.getenv("AFFINE_NAMESPACE") == "shadow"
+
+
+def _pair_sample_from_rows(duel_id: int, env: str, task_id: int, iter_idx: int,
+                           block: int, king: Miner, chal: Miner, rk, rc) -> PairSample:
+    def unpack(result, miner: Miner) -> tuple[int, float, int, int]:
+        if isinstance(result, BaseException):
+            log.warning(f"sample raised uid{miner.uid}: {type(result).__name__}: {result}")
+            return 0, 0.0, 0, 0
+        p, l, delivered, tokens = result
+        return p, l, int(delivered), tokens
+    kp, kl, kd, kt = unpack(rk, king)
+    cp, cl, cd, ct = unpack(rc, chal)
+    return PairSample(duel_id, env, task_id, iter_idx, block, kp, cp, kl, cl, kd, cd, kt, ct)
+
+
+async def _run_fixed_duel(
+    store: Store,
+    chain: Chain,
+    king: Miner,
+    king_slot: Slot,
+    challenger: Miner,
+    chal_slot: Slot,
+    envs: dict[str, tuple],
+    cfg: Config,
+    duel,
+    stop: asyncio.Event,
+) -> _DuelRun:
+    env_names = [spec.name for spec in cfg.environments]
+    target_per_env = duel.pairs_per_env
+    target_total = target_per_env * len(env_names)
+    delivered_by_env = {env: 0 for env in env_names}
+    inflight_by_env = {env: 0 for env in env_names}
+    launched_by_env = {env: 0 for env in env_names}
+    env_rank = {env: i for i, env in enumerate(env_names)}
+    counters: dict[tuple[int, str, str], int] = {}
     inflight: set[asyncio.Task] = set()
-    iters_started = 0
-    iters_done = 0
-    samples_done = 0; tokens_done = 0; latency_sum = 0.0
-    t_start = _time.monotonic()
+    counts = PairCounts()
+    king_dead = chal_dead = 0
+    pair_dead = 0
 
-    def alloc_c(uid: int, rev: str, env: str) -> int:
-        key = (uid, rev, env)
-        if key not in next_c:
-            next_c[key] = store.next_counter(uid, rev, env)
-        c = next_c[key]
-        next_c[key] = c + 1
+    def alloc(miner: Miner, env: str) -> int:
+        key = (miner.uid, miner.revision, env)
+        c = counters.get(key, 0)
+        counters[key] = c + 1
         return c
 
-    def pick_env() -> int:
-        if fit.degenerate:
-            return int(rng.choice(len(env_names)))
-        return fisher_env(fit, c_idx, k_idx, rng, excluded=frozenset())
+    async def drain(reason: str) -> None:
+        for task in inflight:
+            if not task.done():
+                task.cancel()
+        for task in list(inflight):
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                pass
+            except BaseException as exc:
+                log.warning(f"duel drain ({reason}) interrupted: {type(exc).__name__}: {exc}")
+        inflight.clear()
 
-    def dispatch_one(e_idx: int, iter_idx: int, block: int) -> asyncio.Task:
-        env_name = env_names[e_idx]
+    async def block() -> int:
+        try:
+            return await chain.current_block()
+        except Exception as ex:
+            log.warning(f"current_block failed during duel: {ex}; using 0")
+            return 0
+
+    def next_env() -> str | None:
+        eligible = [
+            env for env in env_names
+            if delivered_by_env[env] + inflight_by_env[env] < target_per_env
+        ]
+        if not eligible:
+            return None
+        return min(eligible, key=lambda env: (delivered_by_env[env] + inflight_by_env[env], env_rank[env]))
+
+    async def launch(env_name: str) -> asyncio.Task:
+        iter_idx = launched_by_env[env_name]
         wrapper, spec = envs[env_name]
         params = {k: v for k, v in spec.params.items() if k != "timeout"}
         timeout = float(spec.params.get("timeout", 600))
         lo, hi = spec.task_range
-        task_id = _task_id(king.uid, challenger.uid, env_name, iter_idx, lo, hi, salt=chain.hotkey)
-        ck = alloc_c(king.uid, king.revision, env_name)
-        cc = alloc_c(challenger.uid, challenger.revision, env_name)
-        return asyncio.create_task(_pair_sample(
+        task_id = _task_id(king.uid, challenger.uid, env_name, iter_idx, lo, hi,
+                           salt=f"{chain.hotkey}:{duel.schedule_seed}")
+        task = asyncio.create_task(_pair_sample(
             chain, wrapper, params, timeout,
-            king_slot, king, ck, chal_slot, challenger, cc,
-            env_name, task_id, block, e_idx))
+            king_slot, king, alloc(king, env_name),
+            chal_slot, challenger, alloc(challenger, env_name),
+            env_name, task_id, iter_idx))
+        launched_by_env[env_name] = iter_idx + 1
+        inflight_by_env[env_name] += 1
+        return task
 
-    async def drain(reason: str):
-        for t in inflight:
-            if not t.done(): t.cancel()
-        for t in list(inflight):
-            try: await asyncio.shield(t)
-            except asyncio.CancelledError:
-                pass
-            except BaseException as ex:
-                log.warning(f"dwell drain ({reason}) interrupted: {type(ex).__name__}")
-        inflight.clear()
-
-    try: block = await chain.current_block()
-    except Exception as ex:
-        log.warning(f"current_block failed at dwell start: {ex}; using 0")
-        block = 0
-
-    while len(inflight) < cfg.dwell_batch:
-        inflight.add(dispatch_one(pick_env(), iters_started, block))
-        iters_started += 1
-
-    while True:
-        if stop.is_set():
-            await drain("stop"); return _out(DuelStatus.CANCELLED, fit)
-        try:
-            done, _pending = await _cancellable(
-                asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED), stop)
-        except asyncio.CancelledError:
-            await drain("cancel"); return _out(DuelStatus.CANCELLED, fit)
-
-        new_rows: list[Row] = []
-        for t in done:
-            inflight.discard(t)
-            _e_idx, env_name, rk, rc = t.result()
-            iters_done += 1
-            if isinstance(rk, BaseException):
-                log.warning(f"dwell king-side raised on env={env_name}: {type(rk).__name__}: {rk}")
-                k_row, k_ok, k_tok = None, False, 0
-            else:
-                k_row, k_ok, k_tok = rk
-            if isinstance(rc, BaseException):
-                log.warning(f"dwell chal-side raised on env={env_name}: {type(rc).__name__}: {rc}")
-                c_row, c_ok, c_tok = None, False, 0
-            else:
-                c_row, c_ok, c_tok = rc
-            king_consec_fails = 0 if k_ok else king_consec_fails + 1
-            chal_consec_fails = 0 if c_ok else chal_consec_fails + 1
-            # Always append both rows. Failing sides get synthetic p=0,l=0
-            # (constructed in _sample). The matched-pair contrast contribution
-            # is identical whether we drop or append-zero on both-fail (Δp=0
-            # either way), but appending preserves the row count: an attacker
-            # who crashes selectively on tasks they'd lose cannot suppress
-            # their loss rate by hiding behind a coinciding king-fail. Drop
-            # would let θ̂_chal float above true ability proportional to
-            # P(king_fail) — non-trivial in hard envs at reign-end k≈1.
-            # Validator-side env outages still inflate row count but not the
-            # contrast (both p=0 → zero matched-pair contribution).
-            if k_ok:
-                samples_done += 1; tokens_done += k_tok; latency_sum += k_row.l
-            if c_ok:
-                samples_done += 1; tokens_done += c_tok; latency_sum += c_row.l
-            if k_row is not None: new_rows.append(k_row)
-            if c_row is not None: new_rows.append(c_row)
-        if new_rows:
-            store.append(*new_rows); rows.extend(new_rows)
-        if king_consec_fails >= SLOT_DEAD and chal_consec_fails >= SLOT_DEAD:
-            log.warning(f"dwell abort: BOTH slots dead (king={king.uid} consec={king_consec_fails}, "
-                        f"chal={challenger.uid} consec={chal_consec_fails})")
-            await drain("both_dead"); return _out(DuelStatus.KING_SLOT_DEAD, fit)
-        if king_consec_fails >= SLOT_DEAD:
-            log.warning(f"dwell abort: king slot dead after {king_consec_fails} consec fails (uid {king.uid})")
-            await drain("king_dead"); return _out(DuelStatus.KING_SLOT_DEAD, fit)
-        if chal_consec_fails >= SLOT_DEAD:
-            log.warning(f"dwell abort: chal slot dead after {chal_consec_fails} consec fails (uid {challenger.uid})")
-            await drain("chal_dead"); return _out(DuelStatus.CHAL_SLOT_DEAD, fit)
-
+    async def fill() -> None:
         while len(inflight) < cfg.dwell_batch:
-            inflight.add(dispatch_one(pick_env(), iters_started, block))
-            iters_started += 1
+            env_name = next_env()
+            if env_name is None:
+                return
+            inflight.add(await launch(env_name))
 
-        if new_rows:
-            try: block = await chain.current_block()
-            except Exception as ex:
-                log.warning(f"current_block refresh failed at i={iters_done}: {ex}; reusing previous")
-            elapsed = max(1e-3, _time.monotonic() - t_start)
-            sps = samples_done / elapsed
-            mean_lat = latency_sum / samples_done if samples_done else 0.0
-            tok_s = tokens_done / elapsed  # aggregate over both slots
-            log.info(f"dwell pairs={iters_done} (in_flight={len(inflight)}/{cfg.dwell_batch}) "
-                     f"samples={samples_done} tokens={tokens_done} elapsed={elapsed:.1f}s "
-                     f"throughput={sps:.2f} sample/s {tok_s:.0f} tok/s mean_lat={mean_lat:.1f}s")
-            if any(r.l != 0.0 for r in new_rows):
-                fit = _fit(rows, miners, env_names, priors, init_x=init_x)
-                if not fit.degenerate:
-                    init_x = np.concatenate([fit.theta, fit.beta, fit.alpha])
-                    delta, se = fit.contrast(c_idx, k_idx)
-                    z = delta / se if se > 0 else 0.0
-                    k = compute_k(block - reign_start_block,
-                                  cfg.k_init, cfg.k_final, cfg.k_halflife)
-                    if z > k:
-                        log.info(f"dwell dethrone after {iters_done} iters: z={z:+.2f} > k={k:.2f}")
-                        await drain("z>k"); return _out(DuelStatus.COMPLETED, fit)
-                    if z < -k:
-                        log.info(f"dwell hold after {iters_done} iters: z={z:+.2f} < -k={-k:.2f}")
-                        await drain("z<-k"); return _out(DuelStatus.COMPLETED, fit)
+    await fill()
 
-
-async def _elect(rows: list[Row], miners: list[Miner], env_names: list[str],
-                 priors: Priors) -> tuple[int, str]:
-    """Pick champion. Cold start (no evidence): seat a hardcoded baseline model if
-    registered; otherwise pick the lowest-block miner (fairest tiebreaker — first
-    to commit holds the throne until evidence dethrones them). With evidence:
-    argmax(θ̂)."""
-    def _seat_baseline_or_lowest(reason: str) -> tuple[int, str]:
-        for target in BASELINE_MODELS:
-            for m in miners:
-                if m.model == target:
-                    log.info(f"{reason}: seating baseline {m.model} as uid {m.uid}")
-                    return m.uid, m.revision
-        m = min(miners, key=lambda x: (x.block, _tiebreak(x)))
-        log.info(f"{reason}: no baseline registered; seating lowest-block uid {m.uid} model {m.model}")
-        return m.uid, m.revision
-    if not rows:
-        return _seat_baseline_or_lowest("cold start")
-    # Uninformative rows (every env all-pass or all-fail) get fully dropped by
-    # _fit's filter — the fit then runs on zero observations, theta stays at
-    # the prior mean (zero), argmax breaks ties to index 0. Functionally
-    # identical to cold start, so route there. Must mirror _fit's `r.e in env_names`
-    # filter: a retired-env row with both outcomes would otherwise pass this check
-    # while _fit drops it, leaving the fit with zero active observations.
-    active = set(env_names)
-    outcomes: dict[str, set[int]] = {}
-    for r in rows:
-        if r.e in active:
-            outcomes.setdefault(r.e, set()).add(r.p)
-    if not any(len(s) >= 2 for s in outcomes.values()):
-        return _seat_baseline_or_lowest("elect: no informative env (all-pass or all-fail)")
-    fit = _fit(rows, miners, env_names, priors)
-    if fit.degenerate:
-        # argmax(θ̂) on a non-MAP fit can publish a winner from a fabricated
-        # posterior — same risk the verdict path refuses for. Fall back to the
-        # cold-start choice; once new evidence accumulates the next election
-        # gets a real fit.
-        return _seat_baseline_or_lowest("elect: degenerate fit")
-    # θ̂ is per-artifact (model, revision). With multiple uids on the winning
-    # artifact, pick the lowest-block one — same tiebreak as cold start, so the
-    # named seat-holder is deterministic even when uids share an artifact.
-    art_keys = _respondents(miners, rows)
-    registered = {art_key(m) for m in miners}
-    candidates = [(i, k) for i, k in enumerate(art_keys) if k in registered]
-    i_best, key_best = max(candidates, key=lambda ik: fit.theta[ik[0]])
-    holders = [m for m in miners if art_key(m) == key_best]
-    seat = min(holders, key=lambda m: (m.block, _tiebreak(m)))
-    log.info(f"elect: uid {seat.uid} model {seat.model} (θ̂={fit.theta[i_best]:+.3f})")
-    return seat.uid, seat.revision
-
-
-@dataclass
-class Reign:
-    """Persisted champion + reign_start + last_published_uid. Without persistence,
-    a restart with the same champion still on chain would re-elect them and reset
-    reign_start to the current block, undoing all k(reign) decay. Save format and
-    atomic-rename semantics are load-bearing for that durability."""
-    champion: tuple[int, str]
-    start_block: int
-    last_published_uid: int | None = None
-
-    @classmethod
-    def load(cls, path: Path) -> "Reign | None":
-        if not path.exists():
-            return None
+    while inflight:
+        if stop.is_set():
+            await drain("stop")
+            store.finish_duel(duel.id, "cancelled", counts, pair_p_value(counts.challenger_only, counts.discordant), None)
+            return _DuelRun(None, "cancelled", counts)
         try:
-            d = json.loads(path.read_text())
-            if not isinstance(d, dict):
-                raise TypeError(f"reign state must be a JSON object, got {type(d).__name__}")
-            lp = d.get("last_published_uid")
-            return cls(
-                champion=(int(d["uid"]), str(d["revision"])),
-                start_block=int(d["reign_start"]),
-                last_published_uid=(int(lp) if lp is not None else None),
-            )
-        except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
-            log.warning(f"reign state at {path} unreadable, ignoring: {e}")
-            return None
+            done, _ = await _cancellable(asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED), stop)
+        except asyncio.CancelledError:
+            await drain("stop")
+            store.finish_duel(duel.id, "cancelled", counts, pair_p_value(counts.challenger_only, counts.discordant), None)
+            if stop.is_set():
+                return _DuelRun(None, "cancelled", counts)
+            raise
+        samples = []
+        for task in done:
+            inflight.discard(task)
+            e_idx, env_name, rk, rc = task.result()
+            inflight_by_env[env_name] -= 1
+            task_id = _task_id(king.uid, challenger.uid, env_name, e_idx,
+                               envs[env_name][1].task_range[0], envs[env_name][1].task_range[1],
+                               salt=f"{chain.hotkey}:{duel.schedule_seed}")
+            b = await block()
+            sample = _pair_sample_from_rows(duel.id, env_name, task_id, e_idx, b, king, challenger, rk, rc)
+            samples.append(sample)
+            if sample.champion_delivered and sample.challenger_delivered:
+                counts = counts.add(sample.champion_pass, sample.challenger_pass)
+                delivered_by_env[env_name] += 1
+                pair_dead = 0
+            else:
+                pair_dead += 1
+            king_dead = 0 if sample.champion_delivered else king_dead + 1
+            chal_dead = 0 if sample.challenger_delivered else chal_dead + 1
+        store.add_samples(samples)
+        # Symmetric env-side failure (e.g. an env wrapper that ships a
+        # 40k-token prompt and gets a 400 from BOTH models) trips both
+        # side counters simultaneously. Without this branch we'd attribute
+        # a shared infra problem to the king and reprovision it for nothing.
+        if king_dead >= SLOT_DEAD and chal_dead >= SLOT_DEAD:
+            await drain("delivery-stalled")
+            store.finish_duel(duel.id, "delivery_stalled", counts, pair_p_value(counts.challenger_only, counts.discordant), await block())
+            return _DuelRun(None, "delivery_stalled", counts)
+        if king_dead >= SLOT_DEAD:
+            await drain("champion-slot-dead")
+            store.finish_duel(duel.id, "champion_slot_dead", counts, pair_p_value(counts.challenger_only, counts.discordant), await block())
+            return _DuelRun(None, "champion_slot_dead", counts)
+        if chal_dead >= SLOT_DEAD:
+            await drain("challenger-slot-dead")
+            store.finish_duel(duel.id, "challenger_slot_dead", counts, pair_p_value(counts.challenger_only, counts.discordant), await block())
+            return _DuelRun(None, "challenger_slot_dead", counts)
+        if pair_dead >= SLOT_DEAD:
+            await drain("delivery-stalled")
+            store.finish_duel(duel.id, "delivery_stalled", counts, pair_p_value(counts.challenger_only, counts.discordant), await block())
+            return _DuelRun(None, "delivery_stalled", counts)
+        remaining = target_total - counts.total
+        best_possible = PairCounts(
+            counts.challenger_only + remaining,
+            counts.champion_only,
+            counts.both_pass,
+            counts.both_fail,
+        )
+        if not decide_paired(best_possible, alpha=duel.alpha,
+                             min_discordant=duel.min_discordant).dethrone:
+            await drain("best-possible-hold")
+            break
+        await fill()
 
-    def save(self, path: Path) -> None:
-        # fsync the tmp before rename: without it, power loss between rename commit
-        # and the data flush can leave an empty/partial file. load() would then
-        # return None and the loop re-elects, resetting start_block and undoing
-        # all k(reign) decay that had accumulated.
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        payload = json.dumps({
-            "uid": self.champion[0], "revision": self.champion[1],
-            "reign_start": self.start_block,
-            "last_published_uid": self.last_published_uid,
-        }).encode()
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-        try:
-            n = os.write(fd, payload)
-            if n != len(payload):
-                raise OSError(f"short write: {n}/{len(payload)} bytes")
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
-
-
-@dataclass
-class DuelOutcome:
-    rows: list[Row]
-    fit: Fit
-    status: DuelStatus
-    rows_added: int
-
-
-@dataclass
-class LoopState:
-    reign: Reign | None = None
-    king_slot: Slot | None = None
-    # Prefetched next-challenger provision. Started while the current duel dwells
-    # so a fast z<-k or z>k early-exit doesn't stall on a 5-15min Targon spin.
-    # Tuple of (task, miner). The task awaits to (slot|None, status) like _provision.
-    next_chal: tuple[asyncio.Task, Miner] | None = None
-    provision_backoff: int = 60   # exponential Targon-API-wide backoff; 60→600s
-
-
-async def _drop_king(state: LoopState, slots) -> None:
-    if state.king_slot is None:
-        return
-    slot, state.king_slot = state.king_slot, None
-    await _safe_teardown(slots, slot, "king-drop")
-
-
-async def _drop_next_chal(state: LoopState, slots) -> None:
-    """Cancel any in-flight prefetch and tear down its slot if it managed to land.
-    Idempotent. Called on shutdown and on cold-start (where the king isn't even
-    alive — prefetch assumptions don't hold)."""
-    if state.next_chal is None:
-        return
-    task, _miner = state.next_chal
-    state.next_chal = None
-    if not task.done():
-        task.cancel()
-    try:
-        slot, _status = await asyncio.shield(task)
-    except (asyncio.CancelledError, Exception):
-        return
-    if slot is not None:
-        await _safe_teardown(slots, slot, "prefetch-drop")
+    decision = decide_paired(counts, alpha=duel.alpha, min_discordant=duel.min_discordant)
+    status = "dethrone" if decision.dethrone else "hold"
+    store.finish_duel(duel.id, status, counts, decision.p_value, await block())
+    return _DuelRun(decision, status, counts)
 
 
-def _start_prefetch(state: LoopState, slots, queue: list[Miner],
-                    current_chal: Miner, states: MinerStates,
-                    stop: asyncio.Event) -> None:
-    """Kick off provisioning for the next-in-queue candidate. No-op if a
-    prefetch is already pending or no candidate exists. We do NOT mark
-    `attempted` at provision time — that defers to `_take_prefetched` so a
-    Dethrone (which clears `attempted`) doesn't strand a rental we want to
-    re-evaluate later."""
-    if state.next_chal is not None:
-        return
-    cur_art = art_key(current_chal)
-    nxt = next((m for m in queue if art_key(m) != cur_art), None)
-    if nxt is None:
-        return
-    task = asyncio.create_task(_provision(slots, nxt, stop))
-    state.next_chal = (task, nxt)
-    log.info(f"prefetch: provisioning next chal uid{nxt.uid} {nxt.model}@{nxt.revision}")
+async def _gc_retiring(store: Store, backup) -> None:
+    for old in store.retiring_backups():
+        if await asyncio.to_thread(backup.delete_prefix, old.prefix):
+            store.mark_backup_deleted(old.manifest_key)
 
 
-async def _take_prefetched(state: LoopState, slots, states: MinerStates,
-                           want_art: ArtKey) -> Slot | None:
-    """If the prefetched miner matches `want_art`, await its provision and
-    return the slot (mark_attempted on success). Otherwise teardown and return
-    None — the queue moved beneath us (typically a Dethrone). `crashloop` is
-    always recorded as `durable` even on mismatch: an artifact that crashed
-    loading is a miner fault regardless of which iter saw it."""
-    if state.next_chal is None:
-        return None
-    task, miner = state.next_chal
-    state.next_chal = None
-    try:
-        slot, status = await task
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        log.warning(f"prefetch task raised: {e}")
-        return None
-    if status == "crashloop":
-        states.mark_durable(miner.uid, art_key(miner), reason=status)
-    if art_key(miner) != want_art:
-        if slot is not None:
-            log.info(f"prefetch mismatch: had {art_key(miner)}, want {want_art}; tearing down")
-            await _safe_teardown(slots, slot, "prefetch-mismatch")
-        return None
-    if slot is None:
-        return None
-    states.mark_attempted(art_key(miner))
-    log.info(f"prefetch hit: reusing slot for {want_art}")
-    return slot
-
-
-async def _maybe_publish(state: LoopState, chain: Chain, cfg: Config,
-                         reign_state_path: Path, uid: int, expected_hotkey: str) -> None:
-    """Idempotent: no-op when uid == reign.last_published_uid. Persists before
-    advancing memory so a save failure leaves the next iter free to retry —
-    the reverse order would lose a publish on save error and burn weight quota.
-    Dry-run skips persistence (would mislead a later real run into skipping the
-    actual on-chain write); memory advance still suppresses re-logging in-session."""
-    if state.reign is None or uid == state.reign.last_published_uid:
-        return
-    dry = _truthy_env("AFFINE_DRY_RUN")
-    audit(type="weight_intent", netuid=cfg.netuid, winner_uid=uid, dry_run=dry)
-    # Not wrapped in _cancellable: cancelling between broadcast and inclusion-wait
-    # leaves the extrinsic on-chain but last_published_uid unset; restart double-submits.
-    if not await chain.publish_winner(uid, expected_hotkey):
-        log.warning(f"publish_winner uid={uid} failed; will retry next iteration")
-        return
-    if not dry:
-        Reign(state.reign.champion, state.reign.start_block, uid).save(reign_state_path)
-    state.reign.last_published_uid = uid
-
-
-def _miner_pl(m: Miner) -> dict:
-    return {"uid": m.uid, "model": m.model, "revision": m.revision}
-
-
-def _audit_verdict(verdict_str: str, king: Miner, chal: Miner, ev: VerdictEvidence) -> None:
-    log.info(f"verdict: Δθ̂={ev.delta:+.3f}±{ev.se:.3f} z={ev.z:+.2f} k={ev.k:.2f} reign={ev.reign_blocks}b")
-    audit(type="duel", verdict=verdict_str,
-          king=_miner_pl(king), challenger=_miner_pl(chal), **asdict(ev))
+async def _gc_staging(store: Store, backup) -> None:
+    for old in store.staging_backups():
+        if await asyncio.to_thread(backup.delete_prefix, old.prefix):
+            store.mark_backup_deleted(old.manifest_key)
 
 
 async def run(cfg: Config, chain: Chain, slots=None):
+    owned_slots = slots is None
     slots = slots or TargonSlots(cfg, hotkey=chain.hotkey)
+    backup = _make_backup_manager(cfg, chain, slots if not owned_slots else None)
     if hasattr(slots, "reconcile"):
         await slots.reconcile()
-    envs: dict[str, tuple] = await _load_envs(cfg)
-    # state.king_slot persists across duels within a reign — re-provisioning a
-    # 600GB model download per challenger is the dominant cost. Hoisted out of
-    # the inner try so the outer finally can shield-tear it down even on init failure.
-    state = LoopState()
+    envs = await _load_envs(cfg)
+    store = Store(cfg.db_path)
+    store.abort_running_duels()
+    await _gc_staging(store, backup)
+    state = _RunState()
+    stop = asyncio.Event()
+    _install_signal_handlers(stop)
     try:
-        env_names = [spec.name for spec in cfg.environments]
-        store = EvidenceStore(cfg.evidence_path)
-        reign_state_path = Path(cfg.evidence_path).parent / f"reign-{chain.hotkey[:8]}.json"
-        states_path = Path(cfg.evidence_path).parent / f"skiplist-{chain.hotkey[:8]}.jsonl"
-        states = MinerStates(
-            {s.strip() for s in os.getenv("AFFINE_MODEL_SKIPLIST", "").split(",") if s.strip()},
-            path=states_path,
-        )
-        priors = Priors(cfg.sigma_beta, cfg.sigma_alpha)
-        # OS entropy so a crashloop doesn't deterministically replay the env that
-        # triggered the crash. Per-sample task determinism is anchored on the
-        # SHA(uid||rev||env||counter) seed elsewhere, not on this rng.
-        rng = np.random.default_rng(secrets.randbits(64))
-
-        stop = asyncio.Event()
-        _install_signal_handlers(stop)
-
-        rows = store.read()
-        prev_fit_state: tuple[Fit, list[ArtKey], list[str]] | None = None
-        state.reign = Reign.load(reign_state_path)
-        if state.reign is not None:
-            log.info(f"resuming reign: uid {state.reign.champion[0]}@{state.reign.champion[1]} "
-                     f"from block {state.reign.start_block} "
-                     f"(last_published_uid={state.reign.last_published_uid})")
-
+        champ = store.champion()
+        if champ is None:
+            champ, state.king_slot = await _bootstrap_champion(store, backup, slots, chain, cfg, stop)
         while not stop.is_set():
-            try:
-                all_miners = await chain.list_miners()
-                miners = states.filter(all_miners)
-                if not miners:
-                    log.info("no miners; sleeping 120s")
-                    await _cancellable(asyncio.sleep(120), stop); continue
-
-                by_key = {(m.uid, m.revision): m for m in miners}
-                if state.reign is None or state.reign.champion not in by_key:
-                    await _drop_king(state, slots)
-                    # Build the new Reign value first; assign to state.reign only after
-                    # save() succeeds. A failure mid-way used to leave the loop with the
-                    # new champion paired against the prior reign's start_block and an
-                    # artificially low k(reign).
-                    new_champion = await _elect(rows, miners, env_names, priors)
-                    new_reign = Reign(new_champion, await chain.current_block())
-                    new_reign.save(reign_state_path)
-                    state.reign = new_reign
-                    states.clear_attempted()
-                    if stop.is_set(): break
-                    log.info(f"champion: uid {new_champion[0]}@{new_champion[1]} "
-                             f"(reign start block {new_reign.start_block})")
-                if stop.is_set(): break
-                king = by_key[state.reign.champion]
-                await _maybe_publish(state, chain, cfg, reign_state_path, king.uid, king.hotkey)
-                champion_art = art_key(king)
-                queue = sorted(
-                    (m for m in miners if art_key(m) != champion_art
-                                       and not states.is_attempted(art_key(m))),
-                    key=lambda m: (m.block, _tiebreak(m)),
+            pending = store.pending_champion()
+            if pending is not None:
+                pending_registration = await _champion_registration_status(
+                    backup, await chain.list_miners(), pending, missing_ref_alive=False,
                 )
-                if not queue:
-                    states.clear_attempted()
-                    log.info("queue exhausted this reign; sleeping 120s before re-probe")
-                    await _cancellable(asyncio.sleep(120), stop); continue
-
-                challenger = queue[0]
-
-                chal_slot: Slot | None = None
-                king_attempt_failed = False
-                try:
-                    if state.king_slot is None:
-                        # Cold-start: any pending prefetch was based on a stale
-                        # king assumption — drop it before _provision_pair.
-                        await _drop_next_chal(state, slots)
-                        state.king_slot, chal_slot, king_attempt_failed = await _provision_pair(
-                            slots, king, challenger, states, stop)
-                    else:
-                        chal_slot = await _take_prefetched(state, slots, states, art_key(challenger))
-                        if chal_slot is None:
-                            chal_slot, status = await _provision(slots, challenger, stop)
-                            _apply_skip(states, challenger, status, is_king=False)
-                except asyncio.CancelledError:
-                    if stop.is_set(): break
-                    raise
-
-                # King-failed → backoff to avoid hammering Targon. Chal failures are
-                # already ATTEMPTED via _apply_skip; the queue advances next iter,
-                # and queue exhaustion provides the natural multi-chal backoff (120s).
-                if king_attempt_failed:
-                    log.warning(f"king provision failed; sleeping {state.provision_backoff}s")
-                    await _cancellable(asyncio.sleep(state.provision_backoff), stop)
-                    state.provision_backoff = min(state.provision_backoff * 2, 600)
-                if chal_slot is None:
+                if pending_registration == "dead":
+                    old = store.clear_pending_champion()
+                    if old is not None and await asyncio.to_thread(backup.delete_prefix, old.prefix):
+                        store.mark_backup_deleted(old.manifest_key)
+                    log.warning(f"pending champion {pending.model}@{pending.revision} is no longer registered; discarded")
                     continue
-                state.provision_backoff = 60
-
-                # Prefetch the next candidate now so dwell overlaps a 5-15min
-                # Targon spin. Hold/Skip on next iter reuses; Dethrone tears down.
-                _start_prefetch(state, slots, queue, challenger, states, stop)
-
-                # chal_slot lifetime is owned by this block: only retained on a
-                # successful dethrone (promoted to state.king_slot). Every other
-                # exit path — Skip, Hold, exception, shutdown — must tear it down.
-                promoted = False
+                if pending_registration == "unknown":
+                    log.warning("pending champion artifact identity unknown; retrying before finalization")
+                    await _cancellable(asyncio.sleep(120), stop)
+                    continue
+                pending_slot = None
                 try:
-                    log.info(f"duel: king uid{king.uid} vs chal uid{challenger.uid} (rows={len(rows)})")
-                    cur_keys = _respondents(miners, rows)
-                    init_x = _init_x_from_prev(
-                        prev_fit_state[0] if prev_fit_state else None,
-                        prev_fit_state[1] if prev_fit_state else [],
-                        prev_fit_state[2] if prev_fit_state else [],
-                        cur_keys, env_names)
-                    out = await dwell(chain, king, state.king_slot, challenger, chal_slot,
-                                      miners, rows, envs, env_names, store, cfg,
-                                      priors, rng, stop,
-                                      reign_start_block=state.reign.start_block,
-                                      init_x=init_x)
-                    prev_fit_state = (out.fit, _respondents(miners, rows), list(env_names))
-                    duel_rows = rows[-out.rows_added:] if out.rows_added > 0 else []
-                    needs_reign = (out.status is DuelStatus.COMPLETED
-                                   and out.rows_added > 0
-                                   and not out.fit.degenerate)
-                    # Falling back to 0 (i.e. k_init) on RPC failure is conservative —
-                    # k_init is the strictest threshold, so a chain blip can never
-                    # cause a spurious dethrone. Mirrors dwell's same fallback.
-                    if needs_reign:
-                        try: cur_block = await chain.current_block()
-                        except Exception as ex:
-                            log.warning(f"current_block failed at verdict: {ex}; using 0")
-                            cur_block = state.reign.start_block
-                        reign_blocks = max(cur_block - state.reign.start_block, 0)
+                    pending_slot, status = await _provision(
+                        slots, _champion_miner(pending), stop,
+                        source="s3", backup_manifest_key=pending.backup_manifest,
+                    )
+                    if pending_slot is None:
+                        log.warning(f"pending champion backup restore failed ({status}); keeping current champion active")
                     else:
-                        reign_blocks = 0
-
-                    king_id = (king.uid, king.revision)
-                    chal_id = (challenger.uid, challenger.revision)
-                    duel_art_keys = _respondents(miners, rows)
-                    verdict = decide(duel_rows, out.fit, out.status,
-                                     king=king, chal=challenger, art_keys=duel_art_keys,
-                                     reign_blocks=reign_blocks, cfg=cfg)
-
-                    if not isinstance(verdict, Dethrone):
-                        # Slot-dead ⇒ tear down the dead slot. Durable-marking
-                        # is now driven by the verdict path (Hold over synthetic
-                        # rows): if chal really lost, decide() returns Hold and
-                        # the standard mark_attempted/durable flow applies. The
-                        # chal side does not need an extra mark_durable on
-                        # CHAL_SLOT_DEAD — that was asymmetric with king-side
-                        # handling and was attributing slot health (validator
-                        # signal) as a model-quality decision (mark_durable).
-                        if out.status is DuelStatus.KING_SLOT_DEAD:
-                            await _drop_king(state, slots)
-
-                    match verdict:
-                        case Skip(reason=reason):
-                            log.info(f"duel aborted ({reason}, rows={out.rows_added}); skipping verdict")
-                            audit(type="duel_aborted", reason=reason,
-                                  king=_miner_pl(king), challenger=_miner_pl(challenger))
+                        pending_registration = await _champion_registration_status(
+                            backup, await chain.list_miners(), pending, missing_ref_alive=False,
+                        )
+                        if pending_registration == "dead":
+                            old = store.clear_pending_champion()
+                            if old is not None and await asyncio.to_thread(backup.delete_prefix, old.prefix):
+                                store.mark_backup_deleted(old.manifest_key)
+                            log.warning(f"pending champion {pending.model}@{pending.revision} changed before publication; discarded")
+                        elif pending_registration == "unknown":
+                            log.warning("pending champion artifact identity unknown after restore; retrying")
+                            await _cancellable(asyncio.sleep(120), stop)
                             continue
-                        case Hold(evidence=ev):
-                            _audit_verdict("CHAMPION_HOLDS", king, challenger, ev)
-                            continue
-                        case Dethrone(new_champion=new_champion, evidence=ev):
-                            _audit_verdict("CHALLENGER_WINS", king, challenger, ev)
-                            if stop.is_set(): break
-                            fresh = {(m.uid, m.revision) for m in await chain.list_miners()}
-                            if king_id not in fresh:
-                                log.warning(f"verdict skipped: king uid{king.uid}@{king.revision} no longer registered")
-                            elif chal_id not in fresh:
-                                log.warning(f"verdict skipped: challenger uid{challenger.uid}@{challenger.revision} no longer registered")
+                        else:
+                            published = await _publish_champion(store, chain, cfg, pending)
+                            if published and _should_finalize(cfg):
+                                finalized = store.finalize_pending_champion()
+                                if finalized is None:
+                                    raise RuntimeError("pending champion disappeared before finalization")
+                                old_slot = state.king_slot
+                                state.king_slot = pending_slot
+                                pending_slot = None
+                                if old_slot is not None:
+                                    await _safe_teardown(slots, old_slot, "pending-champion-finalized")
+                                if not cfg.dry_run:
+                                    await _gc_retiring(store, backup)
+                            elif not _should_finalize(cfg):
+                                old = store.clear_pending_champion()
+                                if old is not None and await asyncio.to_thread(backup.delete_prefix, old.prefix):
+                                    store.mark_backup_deleted(old.manifest_key)
                             else:
-                                new_reign = Reign(new_champion, await chain.current_block())
-                                new_reign.save(reign_state_path)
-                                await _drop_king(state, slots)
-                                state.king_slot = chal_slot
-                                promoted = True
-                                state.reign = new_reign
-                                states.clear_attempted()
-                                await _maybe_publish(state, chain, cfg, reign_state_path,
-                                                     challenger.uid, challenger.hotkey)
-                                log.info(f"DETHRONE: uid {king.uid} → uid {challenger.uid}")
+                                await _cancellable(asyncio.sleep(120), stop)
+                                continue
                 finally:
-                    if not promoted:
-                        await _safe_teardown(slots, chal_slot, "chal-end-of-duel")
+                    if pending_slot is not None:
+                        await _safe_teardown(slots, pending_slot, "pending-champion-unfinalized")
+            champ = store.champion()
+            if champ is None:
+                champ, state.king_slot = await _bootstrap_champion(store, backup, slots, chain, cfg, stop)
+            all_miners = await chain.list_miners()
+            registration = await _champion_registration_status(backup, all_miners, champ, missing_ref_alive=True)
+            champion_artifact_alive = registration == "alive"
+            if champ.payable and registration == "unknown":
+                log.warning("champion artifact identity unknown; pausing publication and duels")
+                await _cancellable(asyncio.sleep(120), stop)
+                continue
+            if champ.payable and registration == "dead":
+                log.warning(f"champion uid={champ.uid} artifact changed or deregistered; burning weights")
+                store.demote_champion(champ.artifact_id)
+                await _publish_burn(store, chain, cfg, champ.artifact_id)
+            else:
+                await _publish_champion(store, chain, cfg, champ)
+            champ = store.champion() or champ
+            if not champ.payable:
+                champion_artifact_alive = False
+            king_slot = await _ensure_king_slot(state, champ, slots, stop)
+            if king_slot is None:
+                await _cancellable(asyncio.sleep(120), stop)
+                continue
+            queue = sorted(
+                (m for m in all_miners
+                 if not _is_current_champion_registration(m, champ, champion_artifact_alive)
+                 and (m.model, m.revision) not in state.attempted),
+                key=lambda m: (m.block, _tiebreak(m)),
+            )
+            if not queue:
+                state.attempted.clear()
+                log.info("queue exhausted this reign; sleeping 120s before re-probe")
+                await _cancellable(asyncio.sleep(120), stop)
+                continue
 
-            except Exception as e:
-                log.error(f"loop iteration: {e}", exc_info=True)
-                await _cancellable(asyncio.sleep(60), stop)
+            registered = queue[0]
+            challenger_backup = None
+            keep_challenger_backup = False
+            chal_slot = None
+            backup_slot = None
+            promoted = False
+            try:
+                try:
+                    challenger = await _pin_artifact(backup, registered)
+                except Exception as exc:
+                    log.warning(f"challenger pin failed uid{registered.uid}: {exc}")
+                    state.attempted.add((registered.model, registered.revision))
+                    continue
+                chal_slot, status = await _provision(slots, challenger, stop, source="hf")
+                if chal_slot is None:
+                    state.attempted.add((registered.model, registered.revision))
+                    log.warning(f"challenger provision failed uid{registered.uid}: {status}")
+                    continue
+                block = await chain.current_block()
+                alpha = alpha_for_reign(block - champ.reign_start,
+                                        cfg.alpha_start, cfg.alpha_final, cfg.alpha_halflife)
+                duel = store.create_duel(
+                    champion=champ,
+                    challenger_uid=registered.uid,
+                    challenger_hotkey=registered.hotkey,
+                    challenger_model=challenger.model,
+                    challenger_revision=challenger.revision,
+                    schedule_seed=secrets.token_hex(16),
+                    pairs_per_env=cfg.duel_pairs_per_env,
+                    min_discordant=cfg.duel_min_discordant,
+                    alpha=alpha,
+                    started_block=block,
+                )
+                log.info(f"duel: champion {champ.model}@{champ.revision} vs uid{registered.uid} "
+                         f"{challenger.model}@{challenger.revision} alpha={alpha:.4g}")
+                result = await _run_fixed_duel(store, chain, _champion_miner(champ), king_slot,
+                                               challenger, chal_slot, envs, cfg, duel, stop)
+                if result.status == "champion_slot_dead":
+                    await _safe_teardown(slots, king_slot, "champion-slot-dead")
+                    state.king_slot = None
+                    continue
+                if result.status == "delivery_stalled":
+                    state.attempted.add((registered.model, registered.revision))
+                    log.warning("delivery_stalled; keeping champion slot, skipping challenger this pass")
+                    continue
+                if result.status != "dethrone" or result.decision is None or not result.decision.dethrone:
+                    state.attempted.add((registered.model, registered.revision))
+                    log.info(f"verdict: champion holds ({result.status}) counts={result.counts}")
+                    continue
+                fresh = await chain.list_miners()
+                if not await _registered_artifact_alive(backup, fresh, registered, challenger.revision):
+                    log.warning(f"verdict skipped: challenger uid{registered.uid}@{registered.revision} identity changed")
+                    state.attempted.add((registered.model, registered.revision))
+                    continue
+                await _safe_teardown(slots, chal_slot, "pre-promotion-hf-slot")
+                chal_slot = None
+                try:
+                    challenger_backup = await _backup_artifact(backup, challenger.model, challenger.revision)
+                except Exception as exc:
+                    log.warning(f"verdict skipped: challenger backup failed uid{registered.uid}: {exc}")
+                    state.attempted.add((registered.model, registered.revision))
+                    continue
+                store.record_backup(challenger_backup, "staging")
+                backup_slot, backup_status = await _provision(
+                    slots, challenger, stop, source="s3", backup_manifest_key=challenger_backup.manifest_key,
+                )
+                if backup_slot is None:
+                    log.warning(f"candidate backup restore failed ({backup_status}); keeping current champion")
+                    state.attempted.add((registered.model, registered.revision))
+                    continue
+                fresh = await chain.list_miners()
+                if not await _registered_artifact_alive(backup, fresh, registered, challenger.revision):
+                    log.warning(f"verdict skipped: challenger uid{registered.uid}@{registered.revision} changed before publication")
+                    state.attempted.add((registered.model, registered.revision))
+                    continue
+                new_champ = Champion(
+                    artifact_id=challenger_backup.artifact_id,
+                    model=challenger.model,
+                    revision=challenger_backup.revision,
+                    uid=registered.uid,
+                    hotkey=registered.hotkey,
+                    reign_start=await chain.current_block(),
+                    backup_manifest=challenger_backup.manifest_key,
+                    backup_prefix=challenger_backup.prefix,
+                    payable=True,
+                )
+                if _should_finalize(cfg):
+                    store.set_pending_champion(new_champ, challenger_backup)
+                    keep_challenger_backup = True
+                published = await _publish_champion(store, chain, cfg, new_champ)
+                if not (published and _should_finalize(cfg)):
+                    state.attempted.add((registered.model, registered.revision))
+                    continue
+                finalized = store.finalize_pending_champion()
+                if finalized is None:
+                    raise RuntimeError("pending champion disappeared before finalization")
+                old_slot = state.king_slot
+                state.king_slot = backup_slot
+                backup_slot = None
+                promoted = True
+                state.attempted.clear()
+                if old_slot is not None:
+                    await _safe_teardown(slots, old_slot, "old-champion-promoted")
+                if not cfg.dry_run:
+                    await _gc_retiring(store, backup)
+                log.info(f"DETHRONE: {champ.model}@{champ.revision} -> uid {registered.uid}")
+            finally:
+                if chal_slot is not None and not promoted:
+                    await _safe_teardown(slots, chal_slot, "challenger-end")
+                if backup_slot is not None:
+                    await _safe_teardown(slots, backup_slot, "backup-slot-end")
+                if challenger_backup is not None and not keep_challenger_backup:
+                    if await asyncio.to_thread(backup.delete_prefix, challenger_backup.prefix):
+                        store.mark_backup_deleted(challenger_backup.manifest_key)
     finally:
         log.info("shutdown")
-        await _drop_next_chal(state, slots)
-        await _drop_king(state, slots)
+        if state.king_slot is not None:
+            await _safe_teardown(slots, state.king_slot, "shutdown-king")
+        store.close()
 
 
 def bittensor_chain(cfg: Config) -> tuple[Chain, Subtensor]:
@@ -1152,11 +936,20 @@ def bittensor_chain(cfg: Config) -> tuple[Chain, Subtensor]:
     async def publish(uid: int, expected_hotkey: str) -> bool:
         return await set_weights(sub, wallet, cfg.netuid, uid, expected_hotkey)
 
+    async def burn() -> bool:
+        return await clear_weights(sub, wallet, cfg.netuid)
+
+    async def uid_matches(uid: int, expected_hotkey: str) -> bool:
+        meta = await sub.metagraph(cfg.netuid)
+        return 0 <= uid < len(meta.hotkeys) and meta.hotkeys[uid] == expected_hotkey
+
     return Chain(
         hotkey=hotkey,
         list_miners=lambda: get_miners(sub, cfg.netuid, hotkey),
         current_block=sub.get_current_block,
         publish_winner=publish,
+        burn_weights=burn,
+        uid_matches_hotkey=uid_matches,
     ), sub
 
 
@@ -1166,4 +959,10 @@ def static_chain(miners: list[Miner], hotkey: str = "local-validator") -> Chain:
     async def _block(): return 0
     async def _publish(uid: int, expected_hotkey: str) -> bool:
         log.info(f"local winner: uid {uid} (hk {expected_hotkey[:8]})"); return True
-    return Chain(hotkey=hotkey, list_miners=_miners, current_block=_block, publish_winner=_publish)
+    async def _burn() -> bool:
+        log.info("local winner: none"); return True
+    async def _uid_matches(uid: int, expected_hotkey: str) -> bool:
+        return any(m.uid == uid and m.hotkey == expected_hotkey for m in miners)
+    return Chain(hotkey=hotkey, list_miners=_miners, current_block=_block,
+                 publish_winner=_publish, burn_weights=_burn,
+                 uid_matches_hotkey=_uid_matches)

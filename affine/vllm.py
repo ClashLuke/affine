@@ -26,6 +26,7 @@ class Slot:
     revision: str
     base_url: str
     slot_id: str = ""
+    name: str = ""
 
 
 async def health_ping(base_url: str, timeout: float = 5) -> bool:
@@ -60,14 +61,15 @@ class LocalSlots:
         self._urls = [champion_url, challenger_url]
         self._free: list[str] = list(self._urls)
 
-    async def provision(self, model: str, revision: str) -> Slot:
+    async def provision(self, model: str, revision: str, **_kwargs) -> Slot:
         if not self._free:
             raise RuntimeError("no free local slots")
         url = self._free.pop(0)
         try:
             if not await health_ping(url):
                 raise SlotProvisionFailed(f"local slot not healthy: {url}")
-            return Slot(model=model, revision=revision, base_url=url, slot_id=f"local-{url}")
+            log.info(f"slot ready after 0s: {url}")
+            return Slot(model=model, revision=revision, base_url=url, slot_id=f"local-{url}", name=f"local-{url}")
         except BaseException:
             self._free.append(url)
             raise
@@ -77,31 +79,46 @@ class LocalSlots:
             self._free.append(slot.base_url)
 
 
-class FixedSlots:
-    """Map (model, revision) → pre-existing vLLM URL. Local dev."""
-    def __init__(self, urls: dict[tuple[str, str], str]):
-        self._urls = urls
 
-    async def provision(self, model: str, revision: str) -> Slot:
-        url = self._urls.get((model, revision))
-        if url is None:
-            raise SlotProvisionFailed(f"no url for {model}@{revision}")
-        if not await health_ping(url):
-            raise SlotProvisionFailed(f"unhealthy: {url}")
-        return Slot(model=model, revision=revision, base_url=url, slot_id=f"fixed-{url}")
-
-    async def teardown(self, slot: Slot) -> None:
-        pass
-
-
-_VLLM_IMAGE = os.getenv("AFFINE_VLLM_IMAGE", "vllm/vllm-openai:latest-cu130-ubuntu2404")
-_RESOURCE = os.getenv("AFFINE_TARGON_RESOURCE", "h200-small")
+_DEFAULT_VLLM_IMAGE = "vllm/vllm-openai:latest-cu130-ubuntu2404"
 _WORKLOADS = "/tha/v2/workloads"
 _CRASH_EVENTS = {"POD_CRASHLOOP_BACKOFF", "POD_BACK_OFF", "POD_FAILED", "POD_OOM_KILLED"}
 
 
+def _vllm_image() -> str:
+    return os.getenv("AFFINE_VLLM_IMAGE", _DEFAULT_VLLM_IMAGE)
+
+
+def require_s3_restore_image() -> None:
+    if _vllm_image() == _DEFAULT_VLLM_IMAGE:
+        raise RuntimeError(
+            "AFFINE_VLLM_IMAGE must be built from Dockerfile.vllm for S3 restore; "
+            "stock vLLM can only boot Hugging Face models"
+        )
+
+
+def _registry_auth() -> dict[str, str] | None:
+    auth = {
+        "server": os.getenv("AFFINE_VLLM_REGISTRY_SERVER", "").strip(),
+        "username": os.getenv("AFFINE_VLLM_REGISTRY_USERNAME", "").strip(),
+        "password": os.getenv("AFFINE_VLLM_REGISTRY_PASSWORD", "").strip(),
+    }
+    if not any(auth.values()):
+        return None
+    if not all(auth.values()):
+        raise RuntimeError(
+            "AFFINE_VLLM_REGISTRY_SERVER, AFFINE_VLLM_REGISTRY_USERNAME, "
+            "and AFFINE_VLLM_REGISTRY_PASSWORD must be set together"
+        )
+    return auth
+
+
+def _resource() -> str:
+    return os.getenv("AFFINE_TARGON_RESOURCE", "h200-small")
+
+
 def _http():
-    from targon import Client
+    from targon.client.client import Client
     return Client.async_serverless
 
 
@@ -204,7 +221,9 @@ class TargonSlots:
         # Lowercase-hex prefix scopes reconcile() to our own workloads when
         # multiple validators share a Targon API key. (Targon names are
         # lowercase-alphanumeric-plus-hyphens only; Substrate hotkeys aren't.)
-        self._prefix = f"af{hashlib.sha256(hotkey.encode()).hexdigest()[:6]}"
+        namespace = os.getenv("AFFINE_NAMESPACE", "prod").strip() or "prod"
+        scope = namespace + "\0" + hotkey
+        self._prefix = f"af{hashlib.sha256(scope.encode()).hexdigest()[:6]}"
 
     async def reconcile(self) -> int:
         """Delete stale workloads we own — matched by `{prefix}-` so a second
@@ -228,14 +247,22 @@ class TargonSlots:
         await asyncio.gather(*(self._delete(uid) for uid in victims))
         return len(victims)
 
-    async def provision(self, model: str, revision: str, timeout: int | None = None) -> Slot:
+    async def provision(
+        self,
+        model: str,
+        revision: str,
+        timeout: int | None = None,
+        *,
+        source: str = "hf",
+        backup_manifest_key: str | None = None,
+    ) -> Slot:
         if timeout is None:
             timeout = int(getattr(self._config, "provision_timeout", 900))
         # Random suffix so concurrent provisions of the same (model, revision) —
         # king & challenger sharing a popular base — don't collide on the workload name.
         h = hashlib.sha256(f"{model}\0{revision}".encode()).hexdigest()[:8]
         name = f"{self._prefix}-{h}-{secrets.token_hex(4)}"
-        args = [
+        vllm_args = [
             "--model", model,
             "--revision", revision,
             "--served-model-name", model,
@@ -256,6 +283,9 @@ class TargonSlots:
             "--max-num-seqs", "1024",
             "--max-num-batched-tokens", "65536",
         ]
+        image = _vllm_image()
+        commands = None
+        args = vllm_args
         env = {
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
             # PR #30515: fold cudagraph cost into startup memory profiling so the
@@ -267,19 +297,42 @@ class TargonSlots:
             v = os.environ.get(k)
             if v:
                 env[k] = v
+        if source == "hf" and image != _DEFAULT_VLLM_IMAGE:
+            commands = ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        if source == "s3":
+            if not backup_manifest_key:
+                raise ValueError("backup_manifest_key is required for source='s3'")
+            require_s3_restore_image()
+            args = [
+                "--source", "s3",
+                "--model", model,
+                "--revision", revision,
+                "--served-model-name", model,
+                "--manifest-key", backup_manifest_key,
+                "--",
+                *vllm_args[6:],
+            ]
+            env.update(_s3_env())
+        elif source != "hf":
+            raise ValueError(f"unknown vLLM source: {source}")
 
         payload = {
             "type": "RENTAL",
             "name": name,
-            "image": _VLLM_IMAGE,
-            "resource_name": _RESOURCE,
+            "image": image,
+            "resource_name": _resource(),
             "args": args,
             "envs": [{"name": k, "value": v} for k, v in env.items()],
             "ports": [{"port": 8000, "protocol": "TCP"}],
         }
+        registry_auth = _registry_auth()
+        if registry_auth is not None:
+            payload["registry_auth"] = registry_auth
+        if commands is not None:
+            payload["commands"] = commands
 
         http = _http()
-        log.info(f"targon rental register: name={name} image={_VLLM_IMAGE} resource={_RESOURCE} model={model}")
+        log.info(f"targon rental register: name={name} image={image} resource={payload['resource_name']} model={model} source={source}")
         # Single try wrapping register+deploy+wait. The register call itself
         # creates the workload on Targon's side: a CancelledError delivered as
         # the post() returns, or a malformed response that triggers RuntimeError
@@ -306,7 +359,7 @@ class TargonSlots:
                 await asyncio.shield(self._delete(uid))
             raise
         log.info(f"targon slot ready: uid={uid} base_url={base_url}")
-        return Slot(model=model, revision=revision, base_url=base_url, slot_id=uid)
+        return Slot(model=model, revision=revision, base_url=base_url, slot_id=uid, name=name)
 
     async def teardown(self, slot: Slot) -> None:
         if not slot.slot_id or slot.slot_id.startswith("local-"):
@@ -324,3 +377,23 @@ class TargonSlots:
             log.warning(f"targon delete hung for {uid}")
         except Exception as e:
             log.warning(f"targon delete failed for {uid}: {e}")
+
+
+def _s3_env() -> dict[str, str]:
+    names = (
+        "HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY", "HIPPIUS_S3_BUCKET",
+        "HIPPIUS_S3_PREFIX", "HIPPIUS_S3_ENDPOINT", "HIPPIUS_S3_REGION",
+        "R2_S3_ACCESS_KEY_ID", "R2_S3_SECRET_ACCESS_KEY", "R2_S3_BUCKET",
+        "R2_S3_PREFIX", "R2_S3_ENDPOINT_URL", "R2_S3_REGION",
+    )
+    env = {k: v for k in names if (v := os.environ.get(k))}
+    has_hippius = all(k in env for k in ("HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY", "HIPPIUS_S3_BUCKET"))
+    has_r2 = all(k in env for k in ("R2_S3_ACCESS_KEY_ID", "R2_S3_SECRET_ACCESS_KEY", "R2_S3_BUCKET", "R2_S3_ENDPOINT_URL"))
+    if not (has_hippius or has_r2):
+        raise RuntimeError("missing S3 env for backup restore")
+    if has_hippius:
+        env.setdefault("HIPPIUS_S3_ENDPOINT", "https://s3.hippius.com")
+        env.setdefault("HIPPIUS_S3_REGION", "decentralized")
+    if has_r2:
+        env.setdefault("R2_S3_REGION", "auto")
+    return env

@@ -6,6 +6,11 @@ from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 
+def _truthy(name: str) -> bool:
+    v = os.getenv(name, "").strip().lower()
+    return v not in ("", "0", "false", "no", "off")
+
+
 @dataclass(frozen=True)
 class EnvSpec:
     name: str
@@ -23,14 +28,15 @@ class Config:
     hotkey_name: str = "default"
     subtensor_endpoint: str = "finney"
     subtensor_fallback: str = "wss://lite.sub.latent.to:443"
-    dwell_batch: int = 1                  # matched-task pairs kept in flight at all times; sets the parallelism ceiling. Dwell exits only on principled stops (z>k, z<-k, shutdown, slot-dead) — there is no iter cap.
-    k_init: float = 3.0                   # starting dethronement threshold
-    k_final: float = 1.0                  # asymptotic threshold
-    k_halflife: int = 7200                # blocks for k decay half-life (~24h on 12s blocks)
-    sigma_beta: float = 1.0               # std of β prior (env difficulty); ±2 logits at 1.96σ
-    sigma_alpha: float = 0.5              # std of log α prior; a ∈ [0.38, 2.66] at 1.96σ
-    evidence_path: str = "./.affine/evidence.jsonl"
+    dwell_batch: int = 1                  # matched-task pairs kept in flight at all times; parallelism ceiling.
+    db_path: str = "./.affine/affine.sqlite3"
+    duel_pairs_per_env: int = 32
+    duel_min_discordant: int = 16
+    alpha_start: float = 0.005
+    alpha_final: float = 0.05
+    alpha_halflife: int = 7200
     provision_timeout: int = 900          # seconds to wait for a vLLM slot to become /v1/models ready
+    dry_run: bool = False
     log_level: str = "INFO"
     environments: tuple[EnvSpec, ...] = ()
 
@@ -44,13 +50,14 @@ class Config:
             subtensor_endpoint=endpoint,
             subtensor_fallback=os.getenv("SUBTENSOR_FALLBACK", "wss://lite.sub.latent.to:443"),
             dwell_batch=int(os.getenv("AFFINE_DWELL_BATCH", "1")),
-            k_init=float(os.getenv("AFFINE_K_INIT", "3.0")),
-            k_final=float(os.getenv("AFFINE_K_FINAL", "1.0")),
-            k_halflife=int(os.getenv("AFFINE_K_HALFLIFE", "7200")),
-            sigma_beta=float(os.getenv("AFFINE_SIGMA_BETA", "1.0")),
-            sigma_alpha=float(os.getenv("AFFINE_SIGMA_ALPHA", "0.5")),
-            evidence_path=os.getenv("AFFINE_EVIDENCE_PATH", "./.affine/evidence.jsonl"),
+            db_path=os.getenv("AFFINE_DB_PATH", "./.affine/affine.sqlite3"),
+            duel_pairs_per_env=int(os.getenv("AFFINE_DUEL_PAIRS_PER_ENV", "32")),
+            duel_min_discordant=int(os.getenv("AFFINE_DUEL_MIN_DISCORDANT", "16")),
+            alpha_start=float(os.getenv("AFFINE_ALPHA_START", "0.005")),
+            alpha_final=float(os.getenv("AFFINE_ALPHA_FINAL", "0.05")),
+            alpha_halflife=int(os.getenv("AFFINE_ALPHA_HALFLIFE", "7200")),
             provision_timeout=int(os.getenv("AFFINE_PROVISION_TIMEOUT", "900")),
+            dry_run=_truthy("AFFINE_DRY_RUN"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             environments=_default_environments(),
         )
@@ -84,7 +91,6 @@ def _apply_config_spec(cfg: Config, spec: str) -> Config:
 _PROFILES: dict[str, dict] = {
     "default": {},
     "full": {
-        "k_init": 3.0,
         "env_overrides": {
             "python": {"params": {"timeout": 300}},
             "nfa": {"params": {"timeout": 300}},
@@ -96,7 +102,6 @@ _PROFILES: dict[str, dict] = {
         },
     },
     "smoke": {
-        "k_init": 1.0,
         "env_overrides": {
             "python": {"params": {"timeout": 90, "lines": 16}},
             "nfa": {"params": {"timeout": 90, "states": 7, "length": 8, "accept_count": 2}},
@@ -111,11 +116,15 @@ _PROFILES: dict[str, dict] = {
 
 
 _TOP_LEVEL_KEYS = frozenset(f.name for f in fields(Config)) | {"env_overrides", "environments"}
+_JSON_DENIED = frozenset({"dry_run"})  # env-only kill switch, never from config spec
 
 
 def _apply_json_overrides(cfg: Config, raw: dict) -> Config:
     if not isinstance(raw, dict):
         raise TypeError(f"AFFINE_CONFIG_SPEC must decode to an object, got {type(raw).__name__}")
+    denied = set(raw) & _JSON_DENIED
+    if denied:
+        raise KeyError(f"env-only config keys cannot be set in AFFINE_CONFIG_SPEC: {sorted(denied)}")
     unknown = set(raw) - _TOP_LEVEL_KEYS
     if unknown:
         raise KeyError(f"unknown config keys: {sorted(unknown)}; "
@@ -173,29 +182,24 @@ def _apply_env_overrides(current: tuple[EnvSpec, ...], raw: dict) -> tuple[EnvSp
 
 def _validate(cfg: Config) -> None:
     """Reject configs that would crash deeper in the stack with confusing errors.
-    NaN/Inf gets through `<=`/`>=` because all comparisons against NaN are False;
-    use math.isfinite explicitly so Priors(σ=nan) doesn't poison the IRT fit."""
+    NaN/Inf passes through `<=`/`>=` (all comparisons against NaN are False), so
+    we use math.isfinite explicitly."""
     if cfg.dwell_batch <= 0:
         raise ValueError(f"dwell_batch must be > 0, got {cfg.dwell_batch}")
-    if cfg.k_halflife <= 0:
-        raise ValueError(f"k_halflife must be > 0, got {cfg.k_halflife}")
-    for n in ("k_init", "k_final"):
-        v = getattr(cfg, n)
-        if not math.isfinite(v):
-            raise ValueError(f"{n} must be finite, got {v}")
-    # k_final must be strictly positive: with k_final=0, k decays to 0 over a long
-    # reign and any positive z (even noise-driven) would dethrone. Negative would
-    # dethrone strictly worse challengers. The minimum useful threshold is 1σ.
-    if cfg.k_final <= 0:
-        raise ValueError(f"k_final must be > 0, got {cfg.k_final}")
-    if cfg.k_final > cfg.k_init:
-        raise ValueError(f"k_final ({cfg.k_final}) must be <= k_init ({cfg.k_init})")
-    for n in ("sigma_beta", "sigma_alpha"):
-        v = getattr(cfg, n)
-        if not (math.isfinite(v) and v > 0):
-            raise ValueError(f"{n} must be finite and > 0, got {v}")
     if cfg.provision_timeout <= 0:
         raise ValueError(f"provision_timeout must be > 0, got {cfg.provision_timeout}")
+    if cfg.duel_pairs_per_env <= 0:
+        raise ValueError(f"duel_pairs_per_env must be > 0, got {cfg.duel_pairs_per_env}")
+    if cfg.duel_min_discordant < 0:
+        raise ValueError(f"duel_min_discordant must be >= 0, got {cfg.duel_min_discordant}")
+    if cfg.alpha_halflife <= 0:
+        raise ValueError(f"alpha_halflife must be > 0, got {cfg.alpha_halflife}")
+    for n in ("alpha_start", "alpha_final"):
+        v = getattr(cfg, n)
+        if not (math.isfinite(v) and 0.0 < v < 1.0):
+            raise ValueError(f"{n} must be in (0, 1), got {v}")
+    if cfg.alpha_start > cfg.alpha_final:
+        raise ValueError(f"alpha_start ({cfg.alpha_start}) must be <= alpha_final ({cfg.alpha_final})")
     if not cfg.environments:
         raise ValueError("environments must not be empty")
     seen: set[str] = set()
@@ -333,9 +337,8 @@ def _validate_task_range(name: str, raw) -> tuple[int, int]:
     return lo, hi
 
 
-# Cold-start baseline: on empty evidence, elect the first registered miner whose
-# model string matches one of these. Avoids the degenerate "argmax on all-zero
-# θ̂ returns uid at index 0" cold-start. Falls through to argmax if none match.
+# First-ever bootstrap baseline. Recovery never uses aggregate scores; once a
+# reign exists, its saved artifact remains the baseline until direct dethrone.
 BASELINE_MODELS: tuple[str, ...] = ("Qwen/Qwen3-32B", "openai/gpt-oss-120b")
 
 

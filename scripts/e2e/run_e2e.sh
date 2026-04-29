@@ -195,7 +195,9 @@ wait_healthy "http://localhost:$VLLM_PORT_B/v1" "vLLM-B" 120
 log "bootstrapping dev chain (wallets, subnet, registrations, commitments)"
 python3 scripts/e2e/bootstrap_dev_chain.py \
     --endpoint ws://127.0.0.1:9944 \
-    --model "$MODEL"
+    --model "$MODEL" \
+    --revision-a stub \
+    --revision-b real
 
 # ------------------------------------------------------------------
 # 6. read bootstrap output and export env
@@ -217,6 +219,11 @@ export AFFINE_LOCAL=1
 export CHAMPION_URL="http://localhost:$VLLM_PORT_A/v1"
 export CHALLENGER_URL="http://localhost:$VLLM_PORT_B/v1"
 export LOG_LEVEL=DEBUG
+export AFFINE_DB_PATH="$PROJECT_DIR/.e2e/affine.sqlite3"
+export AFFINE_BASELINE_MODEL="$MODEL"
+export AFFINE_BASELINE_REVISION="stub"
+
+rm -f "$AFFINE_DB_PATH" "$AFFINE_DB_PATH-wal" "$AFFINE_DB_PATH-shm"
 
 log "env: SUBTENSOR_ENDPOINT=$SUBTENSOR_ENDPOINT NETUID=$NETUID"
 log "env: BT_WALLET_COLD=$BT_WALLET_COLD BT_WALLET_HOT=$BT_WALLET_HOT"
