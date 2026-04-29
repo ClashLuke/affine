@@ -295,6 +295,25 @@ async def _safe_teardown(slots, slot: Slot, ctx: str) -> None:
     except Exception as e: log.warning(f"teardown error ({ctx}): {e}")
 
 
+def _shutdown_signals() -> tuple[signal.Signals, ...]:
+    sigs = [signal.SIGTERM, signal.SIGINT]
+    if hasattr(signal, "SIGHUP"):
+        sigs.append(signal.SIGHUP)
+    return tuple(sigs)
+
+
+def _install_signal_handlers(stop: asyncio.Event) -> None:
+    loop = asyncio.get_running_loop()
+    for sig in _shutdown_signals():
+        def request_stop(sig=sig):
+            log.warning(f"shutdown signal received: {sig.name}")
+            stop.set()
+        try:
+            loop.add_signal_handler(sig, request_stop)
+        except (NotImplementedError, ValueError):
+            signal.signal(sig, lambda *_args, request_stop=request_stop: request_stop())
+
+
 def _slot_from_task(t: asyncio.Task) -> Slot | None:
     """Extract the slot from a task wrapping `_provision`. Returns None for any
     not-clean state (still running, cancelled, raised). The not-done guard is
@@ -594,6 +613,8 @@ async def dwell(chain: Chain, king: Miner, king_slot: Slot,
             if not t.done(): t.cancel()
         for t in list(inflight):
             try: await asyncio.shield(t)
+            except asyncio.CancelledError:
+                pass
             except BaseException as ex:
                 log.warning(f"dwell drain ({reason}) interrupted: {type(ex).__name__}")
         inflight.clear()
@@ -945,10 +966,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
         rng = np.random.default_rng(secrets.randbits(64))
 
         stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for s in (signal.SIGTERM, signal.SIGINT):
-            try: loop.add_signal_handler(s, stop.set)
-            except (NotImplementedError, ValueError): signal.signal(s, lambda *_: stop.set())
+        _install_signal_handlers(stop)
 
         rows = store.read()
         prev_fit_state: tuple[Fit, list[ArtKey], list[str]] | None = None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,8 +15,9 @@ from affine.evidence import EvidenceStore, Row
 from affine.irt import Priors
 from affine.loop import (
     SLOT_DEAD, Chain, LoopState, MinerStates, Reign, _apply_skip, _cancellable,
-    art_key, _drop_next_chal, dwell, _fit, _load_envs, _provision, _provision_pair,
-    _respondents, _seed, _slot_from_task, _start_prefetch, _take_prefetched, static_chain,
+    _install_signal_handlers, art_key, _drop_next_chal, dwell, _fit, _load_envs,
+    _provision, _provision_pair, _respondents, _seed, _shutdown_signals,
+    _slot_from_task, _start_prefetch, _take_prefetched, static_chain,
 )
 from affine.verdict import DuelStatus
 from affine.vllm import SlotProvisionFailed
@@ -1015,6 +1017,20 @@ def test_static_chain_returns_fixed_miners():
     assert chain.hotkey == "hk"
     assert asyncio.run(chain.list_miners()) == miners
     assert asyncio.run(chain.current_block()) == 0
+
+
+@pytest.mark.asyncio
+async def test_shutdown_signal_handlers_include_hup(monkeypatch):
+    if not hasattr(signal, "SIGHUP"):
+        pytest.skip("SIGHUP is POSIX-only")
+    callbacks = {}
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "add_signal_handler", lambda sig, cb: callbacks.setdefault(sig, cb))
+    stop = asyncio.Event()
+    _install_signal_handlers(stop)
+    assert set(_shutdown_signals()) >= {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
+    callbacks[signal.SIGHUP]()
+    assert stop.is_set()
 
 
 def _env(err=False):

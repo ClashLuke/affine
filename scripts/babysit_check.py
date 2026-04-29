@@ -15,12 +15,30 @@ Exits 0 clean, 1 if any FAIL.
 """
 from __future__ import annotations
 
-import json, math, re, subprocess, sys, time
+import json, math, os, re, subprocess, sys, time
 from collections import Counter
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
+
+def _prime_shadow_env() -> None:
+    dotenv = REPO / ".env"
+    if dotenv.exists():
+        for line in dotenv.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+                os.environ.setdefault(k, v.strip().strip("'\""))
+    spec = REPO / ".shadow" / "config.json"
+    if spec.exists():
+        os.environ.setdefault("AFFINE_CONFIG_SPEC", str(spec))
+
+
+_prime_shadow_env()
 
 from affine.chain import Miner
 from affine.config import Config
@@ -177,6 +195,7 @@ dwell_re = re.compile(
 # Sampler errors.
 infra_re   = re.compile(r"affine\.sampler WARNING infra failure \(([^)]+)\) in ([\d.]+)s, error_type=(\w+):")
 timeout_re = re.compile(r"affine\.sampler WARNING sample timeout \(([^)]+)\) in ([\d.]+)s")
+outer_timeout_re = re.compile(r"affine\.sampler WARNING sample timed out after ([\d.]+)s: ([^\n]+)")
 
 # Provisioning.
 slot_ready_re   = re.compile(r"affine\.vllm INFO slot ready after (\d+)s:")
@@ -197,13 +216,14 @@ engine_dead_re  = re.compile(r"EngineCore encountered an issue")
 def _scan(text: str):
     cl_total = len(crashloop_re.findall(text))
     wh_fail  = len(warm_fail_re.findall(text))
+    outer_timeouts = [(model, seconds) for seconds, model in outer_timeout_re.findall(text)]
     return {
         "duels": duel_re.findall(text),
         "verdicts": verdict_re.findall(text),
         "aborts": abort_re.findall(text),
         "dethrones": dethrone_re.findall(text),
         "infra": infra_re.findall(text),
-        "timeouts": timeout_re.findall(text),
+        "timeouts": timeout_re.findall(text) + outer_timeouts,
         "slot_ready": [int(x) for x in slot_ready_re.findall(text)],
         "crashloops": cl_total - wh_fail,    # true POD_CRASHLOOP_BACKOFF only
         "warm_fails": wh_fail,

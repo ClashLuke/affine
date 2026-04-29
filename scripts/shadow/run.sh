@@ -69,4 +69,45 @@ log "config: NETUID=$NETUID SUBTENSOR=$SUBTENSOR_ENDPOINT SPEC=$AFFINE_CONFIG_SP
 # Prepend venv bin so the `targon` subprocess invoked by TargonSlots resolves
 # to the venv's targon-sdk CLI, not the broken system /usr/bin copy.
 export PATH="$VENV/bin:$PATH"
-exec "$VENV/bin/affine" 2>&1 | tee "$STDERR_LOG"
+
+SHADOW_CLEANED=0
+shadow_cleanup() {
+    [ "$SHADOW_CLEANED" = "0" ] || return 0
+    SHADOW_CLEANED=1
+    {
+        log "cleanup: reconciling shadow rentals"
+        "$VENV/bin/python" - <<'PY'
+import asyncio
+
+import bittensor as bt
+
+from affine.config import Config
+from affine.vllm import TargonSlots
+
+
+async def main():
+    cfg = Config.from_env()
+    wallet = bt.Wallet(name=cfg.wallet_name, hotkey=cfg.hotkey_name)
+    n = await TargonSlots(cfg, hotkey=wallet.hotkey.ss58_address).reconcile()
+    print(f"shadow cleanup: reconcile deleted {n} stale rentals")
+
+
+asyncio.run(main())
+PY
+    } >>"$STDERR_LOG" 2>&1 || true
+}
+
+on_exit() {
+    status=$?
+    trap - EXIT
+    shadow_cleanup
+    exit "$status"
+}
+trap on_exit EXIT
+
+log "launching affine; output is appended to $STDERR_LOG"
+set +e
+"$VENV/bin/affine" >>"$STDERR_LOG" 2>&1
+status=$?
+set -e
+exit "$status"
