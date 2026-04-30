@@ -16,8 +16,9 @@ def now() -> int:
     return int(time.time())
 
 
-def artifact_id(model: str, revision: str) -> str:
-    return hashlib.sha256(f"{model}\0{revision}".encode()).hexdigest()[:24]
+def artifact_id(model: str, pinned_revision: str) -> str:
+    """Content-addressed artifact identity. A champion without this is not a champion."""
+    return hashlib.sha256(f"{model}\0{pinned_revision}".encode()).hexdigest()[:24]
 
 
 @dataclass(frozen=True)

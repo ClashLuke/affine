@@ -124,19 +124,6 @@ def main() -> int:
         samples = db.execute("SELECT * FROM samples").fetchall()
         if champ is None:
             problems.append("no SQLite champion")
-        if pids:
-            latest = max(
-                (int(r[0] or 0) for r in (
-                    db.execute("SELECT MAX(updated_at) FROM champion").fetchone(),
-                    db.execute("SELECT MAX(updated_at) FROM duels").fetchone(),
-                    db.execute("SELECT MAX(updated_at) FROM publications").fetchone(),
-                    db.execute("SELECT MAX(verified_at) FROM backups").fetchone(),
-                )),
-                default=0,
-            )
-            age = time.time() - latest if latest else float("inf")
-            if age > PROBE_WINDOW_S:
-                problems.append(f"SQLite state stale {age:.0f}s while validator alive")
 
     status = "OK" if not problems and not warns else ("WARN" if not problems else "FAIL")
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

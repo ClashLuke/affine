@@ -5,10 +5,8 @@ import os
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
-
-def _truthy(name: str) -> bool:
-    v = os.getenv(name, "").strip().lower()
-    return v not in ("", "0", "false", "no", "off")
+from .chain import _truthy_env
+from .envs._base import load_env_class
 
 
 @dataclass(frozen=True)
@@ -57,8 +55,8 @@ class Config:
             alpha_final=float(os.getenv("AFFINE_ALPHA_FINAL", "0.05")),
             alpha_halflife=int(os.getenv("AFFINE_ALPHA_HALFLIFE", "7200")),
             provision_timeout=int(os.getenv("AFFINE_PROVISION_TIMEOUT", "900")),
-            dry_run=_truthy("AFFINE_DRY_RUN"),
-            log_level=os.getenv("LOG_LEVEL", "INFO"),
+            dry_run=_truthy_env("AFFINE_DRY_RUN"),
+            log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
             environments=_default_environments(),
         )
         spec = os.getenv("AFFINE_CONFIG_SPEC", "").strip()
@@ -200,6 +198,7 @@ def _validate(cfg: Config) -> None:
             raise ValueError(f"{n} must be in (0, 1), got {v}")
     if cfg.alpha_start > cfg.alpha_final:
         raise ValueError(f"alpha_start ({cfg.alpha_start}) must be <= alpha_final ({cfg.alpha_final})")
+    _validate_log_level(cfg.log_level)
     if not cfg.environments:
         raise ValueError("environments must not be empty")
     seen: set[str] = set()
@@ -222,6 +221,14 @@ def _validate(cfg: Config) -> None:
         _validate_env_params(spec.name, spec.entrypoint, spec.params)
 
 
+_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+
+def _validate_log_level(level: str) -> None:
+    if level not in _LOG_LEVELS:
+        raise ValueError(f"LOG_LEVEL must be one of {sorted(_LOG_LEVELS)}, got {level!r}")
+
+
 _GENERATION_KEYS = frozenset({
     "api_key", "frequency_penalty", "logit_bias", "max_tokens", "min_p", "presence_penalty",
     "repetition_penalty", "stop", "temperature", "top_k", "top_p", "gym_max_steps",
@@ -231,7 +238,6 @@ _GENERATION_KEYS = frozenset({
 def _validate_env_params(name: str, entrypoint: str, params: dict) -> None:
     if not isinstance(params, dict):
         raise TypeError(f"env '{name}': params must be an object, got {type(params).__name__}")
-    from affine.envs._base import load_env_class
     cls = load_env_class(entrypoint)
     unknown = set(params) - cls.option_keys - _GENERATION_KEYS - {"timeout"}
     if unknown:

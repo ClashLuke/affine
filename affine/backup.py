@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import logging
@@ -9,10 +10,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import boto3
 import httpx
 import smart_open
+from botocore.config import Config as BotoConfig
+from huggingface_hub import HfApi, hf_hub_url
 
-from .dotenv import load_dotenv
 from .store import BackupRecord, artifact_id
 
 
@@ -36,11 +39,8 @@ class S3Config:
     access_key: str
     secret_key: str
 
-    @property
+    @functools.cached_property
     def transport_params(self) -> dict:
-        import boto3
-        from botocore.config import Config as BotoConfig
-
         client = boto3.client(
             "s3",
             endpoint_url=self.endpoint_url,
@@ -149,6 +149,8 @@ def decode_refs(raw: str) -> list[ManifestRef]:
     data = json.loads(raw)
     if not isinstance(data, list):
         raise ValueError("backup reference must be a list")
+    if not data:
+        raise ValueError("backup reference must not be empty")
     return [ManifestRef(
         provider=str(x["provider"]),
         bucket=str(x["bucket"]),
@@ -172,18 +174,8 @@ class BackupManager:
         self.by_name = {c.name: c for c in configs}
         self.transport = {c.name: c.transport_params for c in configs}
 
-    def ensure_buckets(self) -> None:
-        for cfg in self.configs:
-            try:
-                with smart_open.open(cfg.uri(".affine-bucket-check"), "wb",
-                                     transport_params=self.transport[cfg.name]) as out:
-                    out.write(b"")
-            except Exception as exc:
-                log.warning("backup provider %s bucket check failed: %s", cfg.name, exc)
 
     def backup_hf_artifact(self, model: str, revision: str) -> BackupRecord:
-        from huggingface_hub import HfApi, hf_hub_url
-
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
         api = HfApi(token=token)
         info = api.model_info(model, revision=revision)
@@ -218,7 +210,8 @@ class BackupManager:
 
             refs = self._write_manifests(model, pinned, art, ts, prefixes, file_meta, provider_ok)
             if refs:
-                failed = {cfg.name for cfg in self.configs} - provider_ok
+                successful = {r.provider for r in refs}
+                failed = {cfg.name for cfg in self.configs} - successful
                 if failed:
                     self._cleanup_prefixes({n: prefixes[n] for n in failed})
                 encoded = encode_refs(refs)
@@ -256,14 +249,16 @@ class BackupManager:
 
     def restore(self, manifest_key: str, dest: str | Path) -> BackupRecord:
         refs = decode_refs(manifest_key)
-        while True:
+        for attempt in range(_MAX_ATTEMPTS):
             for ref in refs:
                 try:
                     return self._restore_ref(ref, refs, dest)
                 except Exception as exc:
-                    log.warning("backup restore failed on provider %s: %s", ref.provider, exc)
-            log.warning("all backup providers failed restore; cycling")
-            time.sleep(1)
+                    log.warning("backup restore failed on provider %s (attempt %d/%d): %s", ref.provider, attempt + 1, _MAX_ATTEMPTS, exc)
+            if attempt < _MAX_ATTEMPTS - 1:
+                log.warning("all backup providers failed restore (attempt %d/%d)", attempt + 1, _MAX_ATTEMPTS)
+                time.sleep(_backoff(attempt))
+        raise RuntimeError(f"backup restore failed after {_MAX_ATTEMPTS} attempts")
 
     def delete_prefix(self, prefix: str) -> bool:
         refs = decode_refs(prefix)
@@ -406,7 +401,7 @@ class BackupManager:
                 raise ValueError(f"backup object mismatch: {f['path']}")
 
     def _restore_ref(self, ref: ManifestRef, refs: list[ManifestRef], dest: str | Path) -> BackupRecord:
-        manifest, raw, cfg = self._manifest_from_ref(ref)
+        manifest, cfg = self._manifest_from_ref(ref)
         base = Path(dest)
         base.mkdir(parents=True, exist_ok=True)
         for f in manifest["files"]:
@@ -442,21 +437,7 @@ class BackupManager:
                 log.warning("backup cleanup failed on provider %s prefix=%s: %s", name, prefix, exc)
 
     def _delete_prefix(self, cfg: S3Config, prefix: str) -> None:
-        import boto3
-        from botocore.config import Config as BotoConfig
-
-        client = boto3.client(
-            "s3",
-            endpoint_url=cfg.endpoint_url,
-            region_name=cfg.region,
-            aws_access_key_id=cfg.access_key,
-            aws_secret_access_key=cfg.secret_key,
-            config=BotoConfig(
-                signature_version="s3v4",
-                retries={"total_max_attempts": 1, "mode": "standard"},
-                s3={"addressing_style": "path"},
-            ),
-        )
+        client = cfg.transport_params["client"]
         token = None
         while True:
             kwargs = {"Bucket": cfg.bucket, "Prefix": prefix}
@@ -484,7 +465,6 @@ def _close_all(writers: dict) -> None:
 
 
 def restore_from_env(manifest_key: str, dest: str | Path) -> BackupRecord:
-    load_dotenv()
     configs = S3Config.from_env_refs()
     if not configs:
         raise RuntimeError("no S3 backup providers configured for restore")

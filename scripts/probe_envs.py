@@ -41,7 +41,9 @@ async def probe_one(spec: EnvSpec, task_id: int, slot: Slot, api_key: str | None
     if api_key:
         kwargs["api_key"] = api_key
     factory = EnvFactory(spec.entrypoint)
-    obs, _ = factory.make().reset(seed=task_id, options=kwargs)
+    env_cls = factory.make()
+    reset_opts = {k: v for k, v in kwargs.items() if k in env_cls.option_keys}
+    obs, _ = env_cls.reset(seed=task_id, options=reset_opts)
     prompt = obs if isinstance(obs, str) else json.dumps(obs, sort_keys=True, default=str)
     passed, dt, tokens = await run_one(factory, kwargs, float(spec.params.get("timeout", 120)),
                                        slot, seed=task_id * 1_000_003, task_id=task_id)

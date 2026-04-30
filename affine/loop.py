@@ -12,13 +12,16 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import signal
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
+import bittensor as bt
 import httpx
+from huggingface_hub import HfApi
 from huggingface_hub.errors import RepositoryNotFoundError, RevisionNotFoundError
 
 from .backup import BackupManager, S3Config
@@ -34,6 +37,7 @@ log = logging.getLogger(__name__)
 
 ArtKey = tuple[str, str]
 SLOT_DEAD = 30   # consecutive same-slot delivery failures → abort duel, reprovision
+KING_REPROVISION_LIMIT = 10  # consecutive failed champion reprovisions → fatal exit
 
 
 @dataclass
@@ -97,13 +101,11 @@ async def _cancellable(coro, stop: asyncio.Event, on_orphan=None):
             # this we'd drop the reference mid-cleanup and leak the rental.
             try: await asyncio.wait_for(asyncio.shield(worker), timeout=60)
             except asyncio.TimeoutError:
-                # Worker exceeded its cleanup budget — it's still pending, we're
-                # losing the reference. Reconcile() at next startup is the backstop.
                 log.warning("_cancellable: worker cleanup exceeded 60s; rental may leak until reconcile")
+            except asyncio.CancelledError:
+                pass  # worker cancelled cleanly, no leak
             except BaseException as e:
-                # Recursive cancellation during shielded await: worker still running,
-                # not awaited. Same leak class as TimeoutError above.
-                log.warning(f"_cancellable: shielded wait interrupted ({type(e).__name__}); rental may leak until reconcile")
+                log.warning(f"_cancellable: worker cleanup failed ({type(e).__name__}); rental may leak until reconcile: {e}")
         if not delivered and worker.done() and not worker.cancelled() and worker.exception() is None:
             orphan = worker.result()
             if on_orphan is not None and orphan is not None:
@@ -244,57 +246,43 @@ class _DuelRun:
     counts: PairCounts
 
 
-class _LocalBackupManager:
-    def __init__(self, root: Path):
-        self.root = root
-
-    def backup_hf_artifact(self, model: str, revision: str) -> BackupRecord:
-        art = artifact_id(model, revision)
-        prefix = self.root / art
-        prefix.mkdir(parents=True, exist_ok=True)
-        manifest = {
-            "schema": 1, "source": "local", "model": model, "revision": revision,
-            "artifact_id": art, "created_at": int(time.time()), "files": [],
-        }
-        body = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-        key = str(prefix / "manifest.json")
-        (prefix / "manifest.json").write_bytes(body)
-        return BackupRecord(art, model, revision, str(prefix), key,
-                            hashlib.sha256(body).hexdigest(), "staging")
-
-    def verify(self, manifest_key: str, expected_manifest_sha: str | None = None) -> BackupRecord:
-        raw = Path(manifest_key).read_bytes()
-        actual = hashlib.sha256(raw).hexdigest()
-        if expected_manifest_sha is not None and actual != expected_manifest_sha:
-            raise ValueError(f"manifest sha mismatch: {actual} != {expected_manifest_sha}")
-        data = json.loads(raw)
-        return BackupRecord(data["artifact_id"], data["model"], data["revision"],
-                            str(Path(manifest_key).parent), manifest_key, actual, "verified")
-
-    def delete_prefix(self, prefix: str) -> bool:
-        import shutil
-        shutil.rmtree(prefix, ignore_errors=True)
-        return True
+def _local_backup_hf(model: str, revision: str, root: Path) -> BackupRecord:
+    art = artifact_id(model, revision)
+    prefix = root / art
+    prefix.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema": 1, "source": "local", "model": model, "revision": revision,
+        "artifact_id": art, "created_at": int(time.time()), "files": [],
+    }
+    body = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    key = str(prefix / "manifest.json")
+    (prefix / "manifest.json").write_bytes(body)
+    return BackupRecord(art, model, revision, str(prefix), key,
+                        hashlib.sha256(body).hexdigest(), "staging")
 
 
-def _make_backup_manager(cfg: Config, chain: Chain, slots) -> BackupManager | _LocalBackupManager:
+def _local_backup_verify(manifest_key: str, expected_manifest_sha: str | None = None) -> BackupRecord:
+    raw = Path(manifest_key).read_bytes()
+    actual = hashlib.sha256(raw).hexdigest()
+    if expected_manifest_sha is not None and actual != expected_manifest_sha:
+        raise ValueError(f"manifest sha mismatch: {actual} != {expected_manifest_sha}")
+    data = json.loads(raw)
+    return BackupRecord(data["artifact_id"], data["model"], data["revision"],
+                        str(Path(manifest_key).parent), manifest_key, actual, "verified")
+
+
+def _local_backup_delete(prefix: str) -> bool:
+    shutil.rmtree(prefix, ignore_errors=True)
+    return True
+
+
+def _make_backup_manager(cfg: Config, chain: Chain, slots) -> tuple[BackupManager | None, list[S3Config]]:
     if slots is not None or _truthy_env("AFFINE_LOCAL"):
-        return _LocalBackupManager(Path(cfg.db_path).parent / "local-backups")
+        return None, []
     if ((os.getenv("HIPPIUS_S3_ACCESS_KEY") and os.getenv("HIPPIUS_S3_SECRET_KEY"))
             or (os.getenv("R2_S3_ACCESS_KEY_ID") and os.getenv("R2_S3_SECRET_ACCESS_KEY"))):
         providers = S3Config.from_envs(hotkey=chain.hotkey, netuid=cfg.netuid)
-        for s3 in providers:
-            if s3.name == "hippius":
-                os.environ.setdefault("HIPPIUS_S3_BUCKET", s3.bucket)
-                os.environ.setdefault("HIPPIUS_S3_PREFIX", s3.prefix)
-                os.environ.setdefault("HIPPIUS_S3_ENDPOINT", s3.endpoint_url)
-                os.environ.setdefault("HIPPIUS_S3_REGION", s3.region)
-            elif s3.name == "r2":
-                os.environ.setdefault("R2_S3_BUCKET", s3.bucket)
-                os.environ.setdefault("R2_S3_PREFIX", s3.prefix)
-                os.environ.setdefault("R2_S3_ENDPOINT_URL", s3.endpoint_url)
-                os.environ.setdefault("R2_S3_REGION", s3.region)
-        return BackupManager(providers)
+        return BackupManager(providers), providers
     raise RuntimeError("Hippius S3 credentials are required for production runs")
 
 
@@ -308,7 +296,10 @@ def _champion_miner(champ: Champion) -> Miner:
     )
 
 
-async def _backup_artifact(backup, model: str, revision: str) -> BackupRecord:
+async def _backup_artifact(backup, model: str, revision: str, local_root: Path) -> BackupRecord:
+    if backup is None:
+        staged = await asyncio.to_thread(_local_backup_hf, model, revision, local_root)
+        return await asyncio.to_thread(_local_backup_verify, staged.manifest_key, staged.manifest_sha256)
     staged = await asyncio.to_thread(backup.backup_hf_artifact, model, revision)
     return await asyncio.to_thread(backup.verify, staged.manifest_key, staged.manifest_sha256)
 
@@ -332,11 +323,11 @@ async def _bootstrap_champion(
     model = registered.model if registered else baseline_model
     revision = registered.revision if registered else baseline_revision
     if not revision:
-        revision = "main" if isinstance(backup, _LocalBackupManager) else await asyncio.to_thread(_pin_hf_revision, model, "main")
-    if registered and not isinstance(backup, _LocalBackupManager):
+        revision = "main" if backup is None else await asyncio.to_thread(_pin_hf_revision, model, "main")
+    if registered and backup is not None:
         revision = await asyncio.to_thread(_pin_hf_revision, model, revision)
         registered = _with_revision(registered, revision)
-    verified = await _backup_artifact(backup, model, revision)
+    verified = await _backup_artifact(backup, model, revision, Path(cfg.db_path).parent / "local-backups")
     block = await chain.current_block()
     champ = Champion(
         artifact_id=verified.artifact_id,
@@ -365,7 +356,6 @@ async def _bootstrap_champion(
 
 
 def _pin_hf_revision(model: str, revision: str) -> str:
-    from huggingface_hub import HfApi
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
     return HfApi(token=token).model_info(model, revision=revision).sha
 
@@ -385,7 +375,7 @@ def _with_revision(miner: Miner, revision: str) -> Miner:
 
 
 async def _pin_artifact(backup, miner: Miner) -> Miner:
-    if isinstance(backup, _LocalBackupManager):
+    if backup is None:
         return miner
     revision = await asyncio.to_thread(_pin_hf_revision, miner.model, miner.revision)
     return _with_revision(miner, revision)
@@ -396,7 +386,7 @@ async def _registered_artifact_alive(backup, miners: list[Miner], registered: Mi
     for m in miners:
         if m.uid != registered.uid or m.hotkey != registered.hotkey or m.model != registered.model:
             continue
-        if isinstance(backup, _LocalBackupManager):
+        if backup is None:
             return m.revision == registered.revision
         try:
             return await asyncio.to_thread(_pin_hf_revision, m.model, m.revision) == pinned_revision
@@ -418,7 +408,7 @@ async def _champion_registration_status(
     for m in miners:
         if m.uid != champ.uid or m.hotkey != champ.hotkey or m.model != champ.model:
             continue
-        if isinstance(backup, _LocalBackupManager):
+        if backup is None:
             return "alive" if m.revision == champ.revision else "dead"
         if m.revision == champ.revision:
             return "alive"
@@ -574,6 +564,11 @@ async def _run_fixed_duel(
             log.warning(f"current_block failed during duel: {ex}; using 0")
             return 0
 
+    async def _abort_duel(reason: str, status: str) -> _DuelRun:
+        await drain(reason)
+        store.finish_duel(duel.id, status, counts, pair_p_value(counts.challenger_only, counts.discordant), await block())
+        return _DuelRun(None, status, counts)
+
     def next_env() -> str | None:
         eligible = [
             env for env in env_names
@@ -646,22 +641,12 @@ async def _run_fixed_duel(
         # 40k-token prompt and gets a 400 from BOTH models) trips both
         # side counters simultaneously. Without this branch we'd attribute
         # a shared infra problem to the king and reprovision it for nothing.
-        if king_dead >= SLOT_DEAD and chal_dead >= SLOT_DEAD:
-            await drain("delivery-stalled")
-            store.finish_duel(duel.id, "delivery_stalled", counts, pair_p_value(counts.challenger_only, counts.discordant), await block())
-            return _DuelRun(None, "delivery_stalled", counts)
+        if (king_dead >= SLOT_DEAD and chal_dead >= SLOT_DEAD) or pair_dead >= SLOT_DEAD:
+            return await _abort_duel("delivery-stalled", "delivery_stalled")
         if king_dead >= SLOT_DEAD:
-            await drain("champion-slot-dead")
-            store.finish_duel(duel.id, "champion_slot_dead", counts, pair_p_value(counts.challenger_only, counts.discordant), await block())
-            return _DuelRun(None, "champion_slot_dead", counts)
+            return await _abort_duel("champion-slot-dead", "champion_slot_dead")
         if chal_dead >= SLOT_DEAD:
-            await drain("challenger-slot-dead")
-            store.finish_duel(duel.id, "challenger_slot_dead", counts, pair_p_value(counts.challenger_only, counts.discordant), await block())
-            return _DuelRun(None, "challenger_slot_dead", counts)
-        if pair_dead >= SLOT_DEAD:
-            await drain("delivery-stalled")
-            store.finish_duel(duel.id, "delivery_stalled", counts, pair_p_value(counts.challenger_only, counts.discordant), await block())
-            return _DuelRun(None, "delivery_stalled", counts)
+            return await _abort_duel("challenger-slot-dead", "challenger_slot_dead")
         remaining = target_total - counts.total
         best_possible = PairCounts(
             counts.challenger_only + remaining,
@@ -681,22 +666,29 @@ async def _run_fixed_duel(
     return _DuelRun(decision, status, counts)
 
 
+def _delete_prefix(backup, prefix: str) -> bool:
+    if backup is None:
+        return _local_backup_delete(prefix)
+    return backup.delete_prefix(prefix)
+
+
 async def _gc_retiring(store: Store, backup) -> None:
     for old in store.retiring_backups():
-        if await asyncio.to_thread(backup.delete_prefix, old.prefix):
+        if await asyncio.to_thread(_delete_prefix, backup, old.prefix):
             store.mark_backup_deleted(old.manifest_key)
 
 
 async def _gc_staging(store: Store, backup) -> None:
     for old in store.staging_backups():
-        if await asyncio.to_thread(backup.delete_prefix, old.prefix):
+        if await asyncio.to_thread(_delete_prefix, backup, old.prefix):
             store.mark_backup_deleted(old.manifest_key)
 
 
 async def run(cfg: Config, chain: Chain, slots=None):
     owned_slots = slots is None
-    slots = slots or TargonSlots(cfg, hotkey=chain.hotkey)
-    backup = _make_backup_manager(cfg, chain, slots if not owned_slots else None)
+    backup, s3_configs = _make_backup_manager(cfg, chain, slots)
+    if owned_slots:
+        slots = TargonSlots(cfg, hotkey=chain.hotkey, s3_configs=s3_configs)
     if hasattr(slots, "reconcile"):
         await slots.reconcile()
     envs = await _load_envs(cfg)
@@ -704,6 +696,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
     store.abort_running_duels()
     await _gc_staging(store, backup)
     state = _RunState()
+    king_provision_fails = 0
     stop = asyncio.Event()
     _install_signal_handlers(stop)
     try:
@@ -718,7 +711,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 )
                 if pending_registration == "dead":
                     old = store.clear_pending_champion()
-                    if old is not None and await asyncio.to_thread(backup.delete_prefix, old.prefix):
+                    if old is not None and await asyncio.to_thread(_delete_prefix, backup, old.prefix):
                         store.mark_backup_deleted(old.manifest_key)
                     log.warning(f"pending champion {pending.model}@{pending.revision} is no longer registered; discarded")
                     continue
@@ -740,7 +733,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
                         )
                         if pending_registration == "dead":
                             old = store.clear_pending_champion()
-                            if old is not None and await asyncio.to_thread(backup.delete_prefix, old.prefix):
+                            if old is not None and await asyncio.to_thread(_delete_prefix, backup, old.prefix):
                                 store.mark_backup_deleted(old.manifest_key)
                             log.warning(f"pending champion {pending.model}@{pending.revision} changed before publication; discarded")
                         elif pending_registration == "unknown":
@@ -762,7 +755,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
                                     await _gc_retiring(store, backup)
                             elif not _should_finalize(cfg):
                                 old = store.clear_pending_champion()
-                                if old is not None and await asyncio.to_thread(backup.delete_prefix, old.prefix):
+                                if old is not None and await asyncio.to_thread(_delete_prefix, backup, old.prefix):
                                     store.mark_backup_deleted(old.manifest_key)
                             else:
                                 await _cancellable(asyncio.sleep(120), stop)
@@ -791,8 +784,12 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 champion_artifact_alive = False
             king_slot = await _ensure_king_slot(state, champ, slots, stop)
             if king_slot is None:
+                king_provision_fails += 1
+                if king_provision_fails >= KING_REPROVISION_LIMIT:
+                    raise RuntimeError(f"champion reprovision failed {KING_REPROVISION_LIMIT} consecutive times; aborting")
                 await _cancellable(asyncio.sleep(120), stop)
                 continue
+            king_provision_fails = 0
             queue = sorted(
                 (m for m in all_miners
                  if not _is_current_champion_registration(m, champ, champion_artifact_alive)
@@ -862,7 +859,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 await _safe_teardown(slots, chal_slot, "pre-promotion-hf-slot")
                 chal_slot = None
                 try:
-                    challenger_backup = await _backup_artifact(backup, challenger.model, challenger.revision)
+                    challenger_backup = await _backup_artifact(backup, challenger.model, challenger.revision, Path(cfg.db_path).parent / "local-backups")
                 except Exception as exc:
                     log.warning(f"verdict skipped: challenger backup failed uid{registered.uid}: {exc}")
                     state.attempted.add((registered.model, registered.revision))
@@ -917,7 +914,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 if backup_slot is not None:
                     await _safe_teardown(slots, backup_slot, "backup-slot-end")
                 if challenger_backup is not None and not keep_challenger_backup:
-                    if await asyncio.to_thread(backup.delete_prefix, challenger_backup.prefix):
+                    if await asyncio.to_thread(_delete_prefix, backup, challenger_backup.prefix):
                         store.mark_backup_deleted(challenger_backup.manifest_key)
     finally:
         log.info("shutdown")
@@ -928,7 +925,6 @@ async def run(cfg: Config, chain: Chain, slots=None):
 
 def bittensor_chain(cfg: Config) -> tuple[Chain, Subtensor]:
     """Wire a Chain from Bittensor subtensor + wallet. Caller owns sub.close()."""
-    import bittensor as bt
     sub = Subtensor(cfg.subtensor_endpoint, cfg.subtensor_fallback)
     wallet = bt.Wallet(name=cfg.wallet_name, hotkey=cfg.hotkey_name)
     hotkey = wallet.hotkey.ss58_address

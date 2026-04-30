@@ -136,8 +136,9 @@ async def _wait_commitments(
     deadline = time.time() + timeout
     while time.time() < deadline:
         revealed = await sub.get_all_revealed_commitments(netuid)
-        if expected_hotkeys.issubset(set(revealed.keys())):
-            return {hk: max(v, key=lambda x: x[0])[1] for hk, v in revealed.items()}
+        if expected_hotkeys.issubset(set(revealed.keys())) and all(revealed[hk] for hk in expected_hotkeys):
+            return {hk: max(v, key=lambda x: x[0])[1]
+                    for hk, v in revealed.items() if v}
         raw = await sub.get_all_commitments(netuid)
         if expected_hotkeys.issubset(set(raw.keys())):
             return raw

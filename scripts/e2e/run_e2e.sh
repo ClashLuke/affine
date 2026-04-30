@@ -235,6 +235,9 @@ log "stages: ${STAGES[*]}"
 for stage in "${STAGES[@]}"; do
     stop_port_a
 
+    rm -f "$AFFINE_DB_PATH" "$AFFINE_DB_PATH-wal" "$AFFINE_DB_PATH-shm"
+    rm -rf "$PROJECT_DIR/.affine/local-backups" 2>/dev/null || true
+
     case "$stage" in
         dethrone)
             start_stub_on_a

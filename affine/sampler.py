@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import asyncio
 import inspect
 import logging
@@ -16,6 +17,16 @@ GENERATION_KEYS = {
     "frequency_penalty", "logit_bias", "max_tokens", "min_p", "presence_penalty",
     "repetition_penalty", "stop", "temperature", "top_k", "top_p",
 }
+
+_CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=None))
+
+
+@atexit.register
+def _close_client() -> None:
+    try:
+        asyncio.run(_CLIENT.aclose())
+    except RuntimeError:
+        pass
 
 
 async def _drain(task: asyncio.Task, slot) -> None:
@@ -69,19 +80,6 @@ async def _maybe_await(x):
     return await x if inspect.isawaitable(x) else x
 
 
-def _messages(obs) -> list[dict]:
-    if isinstance(obs, str):
-        return [{"role": "user", "content": obs}]
-    if isinstance(obs, list) and all(isinstance(m, dict) for m in obs):
-        return obs
-    if isinstance(obs, dict):
-        if isinstance(obs.get("messages"), list):
-            return obs["messages"]
-        if isinstance(obs.get("prompt"), str):
-            return [{"role": "user", "content": obs["prompt"]}]
-    raise TypeError(f"unsupported env observation: {type(obs).__name__}")
-
-
 def _usage_add(total: dict, usage) -> dict:
     if not isinstance(usage, dict):
         return total
@@ -106,10 +104,10 @@ def _content(r: dict) -> str:
     raise ValueError("OpenAI choice has no text content")
 
 
-async def _chat(slot, obs, params: dict, seed: int) -> dict:
+async def _chat(slot, messages: list[dict], params: dict, seed: int) -> dict:
     payload = {
         "model": slot.model,
-        "messages": _messages(obs),
+        "messages": messages,
         "temperature": 0.0,
         "seed": seed,
     }
@@ -118,9 +116,7 @@ async def _chat(slot, obs, params: dict, seed: int) -> dict:
     api_key = params.get("api_key") or os.getenv("OPENAI_API_KEY")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    async with httpx.AsyncClient(timeout=None) as client:
-        r = await client.post(f"{slot.base_url.rstrip('/')}/chat/completions",
-                              json=payload, headers=headers)
+    r = await _CLIENT.post(f"{slot.base_url.rstrip('/')}/chat/completions", json=payload, headers=headers)
     if r.status_code != 200:
         raise RuntimeError(f"chat/completions returned {r.status_code}: {r.text[:400]}")
     data = r.json()
@@ -135,6 +131,9 @@ async def _gym_eval(env_wrapper, params: dict, slot, seed: int, task_id: int):
     env_options = {k: v for k, v in params.items() if k in env_keys}
     try:
         obs, reset_info = await _maybe_await(env.reset(seed=task_id, options=env_options))
+        if not isinstance(obs, str):
+            raise TypeError(f"env.reset() must return str observation, got {type(obs).__name__}")
+        messages: list[dict] = [{"role": "user", "content": obs}]
         reset_max = reset_info.get("max_turns") if isinstance(reset_info, dict) else None
         param_max = params.get("gym_max_steps")
         if reset_max is None:
@@ -146,7 +145,7 @@ async def _gym_eval(env_wrapper, params: dict, slot, seed: int, task_id: int):
         usage: dict = {}
         last_info = {}
         for step_idx in range(max_steps):
-            raw = await _chat(slot, obs, params, seed)
+            raw = await _chat(slot, messages, params, seed)
             _usage_add(usage, raw.get("usage"))
             answer = _content(raw)
             next_obs, reward, terminated, truncated, info = await _maybe_await(env.step(answer))
@@ -159,7 +158,9 @@ async def _gym_eval(env_wrapper, params: dict, slot, seed: int, task_id: int):
                     "usage": usage or None,
                     "extra": {"reset": reset_info, "step": info, "turns": step_idx + 1},
                 }
-            obs = [*_messages(obs), {"role": "assistant", "content": answer}, *_messages(next_obs)]
+            if not isinstance(next_obs, str):
+                raise TypeError(f"env.step() must return str observation, got {type(next_obs).__name__}")
+            messages = messages + [{"role": "assistant", "content": answer}, {"role": "user", "content": next_obs}]
         return {
             "score": 0.0,
             "success": False,
@@ -222,7 +223,7 @@ async def run_one(
     if task not in done:
         await _drain(task, slot)
         log.warning(f"sample timed out after {timeout}s: {slot.model}")
-        return False, time.monotonic() - t0, 0
+        return False, dt, 0
     try:
         exc = task.exception()
     except asyncio.CancelledError:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 import asyncio
 import hashlib
-import inspect
 import json
 import logging
 import os
@@ -19,16 +18,6 @@ def _truthy_env(name: str) -> bool:
     this, AFFINE_DRY_RUN=0 silently leaves the validator in dry-run mode."""
     v = os.getenv(name, "").strip().lower()
     return v not in ("", "0", "false", "no", "off")
-
-
-# Auto-retried on transport errors. Mutations are excluded: a transport drop after
-# a successful broadcast would silently double-submit on reconnect, burning weight
-# quota. Writes own their own retry loop with idempotency (nonce / version_key).
-_RETRY_SAFE = frozenset({
-    "metagraph",
-    "get_all_revealed_commitments", "get_all_commitments",
-    "get_current_block",
-})
 
 
 class Subtensor:
@@ -77,20 +66,38 @@ class Subtensor:
             try: await sub.close()
             except Exception: pass
 
-    def __getattr__(self, name: str):
-        async def _call(*args, **kwargs):
-            sub = await self._ensure()
-            async def _invoke(s):
-                r = getattr(s, name)(*args, **kwargs)
-                return await r if inspect.isawaitable(r) else r
-            try:
-                return await _invoke(sub)
-            except Exception as e:
-                if name not in _RETRY_SAFE:
-                    raise
-                log.warning(f"subtensor.{name} failed ({type(e).__name__}: {e}); reconnecting")
-                return await _invoke(await self._reconnect(stale=sub))
-        return _call
+    async def _call_retry(self, name: str, *args, **kwargs):
+        """Auto-reconnect on failure and retry once. Use for read-only RPCs only —
+        a transport drop after a successful mutation broadcast would silently
+        double-submit on reconnect."""
+        sub = await self._ensure()
+        try:
+            return await getattr(sub, name)(*args, **kwargs)
+        except Exception as e:
+            log.warning(f"subtensor.{name} failed ({type(e).__name__}: {e}); reconnecting")
+            sub = await self._reconnect(stale=sub)
+            return await getattr(sub, name)(*args, **kwargs)
+
+    async def _call_no_retry(self, name: str, *args, **kwargs):
+        """Raise on failure. Use for mutations: callers own their own retry loop
+        with idempotency (nonce / version_key)."""
+        sub = await self._ensure()
+        return await getattr(sub, name)(*args, **kwargs)
+
+    async def get_current_block(self):
+        return await self._call_retry("get_current_block")
+
+    async def metagraph(self, *args, **kwargs):
+        return await self._call_retry("metagraph", *args, **kwargs)
+
+    async def get_all_commitments(self, *args, **kwargs):
+        return await self._call_retry("get_all_commitments", *args, **kwargs)
+
+    async def get_all_revealed_commitments(self, *args, **kwargs):
+        return await self._call_retry("get_all_revealed_commitments", *args, **kwargs)
+
+    async def set_weights(self, **kwargs):
+        return await self._call_no_retry("set_weights", **kwargs)
 
     async def close(self):
         async with self._lock:

@@ -6,8 +6,13 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import httpx
+from targon.client.client import Client
+
+if TYPE_CHECKING:
+    from .backup import S3Config
 
 log = logging.getLogger(__name__)
 
@@ -39,17 +44,9 @@ async def health_ping(base_url: str, timeout: float = 5) -> bool:
 
 
 def _docker_host_ip() -> str | None:
-    """Docker bridge gateway IP — only meaningful when affine runs inside a container
-    that needs to reach a vLLM on the host. On the host itself, localhost works and
-    the bridge IP would break a 127.0.0.1-bound vLLM."""
-    if not os.path.exists("/.dockerenv"):
-        return None
-    try:
-        import docker as _docker
-        gw = _docker.from_env().networks.get("bridge").attrs["IPAM"]["Config"][0]["Gateway"]
-        return gw if gw else None
-    except Exception:
-        return None
+    """Override host IP for localhost rewrites in LocalSlots, e.g. when affine
+    runs inside a container that needs to reach a vLLM on the host."""
+    return os.getenv("AFFINE_DOCKER_GATEWAY", "").strip() or None
 
 
 class LocalSlots:
@@ -79,22 +76,15 @@ class LocalSlots:
             self._free.append(slot.base_url)
 
 
-
-_DEFAULT_VLLM_IMAGE = "vllm/vllm-openai:latest-cu130-ubuntu2404"
 _WORKLOADS = "/tha/v2/workloads"
 _CRASH_EVENTS = {"POD_CRASHLOOP_BACKOFF", "POD_BACK_OFF", "POD_FAILED", "POD_OOM_KILLED"}
 
 
 def _vllm_image() -> str:
-    return os.getenv("AFFINE_VLLM_IMAGE", _DEFAULT_VLLM_IMAGE)
-
-
-def require_s3_restore_image() -> None:
-    if _vllm_image() == _DEFAULT_VLLM_IMAGE:
-        raise RuntimeError(
-            "AFFINE_VLLM_IMAGE must be built from Dockerfile.vllm for S3 restore; "
-            "stock vLLM can only boot Hugging Face models"
-        )
+    image = os.getenv("AFFINE_VLLM_IMAGE", "").strip()
+    if not image:
+        raise RuntimeError("AFFINE_VLLM_IMAGE must be set when provisioning Targon vLLM slots")
+    return image
 
 
 def _registry_auth() -> dict[str, str] | None:
@@ -118,7 +108,6 @@ def _resource() -> str:
 
 
 def _http():
-    from targon.client.client import Client
     return Client.async_serverless
 
 
@@ -216,8 +205,9 @@ async def _wait_for_ready(uid: str, timeout: int, interval: float = 5.0) -> str:
 
 
 class TargonSlots:
-    def __init__(self, config, hotkey: str):
+    def __init__(self, config, hotkey: str, s3_configs: list["S3Config"] | None = None):
         self._config = config
+        self._s3_configs = list(s3_configs) if s3_configs else []
         # Lowercase-hex prefix scopes reconcile() to our own workloads when
         # multiple validators share a Targon API key. (Targon names are
         # lowercase-alphanumeric-plus-hyphens only; Substrate hotkeys aren't.)
@@ -297,12 +287,11 @@ class TargonSlots:
             v = os.environ.get(k)
             if v:
                 env[k] = v
-        if source == "hf" and image != _DEFAULT_VLLM_IMAGE:
+        if source == "hf":
             commands = ["python", "-m", "vllm.entrypoints.openai.api_server"]
         if source == "s3":
             if not backup_manifest_key:
                 raise ValueError("backup_manifest_key is required for source='s3'")
-            require_s3_restore_image()
             args = [
                 "--source", "s3",
                 "--model", model,
@@ -312,7 +301,7 @@ class TargonSlots:
                 "--",
                 *vllm_args[6:],
             ]
-            env.update(_s3_env())
+            env.update(_s3_env_from_configs(self._s3_configs))
         elif source != "hf":
             raise ValueError(f"unknown vLLM source: {source}")
 
@@ -379,21 +368,29 @@ class TargonSlots:
             log.warning(f"targon delete failed for {uid}: {e}")
 
 
-def _s3_env() -> dict[str, str]:
-    names = (
-        "HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY", "HIPPIUS_S3_BUCKET",
-        "HIPPIUS_S3_PREFIX", "HIPPIUS_S3_ENDPOINT", "HIPPIUS_S3_REGION",
-        "R2_S3_ACCESS_KEY_ID", "R2_S3_SECRET_ACCESS_KEY", "R2_S3_BUCKET",
-        "R2_S3_PREFIX", "R2_S3_ENDPOINT_URL", "R2_S3_REGION",
-    )
-    env = {k: v for k in names if (v := os.environ.get(k))}
-    has_hippius = all(k in env for k in ("HIPPIUS_S3_ACCESS_KEY", "HIPPIUS_S3_SECRET_KEY", "HIPPIUS_S3_BUCKET"))
-    has_r2 = all(k in env for k in ("R2_S3_ACCESS_KEY_ID", "R2_S3_SECRET_ACCESS_KEY", "R2_S3_BUCKET", "R2_S3_ENDPOINT_URL"))
-    if not (has_hippius or has_r2):
-        raise RuntimeError("missing S3 env for backup restore")
-    if has_hippius:
-        env.setdefault("HIPPIUS_S3_ENDPOINT", "https://s3.hippius.com")
-        env.setdefault("HIPPIUS_S3_REGION", "decentralized")
-    if has_r2:
-        env.setdefault("R2_S3_REGION", "auto")
+def _s3_env_from_configs(configs: list["S3Config"]) -> dict[str, str]:
+    """Project S3Configs into the env vars the in-container restorer reads.
+    Mirrors the keys vllm_entrypoint.py + backup.S3Config.from_env_refs consume."""
+    env: dict[str, str] = {}
+    for c in configs:
+        if c.name == "hippius":
+            env.update({
+                "HIPPIUS_S3_ACCESS_KEY": c.access_key,
+                "HIPPIUS_S3_SECRET_KEY": c.secret_key,
+                "HIPPIUS_S3_BUCKET": c.bucket,
+                "HIPPIUS_S3_PREFIX": c.prefix,
+                "HIPPIUS_S3_ENDPOINT": c.endpoint_url,
+                "HIPPIUS_S3_REGION": c.region,
+            })
+        elif c.name == "r2":
+            env.update({
+                "R2_S3_ACCESS_KEY_ID": c.access_key,
+                "R2_S3_SECRET_ACCESS_KEY": c.secret_key,
+                "R2_S3_BUCKET": c.bucket,
+                "R2_S3_PREFIX": c.prefix,
+                "R2_S3_ENDPOINT_URL": c.endpoint_url,
+                "R2_S3_REGION": c.region,
+            })
+    if not env:
+        raise RuntimeError("no S3 configs available for backup restore")
     return env

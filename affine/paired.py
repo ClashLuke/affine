@@ -1,3 +1,10 @@
+"""Pure statistical decisions. No I/O, no side effects.
+
+The decision model is an exact one-sided paired binomial test:
+- Only discordant pairs enter the p-value.
+- p-value = binomtest(chal_only, discordant, p=0.5, alternative='greater').pvalue
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,7 +27,7 @@ class PairCounts:
     def discordant(self) -> int:
         return self.challenger_only + self.champion_only
 
-    def add(self, champion_pass: int, challenger_pass: int) -> "PairCounts":
+    def add(self, champion_pass: int, challenger_pass: int) -> PairCounts:
         if challenger_pass and not champion_pass:
             return PairCounts(self.challenger_only + 1, self.champion_only, self.both_pass, self.both_fail)
         if champion_pass and not challenger_pass:
@@ -59,6 +66,7 @@ def decide_paired(counts: PairCounts, *, alpha: float, min_discordant: int) -> P
 
 
 def alpha_for_reign(blocks: int, start: float, final: float, halflife: int) -> float:
+    """Exponential alpha rise. Lowers the statistical bar the longer a champion reigns."""
     age = max(int(blocks), 0)
     if age == 0:
         return float(start)

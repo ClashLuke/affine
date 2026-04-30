@@ -319,9 +319,9 @@ A complete reconstruction must identify every parent exactly."""
 
     @classmethod
     def _validate(cls, options: dict) -> dict[str, Any]:
-        n = int_param(options, "n", default=20, lo=2, hi=10**9)
-        max_queries = int_param(options, "max_queries", default=64, lo=0, hi=10**9)
-        max_turns = int_param(options, "max_turns", default=32, lo=1, hi=10**9)
+        n = int_param(options, "n", default=20, lo=2, hi=10_000)
+        max_queries = int_param(options, "max_queries", default=64, lo=0, hi=4_096)
+        max_turns = int_param(options, "max_turns", default=32, lo=1, hi=1_024)
         method = str(options.get("method", "prufer"))
         if method not in {"prufer", "recursive"}:
             raise ValueError(f"method must be 'prufer' or 'recursive', got {method!r}")

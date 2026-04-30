@@ -18,6 +18,7 @@ RE_WEIGHTS = re.compile(r"weights set:\s*uid")
 RE_WEIGHTS_UID = re.compile(r"weights set:\s*uid\s+(\d+)")
 RE_DUEL_START = re.compile(r"duel:\s*champion\s+\S+@\S+\s+vs\s+uid(\d+)")
 RE_VERDICT = re.compile(r"verdict:\s*champion\s+holds")
+RE_ENV_LOADED = re.compile(r"\benv:\s*([A-Za-z0-9_-]+)\s+\(")
 RE_DETHRONE = re.compile(r"DETHRONE:\s*\S+@\S+\s+->\s+uid\s+(\d+)")
 RE_QUEUE_EXHAUSTED = re.compile(r"queue exhausted")
 RE_SHUTDOWN = re.compile(r"^shutdown$|\bshutdown\s*$")
@@ -118,6 +119,11 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
             now = time.time()
             if now >= deadline:
                 proc.send_signal(signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
                 raise TimeoutError(f"{stage.name} exceeded timeout={stage.timeout}s")
 
             if proc.poll() is not None and proc.stdout.closed:

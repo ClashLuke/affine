@@ -2,16 +2,16 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sqlite3
 from pathlib import Path
 
+from .config import Config
 from .paired import PairCounts, decide_paired, pair_p_value
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Offline replay of validator SQLite evidence.")
-    ap.add_argument("path", nargs="?", default=os.getenv("AFFINE_DB_PATH", ".affine/affine.sqlite3"))
+    ap.add_argument("path", nargs="?", default=Config.from_env().db_path)
     args = ap.parse_args()
     path = Path(args.path)
     if not path.exists():

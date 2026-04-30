@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 from .backup import restore_from_env
@@ -22,12 +23,20 @@ def main() -> int:
         if not args.manifest_key:
             raise SystemExit("--manifest-key is required for --source=s3")
         dest = Path(os.getenv("AFFINE_MODEL_DIR", "/models")) / args.served_model_name.replace("/", "__")
-        restore_from_env(args.manifest_key, dest)
+        tmp = Path(str(dest) + ".tmp")
+        if tmp.exists():
+            import shutil
+            shutil.rmtree(tmp)
+        restore_from_env(args.manifest_key, tmp)
+        if dest.exists():
+            import shutil
+            shutil.rmtree(dest)
+        tmp.rename(dest)
         model_path = str(dest)
 
     extra = args.vllm_args[1:] if args.vllm_args[:1] == ["--"] else args.vllm_args
     argv = [
-        "python", "-m", "vllm.entrypoints.openai.api_server",
+        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--model", model_path,
         "--served-model-name", args.served_model_name,
     ]
