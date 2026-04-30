@@ -15,7 +15,7 @@ import secrets
 import shutil
 import signal
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -47,8 +47,8 @@ class Chain:
     list_miners: Callable[[], Awaitable[list[Miner]]]
     current_block: Callable[[], Awaitable[int]]
     publish_winner: Callable[[int, str], Awaitable[bool]]
-    burn_weights: Callable[[], Awaitable[bool]] | None = None
-    uid_matches_hotkey: Callable[[int, str], Awaitable[bool]] | None = None
+    burn_weights: Callable[[], Awaitable[bool]]
+    uid_matches_hotkey: Callable[[int, str], Awaitable[bool]]
 
 
 async def _load_envs(cfg: Config) -> dict[str, tuple]:
@@ -208,7 +208,7 @@ async def _sample(chain: Chain, wrapper, params: dict, timeout: float, slot: Slo
     pass=0 with the actual latency, delivered=True."""
     outcome, latency, tokens = await run_one(
         wrapper, params, timeout, slot,
-        seed=_seed(miner.uid, miner.revision, env_name, c, salt=chain.hotkey),
+        seed=_seed(miner.uid if miner.uid is not None else -1, miner.revision, env_name, c, salt=chain.hotkey),
         task_id=task_id)
     if outcome is None:
         return 0, 0.0, False, 0
@@ -232,11 +232,7 @@ async def _pair_sample(chain: Chain, wrapper, params: dict, timeout: float,
 @dataclass
 class _RunState:
     king_slot: Slot | None = None
-    attempted: set[ArtKey] = None
-
-    def __post_init__(self):
-        if self.attempted is None:
-            self.attempted = set()
+    attempted: set[ArtKey] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -288,7 +284,7 @@ def _make_backup_manager(cfg: Config, chain: Chain, slots) -> tuple[BackupManage
 
 def _champion_miner(champ: Champion) -> Miner:
     return Miner(
-        uid=champ.uid if champ.uid is not None else -1,
+        uid=champ.uid,
         hotkey=champ.hotkey or "",
         model=champ.model,
         revision=champ.revision,
@@ -458,7 +454,7 @@ async def _ensure_king_slot(
 async def _publish_champion(store: Store, chain: Chain, cfg: Config, champ: Champion) -> bool:
     if not champ.payable or champ.uid is None or not champ.hotkey:
         return await _publish_burn(store, chain, cfg, champ.artifact_id)
-    if chain.uid_matches_hotkey is not None and not await chain.uid_matches_hotkey(champ.uid, champ.hotkey):
+    if not await chain.uid_matches_hotkey(champ.uid, champ.hotkey):
         log.warning(f"champion uid={champ.uid} hotkey mismatch; burning weights")
         store.demote_champion(champ.artifact_id)
         await _publish_burn(store, chain, cfg, champ.artifact_id)
@@ -471,7 +467,7 @@ async def _publish_champion(store: Store, chain: Chain, cfg: Config, champ: Cham
         store.mark_publication(pub_id, "dry_run")
         return True
     ok = await chain.publish_winner(champ.uid, champ.hotkey)
-    if ok and chain.uid_matches_hotkey is not None and not await chain.uid_matches_hotkey(champ.uid, champ.hotkey):
+    if ok and not await chain.uid_matches_hotkey(champ.uid, champ.hotkey):
         log.warning(f"champion uid={champ.uid} hotkey changed after publish; burning weights")
         store.demote_champion(champ.artifact_id)
         await _publish_burn(store, chain, cfg, champ.artifact_id)
@@ -485,7 +481,7 @@ async def _publish_burn(store: Store, chain: Chain, cfg: Config, artifact: str) 
     pub_id = store.publication_intent(artifact, "burn", None, None, dry)
     if store.publication_status(pub_id) in {"confirmed", "dry_run"}:
         return True
-    ok = True if dry else bool(chain.burn_weights and await chain.burn_weights())
+    ok = True if dry else bool(await chain.burn_weights())
     if dry:
         store.mark_publication(pub_id, "dry_run")
     else:
@@ -584,8 +580,10 @@ async def _run_fixed_duel(
         params = {k: v for k, v in spec.params.items() if k != "timeout"}
         timeout = float(spec.params.get("timeout", 600))
         lo, hi = spec.task_range
-        task_id = _task_id(king.uid, challenger.uid, env_name, iter_idx, lo, hi,
-                           salt=f"{chain.hotkey}:{duel.schedule_seed}")
+        task_id = _task_id(
+            king.uid if king.uid is not None else -1, challenger.uid if challenger.uid is not None else -1,
+            env_name, iter_idx, lo, hi,
+            salt=f"{chain.hotkey}:{duel.schedule_seed}")
         task = asyncio.create_task(_pair_sample(
             chain, wrapper, params, timeout,
             king_slot, king, alloc(king, env_name),
@@ -622,9 +620,11 @@ async def _run_fixed_duel(
             inflight.discard(task)
             e_idx, env_name, rk, rc = task.result()
             inflight_by_env[env_name] -= 1
-            task_id = _task_id(king.uid, challenger.uid, env_name, e_idx,
-                               envs[env_name][1].task_range[0], envs[env_name][1].task_range[1],
-                               salt=f"{chain.hotkey}:{duel.schedule_seed}")
+            task_id = _task_id(
+                king.uid if king.uid is not None else -1, challenger.uid if challenger.uid is not None else -1,
+                env_name, e_idx,
+                envs[env_name][1].task_range[0], envs[env_name][1].task_range[1],
+                salt=f"{chain.hotkey}:{duel.schedule_seed}")
             b = await block()
             sample = _pair_sample_from_rows(duel.id, env_name, task_id, e_idx, b, king, challenger, rk, rc)
             samples.append(sample)
@@ -684,6 +684,82 @@ async def _gc_staging(store: Store, backup) -> None:
             store.mark_backup_deleted(old.manifest_key)
 
 
+async def _finalize_pending(
+    store: Store,
+    backup,
+    slots,
+    pending,
+    chain: Chain,
+    cfg: Config,
+    stop: asyncio.Event,
+    state: _RunState,
+) -> bool:
+    """Process the pending champion. Returns True if the outer loop should
+    `continue` (sleep/retry), False to fall through to champion handling."""
+    pending_registration = await _champion_registration_status(
+        backup, await chain.list_miners(), pending, missing_ref_alive=False,
+    )
+    if pending_registration == "dead":
+        old = store.clear_pending_champion()
+        if old is not None and await asyncio.to_thread(_delete_prefix, backup, old.prefix):
+            store.mark_backup_deleted(old.manifest_key)
+        log.warning(f"pending champion {pending.model}@{pending.revision} is no longer registered; discarded")
+        return True
+    if pending_registration == "unknown":
+        log.warning("pending champion artifact identity unknown; retrying before finalization")
+        await _cancellable(asyncio.sleep(120), stop)
+        return True
+
+    pending_slot = None
+    try:
+        pending_slot, status = await _provision(
+            slots, _champion_miner(pending), stop,
+            source="s3", backup_manifest_key=pending.backup_manifest,
+        )
+        if pending_slot is None:
+            log.warning(f"pending champion backup restore failed ({status}); keeping current champion active")
+            return False
+
+        pending_registration = await _champion_registration_status(
+            backup, await chain.list_miners(), pending, missing_ref_alive=False,
+        )
+        if pending_registration == "dead":
+            old = store.clear_pending_champion()
+            if old is not None and await asyncio.to_thread(_delete_prefix, backup, old.prefix):
+                store.mark_backup_deleted(old.manifest_key)
+            log.warning(f"pending champion {pending.model}@{pending.revision} changed before publication; discarded")
+            return False
+        if pending_registration == "unknown":
+            log.warning("pending champion artifact identity unknown after restore; retrying")
+            await _cancellable(asyncio.sleep(120), stop)
+            return True
+
+        published = await _publish_champion(store, chain, cfg, pending)
+        if published and _should_finalize(cfg):
+            finalized = store.finalize_pending_champion()
+            if finalized is None:
+                raise RuntimeError("pending champion disappeared before finalization")
+            old_slot = state.king_slot
+            state.king_slot = pending_slot
+            pending_slot = None
+            if old_slot is not None:
+                await _safe_teardown(slots, old_slot, "pending-champion-finalized")
+            if not cfg.dry_run:
+                await _gc_retiring(store, backup)
+            return False
+        if not _should_finalize(cfg):
+            old = store.clear_pending_champion()
+            if old is not None and await asyncio.to_thread(_delete_prefix, backup, old.prefix):
+                store.mark_backup_deleted(old.manifest_key)
+            return False
+
+        await _cancellable(asyncio.sleep(120), stop)
+        return True
+    finally:
+        if pending_slot is not None:
+            await _safe_teardown(slots, pending_slot, "pending-champion-unfinalized")
+
+
 async def run(cfg: Config, chain: Chain, slots=None):
     owned_slots = slots is None
     backup, s3_configs = _make_backup_manager(cfg, chain, slots)
@@ -705,64 +781,8 @@ async def run(cfg: Config, chain: Chain, slots=None):
             champ, state.king_slot = await _bootstrap_champion(store, backup, slots, chain, cfg, stop)
         while not stop.is_set():
             pending = store.pending_champion()
-            if pending is not None:
-                pending_registration = await _champion_registration_status(
-                    backup, await chain.list_miners(), pending, missing_ref_alive=False,
-                )
-                if pending_registration == "dead":
-                    old = store.clear_pending_champion()
-                    if old is not None and await asyncio.to_thread(_delete_prefix, backup, old.prefix):
-                        store.mark_backup_deleted(old.manifest_key)
-                    log.warning(f"pending champion {pending.model}@{pending.revision} is no longer registered; discarded")
-                    continue
-                if pending_registration == "unknown":
-                    log.warning("pending champion artifact identity unknown; retrying before finalization")
-                    await _cancellable(asyncio.sleep(120), stop)
-                    continue
-                pending_slot = None
-                try:
-                    pending_slot, status = await _provision(
-                        slots, _champion_miner(pending), stop,
-                        source="s3", backup_manifest_key=pending.backup_manifest,
-                    )
-                    if pending_slot is None:
-                        log.warning(f"pending champion backup restore failed ({status}); keeping current champion active")
-                    else:
-                        pending_registration = await _champion_registration_status(
-                            backup, await chain.list_miners(), pending, missing_ref_alive=False,
-                        )
-                        if pending_registration == "dead":
-                            old = store.clear_pending_champion()
-                            if old is not None and await asyncio.to_thread(_delete_prefix, backup, old.prefix):
-                                store.mark_backup_deleted(old.manifest_key)
-                            log.warning(f"pending champion {pending.model}@{pending.revision} changed before publication; discarded")
-                        elif pending_registration == "unknown":
-                            log.warning("pending champion artifact identity unknown after restore; retrying")
-                            await _cancellable(asyncio.sleep(120), stop)
-                            continue
-                        else:
-                            published = await _publish_champion(store, chain, cfg, pending)
-                            if published and _should_finalize(cfg):
-                                finalized = store.finalize_pending_champion()
-                                if finalized is None:
-                                    raise RuntimeError("pending champion disappeared before finalization")
-                                old_slot = state.king_slot
-                                state.king_slot = pending_slot
-                                pending_slot = None
-                                if old_slot is not None:
-                                    await _safe_teardown(slots, old_slot, "pending-champion-finalized")
-                                if not cfg.dry_run:
-                                    await _gc_retiring(store, backup)
-                            elif not _should_finalize(cfg):
-                                old = store.clear_pending_champion()
-                                if old is not None and await asyncio.to_thread(_delete_prefix, backup, old.prefix):
-                                    store.mark_backup_deleted(old.manifest_key)
-                            else:
-                                await _cancellable(asyncio.sleep(120), stop)
-                                continue
-                finally:
-                    if pending_slot is not None:
-                        await _safe_teardown(slots, pending_slot, "pending-champion-unfinalized")
+            if pending is not None and await _finalize_pending(store, backup, slots, pending, chain, cfg, stop, state):
+                continue
             champ = store.champion()
             if champ is None:
                 champ, state.king_slot = await _bootstrap_champion(store, backup, slots, chain, cfg, stop)

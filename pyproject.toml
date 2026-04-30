@@ -16,7 +16,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
-viz = ["matplotlib>=3.8"]
 
 [project.scripts]
 affine = "affine.__main__:main"
@@ -29,8 +28,4 @@ build-backend = "setuptools.build_meta"
 include = ["affine*"]
 
 [tool.pytest.ini_options]
-addopts = "-m 'not diagnostic and not e2e_fault'"
-markers = [
-    "diagnostic: characterization and anomaly-hunting tests (non-gating by default)",
-    "e2e_fault: fault-injection integration drills (non-gating by default)",
-]
+asyncio_mode = "auto"

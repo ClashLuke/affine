@@ -6,6 +6,8 @@ import logging
 import os
 from dataclasses import dataclass
 
+import bittensor as bt
+
 log = logging.getLogger(__name__)
 
 
@@ -28,7 +30,6 @@ class Subtensor:
         self._lock = asyncio.Lock()
 
     async def _connect(self):
-        import bittensor as bt
         for url in (self._endpoint, self._fallback):
             if url is None:
                 continue
@@ -110,7 +111,7 @@ class Subtensor:
 
 @dataclass(frozen=True)
 class Miner:
-    uid: int
+    uid: int | None
     hotkey: str
     model: str
     revision: str

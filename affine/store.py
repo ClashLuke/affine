@@ -464,13 +464,13 @@ class Store:
                 """
                 SELECT id FROM publications
                 WHERE artifact_id=? AND action=?
-                  AND ((uid IS NULL AND ? IS NULL) OR uid = ?)
-                  AND ((hotkey IS NULL AND ? IS NULL) OR hotkey = ?)
+                  AND uid IS ?
+                  AND hotkey IS ?
                   AND dry_run=?
                   AND status IN ('intent','submitted','failed','confirmed','dry_run')
                 ORDER BY id DESC LIMIT 1
                 """,
-                (artifact, action, uid, uid, hotkey, hotkey, int(dry_run)),
+                (artifact, action, uid, hotkey, int(dry_run)),
             ).fetchone()
             if row:
                 latest = db.execute(

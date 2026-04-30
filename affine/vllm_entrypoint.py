@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -23,13 +24,11 @@ def main() -> int:
         if not args.manifest_key:
             raise SystemExit("--manifest-key is required for --source=s3")
         dest = Path(os.getenv("AFFINE_MODEL_DIR", "/models")) / args.served_model_name.replace("/", "__")
-        tmp = Path(str(dest) + ".tmp")
+        tmp = Path(f"{dest}.tmp")
         if tmp.exists():
-            import shutil
             shutil.rmtree(tmp)
         restore_from_env(args.manifest_key, tmp)
         if dest.exists():
-            import shutil
             shutil.rmtree(dest)
         tmp.rename(dest)
         model_path = str(dest)
