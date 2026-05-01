@@ -11,22 +11,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import boto3
-import httpx
 import smart_open
 from botocore.config import Config as BotoConfig
-from huggingface_hub import HfApi, hf_hub_url
 
-from .store import BackupRecord, artifact_id
+from .store import BackupRecord
 
 
 log = logging.getLogger(__name__)
 
 HIPPIUS_ENDPOINT = "https://s3.hippius.com"
 HIPPIUS_REGION = "decentralized"
-_MAX_ATTEMPTS = 5         # per backup/verify/restore operation
+_MAX_ATTEMPTS = 5         # per verify/restore operation
 _FIRST_BACKOFF_S = 2.0
 _MAX_BACKOFF_S = 60.0
 CHUNK_SIZE = 1024 * 1024
+UPLOAD_PART_CONCURRENCY = 16
 
 
 @dataclass(frozen=True)
@@ -51,6 +50,7 @@ class S3Config:
                 signature_version="s3v4",
                 retries={"total_max_attempts": 1, "mode": "standard"},
                 s3={"addressing_style": "path"},
+                max_pool_connections=UPLOAD_PART_CONCURRENCY * 2,
             ),
         )
         return {"client": client}
@@ -174,54 +174,6 @@ class BackupManager:
         self.by_name = {c.name: c for c in configs}
         self.transport = {c.name: c.transport_params for c in configs}
 
-
-    def backup_hf_artifact(self, model: str, revision: str) -> BackupRecord:
-        token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
-        api = HfApi(token=token)
-        info = api.model_info(model, revision=revision)
-        pinned = info.sha
-        paths = [p for p in sorted(api.list_repo_files(model, revision=pinned)) if not p.endswith("/")]
-        art = artifact_id(model, pinned)
-
-        for attempt in range(_MAX_ATTEMPTS):
-            ts = int(time.time())
-            provider_ok = {cfg.name for cfg in self.configs}
-            file_meta: dict[str, list[dict]] = {cfg.name: [] for cfg in self.configs}
-            prefixes = {cfg.name: f"{cfg.prefix}/artifacts/{art}/staging-{ts}" for cfg in self.configs}
-
-            for path in paths:
-                url = hf_hub_url(model, path, revision=pinned)
-                active = [cfg for cfg in self.configs if cfg.name in provider_ok]
-                successes, meta = self._copy_url_to_providers(
-                    url, {cfg.name: f"{prefixes[cfg.name]}/files/{path}" for cfg in active},
-                    token=token,
-                )
-                provider_ok &= successes
-                for provider in successes:
-                    file_meta[provider].append({"path": path, **meta[provider]})
-                if not provider_ok:
-                    log.warning("all backup providers failed while uploading %s (attempt %d/%d)", path, attempt + 1, _MAX_ATTEMPTS)
-                    self._cleanup_prefixes(prefixes)
-                    if attempt < _MAX_ATTEMPTS - 1:
-                        time.sleep(_backoff(attempt))
-                    break
-            if not provider_ok:
-                continue
-
-            refs = self._write_manifests(model, pinned, art, ts, prefixes, file_meta, provider_ok)
-            if refs:
-                successful = {r.provider for r in refs}
-                failed = {cfg.name for cfg in self.configs} - successful
-                if failed:
-                    self._cleanup_prefixes({n: prefixes[n] for n in failed})
-                encoded = encode_refs(refs)
-                return BackupRecord(art, model, pinned, encoded, encoded, refs_digest(refs), "staging")
-            log.warning("all backup providers failed while writing manifest (attempt %d/%d)", attempt + 1, _MAX_ATTEMPTS)
-            self._cleanup_prefixes(prefixes)
-            if attempt < _MAX_ATTEMPTS - 1:
-                time.sleep(_backoff(attempt))
-        raise RuntimeError(f"backup failed after {_MAX_ATTEMPTS} attempts for {model}@{pinned}")
-
     def verify(self, manifest_key: str, expected_manifest_sha: str | None = None) -> BackupRecord:
         refs = decode_refs(manifest_key)
         if expected_manifest_sha is not None and expected_manifest_sha != refs_digest(refs):
@@ -268,110 +220,12 @@ class BackupManager:
             if cfg is None:
                 ok = False
                 continue
-            target = ref.prefix
             try:
-                self._delete_prefix(cfg, target)
+                self._delete_prefix(cfg, ref.prefix)
             except Exception as exc:
                 ok = False
-                log.warning("backup cleanup failed on provider %s prefix=%s: %s", ref.provider, target, exc)
+                log.warning("backup cleanup failed on provider %s prefix=%s: %s", ref.provider, ref.prefix, exc)
         return ok
-
-    def _copy_url_to_providers(
-        self,
-        url: str,
-        keys: dict[str, str],
-        *,
-        token: str | None,
-    ) -> tuple[set[str], dict[str, dict]]:
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        writers = {}
-        for name, key in keys.items():
-            cfg = self.by_name[name]
-            try:
-                writers[name] = smart_open.open(
-                    cfg.uri(key), "wb", transport_params=self.transport[name],
-                )
-            except Exception as exc:
-                log.warning("backup provider %s open failed: %s", name, exc)
-        if not writers:
-            return set(), {}
-
-        digest = hashlib.sha256()
-        size = 0
-        active = dict(writers)
-        file_sha = ""
-        try:
-            with httpx.Client(timeout=None, follow_redirects=True) as client:
-                with client.stream("GET", url, headers=headers) as resp:
-                    resp.raise_for_status()
-                    for chunk in resp.iter_bytes(CHUNK_SIZE):
-                        if not chunk:
-                            continue
-                        digest.update(chunk)
-                        size += len(chunk)
-                        for name, out in list(active.items()):
-                            try:
-                                out.write(chunk)
-                            except Exception as exc:
-                                log.warning("backup provider %s write failed: %s", name, exc)
-                                _close_quietly(out)
-                                active.pop(name, None)
-                        if not active:
-                            break
-            file_sha = digest.hexdigest()
-        except Exception as exc:
-            log.warning("backup source stream failed for %s: %s", url, exc)
-            _close_all(writers)
-            return set(), {}
-
-        successes: set[str] = set()
-        for name, out in list(active.items()):
-            try:
-                out.close()
-                successes.add(name)
-            except Exception as exc:
-                log.warning("backup provider %s close failed: %s", name, exc)
-        for name, out in writers.items():
-            if name not in active:
-                _close_quietly(out)
-
-        return successes, {
-            name: {"object_key": keys[name], "size": size, "sha256": file_sha}
-            for name in successes
-        }
-
-    def _write_manifests(
-        self,
-        model: str,
-        revision: str,
-        art: str,
-        ts: int,
-        prefixes: dict[str, str],
-        file_meta: dict[str, list[dict]],
-        providers: set[str],
-    ) -> list[ManifestRef]:
-        refs = []
-        for name in sorted(providers):
-            cfg = self.by_name[name]
-            manifest = {
-                "schema": 1,
-                "source": "huggingface",
-                "provider": name,
-                "model": model,
-                "revision": revision,
-                "artifact_id": art,
-                "created_at": ts,
-                "files": file_meta[name],
-            }
-            body = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-            key = f"{prefixes[name]}/manifest.json"
-            try:
-                with smart_open.open(cfg.uri(key), "wb", transport_params=self.transport[name]) as out:
-                    out.write(body)
-                refs.append(ManifestRef(name, cfg.bucket, key, prefixes[name], hashlib.sha256(body).hexdigest()))
-            except Exception as exc:
-                log.warning("backup provider %s manifest write failed: %s", name, exc)
-        return refs
 
     def _manifest_from_ref(self, ref: ManifestRef) -> tuple[dict, S3Config]:
         cfg = self.by_name.get(ref.provider)
@@ -428,14 +282,6 @@ class BackupManager:
             status="restored",
         )
 
-    def _cleanup_prefixes(self, prefixes: dict[str, str]) -> None:
-        for name, prefix in prefixes.items():
-            cfg = self.by_name[name]
-            try:
-                self._delete_prefix(cfg, prefix)
-            except Exception as exc:
-                log.warning("backup cleanup failed on provider %s prefix=%s: %s", name, prefix, exc)
-
     def _delete_prefix(self, cfg: S3Config, prefix: str) -> None:
         client = cfg.transport_params["client"]
         token = None
@@ -450,18 +296,6 @@ class BackupManager:
             if not resp.get("IsTruncated"):
                 return
             token = resp.get("NextContinuationToken")
-
-
-def _close_quietly(out) -> None:
-    try:
-        out.close()
-    except Exception:
-        pass
-
-
-def _close_all(writers: dict) -> None:
-    for out in writers.values():
-        _close_quietly(out)
 
 
 def restore_from_env(manifest_key: str, dest: str | Path) -> BackupRecord:

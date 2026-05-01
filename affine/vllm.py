@@ -30,6 +30,8 @@ class Slot:
     model: str
     revision: str
     base_url: str
+    sidecar_url: str = ""
+    slot_token: str = ""
     slot_id: str = ""
     name: str = ""
 
@@ -124,19 +126,30 @@ async def _targon_crashed(uid: str) -> bool:
     return any(e.get("event_type") in _CRASH_EVENTS for e in (items or []))
 
 
-async def _extract_url(uid: str) -> str | None:
+async def _extract_urls(uid: str) -> dict[int, str]:
+    """Map exposed-port → URL. Targon returns one entry per declared port; we
+    pick by matching `port` (or `internal_port`) on each entry. Order-only
+    fallback: when no port field is present, assume Targon listed entries in
+    declaration order (vllm 8000, sidecar 8001)."""
     try:
         state = await _http()._async_get(f"{_WORKLOADS}/{uid}/state")
     except Exception as e:
         log.debug(f"get_state {uid} failed: {e}")
-        return None
+        return {}
     urls = state.get("urls") if isinstance(state, dict) else None
     if not isinstance(urls, list):
-        return None
-    for u in urls:
-        if isinstance(u, dict) and u.get("url"):
-            return u["url"]
-    return None
+        return {}
+    out: dict[int, str] = {}
+    fallback_order = [8000, 8001]
+    for i, u in enumerate(urls):
+        if not isinstance(u, dict) or not u.get("url"):
+            continue
+        port = u.get("port") or u.get("internal_port") or u.get("target_port")
+        if isinstance(port, int):
+            out[port] = u["url"]
+        elif i < len(fallback_order) and fallback_order[i] not in out:
+            out[fallback_order[i]] = u["url"]
+    return out
 
 
 async def _warm_hit(base_url: str, model: str, timeout: float = 120.0) -> None:
@@ -174,39 +187,59 @@ async def _warm_hit(base_url: str, model: str, timeout: float = 120.0) -> None:
     log.info(f"warm hit ok in {time.monotonic() - t0:.1f}s: {base_url}")
 
 
-async def _wait_for_ready(uid: str, timeout: int, interval: float = 5.0) -> str:
-    """Poll state+events+/models until the slot is ready. One unified loop so
-    crashloops are detected before a URL is exposed and after /models starts
-    responding (vLLM can 200 on /models while still initializing).
+async def _wait_for_ready(uid: str, timeout: int, interval: float = 5.0) -> tuple[str, str]:
+    """Poll state+events until both vLLM `/v1/models` and sidecar `/healthz`
+    return 200. Returns (base_url, sidecar_url).
+
+    The sidecar comes up before vLLM (it's started first in vllm_entrypoint.py),
+    so /healthz typically ready earlier; we still gate on /v1/models to ensure
+    the slot can serve inference. Crashloop detection runs throughout.
 
     Raises `SlotProvisionFailed` ONLY on observed crashloop (miner-caused).
     Raises `TimeoutError` on deadline (could be infra — caller should not skiplist).
     """
     t0 = time.monotonic()
     base_url: str | None = None
+    sidecar_url: str | None = None
+    vllm_ok = False
+    sidecar_ok = False
     async with httpx.AsyncClient(timeout=10) as client:
         while time.monotonic() - t0 < timeout:
             if await _targon_crashed(uid):
                 raise SlotProvisionFailed(f"pod crashlooping after {time.monotonic() - t0:.0f}s: uid={uid}")
-            if base_url is None:
-                raw = await _extract_url(uid)
-                if raw:
-                    base_url = raw.rstrip("/") + "/v1"
-            if base_url:
+            if base_url is None or sidecar_url is None:
+                urls = await _extract_urls(uid)
+                if base_url is None and 8000 in urls:
+                    base_url = urls[8000].rstrip("/") + "/v1"
+                if sidecar_url is None and 8001 in urls:
+                    sidecar_url = urls[8001].rstrip("/")
+            if base_url and not vllm_ok:
                 try:
                     r = await client.get(f"{base_url}/models")
-                    if r.status_code == 200:
-                        log.info(f"slot ready after {time.monotonic() - t0:.0f}s: {base_url}")
-                        return base_url
+                    vllm_ok = r.status_code == 200
                 except Exception:
                     pass
+            if sidecar_url and not sidecar_ok:
+                try:
+                    r = await client.get(f"{sidecar_url}/healthz")
+                    sidecar_ok = r.status_code == 200
+                except Exception:
+                    pass
+            if vllm_ok and sidecar_ok:
+                log.info(f"slot ready after {time.monotonic() - t0:.0f}s: vllm={base_url} sidecar={sidecar_url}")
+                return base_url, sidecar_url
             await asyncio.sleep(interval)
-    raise TimeoutError(f"uid={uid} not ready within {timeout}s")
+    raise TimeoutError(f"uid={uid} not ready within {timeout}s "
+                       f"(vllm_ok={vllm_ok}, sidecar_ok={sidecar_ok})")
 
 
 class TargonSlots:
     def __init__(self, config, hotkey: str, s3_configs: list["S3Config"] | None = None):
         self._config = config
+        # S3 configs are kept for the in-container restore path: when a slot is
+        # reprovisioned from a champion's existing backup, the slot needs creds
+        # to read from S3 at startup. Upload-side creds are NOT injected into
+        # env; they ride the /setup-backup POST instead.
         self._s3_configs = list(s3_configs) if s3_configs else []
         # Lowercase-hex prefix scopes reconcile() to our own workloads when
         # multiple validators share a Targon API key. (Targon names are
@@ -252,12 +285,15 @@ class TargonSlots:
         # king & challenger sharing a popular base — don't collide on the workload name.
         h = hashlib.sha256(f"{model}\0{revision}".encode()).hexdigest()[:8]
         name = f"{self._prefix}-{h}-{secrets.token_hex(4)}"
+        slot_token = secrets.token_urlsafe(32)
         vllm_args = [
-            "--model", model,
-            "--revision", revision,
-            "--served-model-name", model,
             "--host", "0.0.0.0",
             "--port", "8000",
+            # Belt-and-suspenders code-execution guards. Asserted in
+            # vllm_entrypoint.py before launch; both must survive any future
+            # refactor untouched.
+            "--trust-remote-code=False",
+            "--load-format=safetensors",
             "--enable-prefix-caching",
             "--enable-chunked-prefill",
             # 0.85 (was 0.90/0.95): leaves ~7 GiB on H200 for lazy first-burst
@@ -274,51 +310,56 @@ class TargonSlots:
             "--max-num-batched-tokens", "65536",
         ]
         image = _vllm_image()
-        commands = None
-        args = vllm_args
         env = {
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
             # PR #30515: fold cudagraph cost into startup memory profiling so the
             # KV pool is sized smaller and real headroom remains for FlashInfer
             # workspace + JIT arenas + transient prefill activations.
             "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "1",
+            # Sidecar reads this once at startup, pops it from os.environ. The
+            # validator presents the same token in the Authorization header on
+            # /setup-backup and /teardown-backup. Targon never sees S3 creds.
+            "AFFINE_SLOT_TOKEN": slot_token,
         }
         for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
             v = os.environ.get(k)
             if v:
                 env[k] = v
-        if source == "hf":
-            commands = ["python", "-m", "vllm.entrypoints.openai.api_server"]
+        if source not in ("hf", "s3"):
+            raise ValueError(f"unknown vLLM source: {source}")
         if source == "s3":
             if not backup_manifest_key:
                 raise ValueError("backup_manifest_key is required for source='s3'")
-            args = [
-                "--source", "s3",
-                "--model", model,
-                "--revision", revision,
-                "--served-model-name", model,
-                "--manifest-key", backup_manifest_key,
-                "--",
-                *vllm_args[6:],
-            ]
+            # Restore-from-S3 needs creds in env at startup (read once before
+            # the entrypoint scrubs them). Upload-side creds never go through here.
             env.update(_s3_env_from_configs(self._s3_configs))
-        elif source != "hf":
-            raise ValueError(f"unknown vLLM source: {source}")
+        commands = ["python", "-m", "affine.vllm_entrypoint"]
+        args = [
+            "--source", source,
+            "--model", model,
+            "--revision", revision,
+            "--served-model-name", model,
+        ]
+        if source == "s3":
+            args += ["--manifest-key", backup_manifest_key]
+        args += ["--", *vllm_args]
 
         payload = {
             "type": "RENTAL",
             "name": name,
             "image": image,
             "resource_name": _resource(),
+            "commands": commands,
             "args": args,
             "envs": [{"name": k, "value": v} for k, v in env.items()],
-            "ports": [{"port": 8000, "protocol": "TCP"}],
+            "ports": [
+                {"port": 8000, "protocol": "TCP"},
+                {"port": 8001, "protocol": "TCP"},
+            ],
         }
         registry_auth = _registry_auth()
         if registry_auth is not None:
             payload["registry_auth"] = registry_auth
-        if commands is not None:
-            payload["commands"] = commands
 
         http = _http()
         log.info(f"targon rental register: name={name} image={image} resource={payload['resource_name']} model={model} source={source}")
@@ -338,7 +379,7 @@ class TargonSlots:
             log.info(f"targon rental deploy: uid={uid}")
             await http._async_post(f"{_WORKLOADS}/{uid}/deploy")
             log.info(f"targon rental uid={uid}; waiting for ready (timeout {timeout}s)")
-            base_url = await _wait_for_ready(uid, timeout=timeout)
+            base_url, sidecar_url = await _wait_for_ready(uid, timeout=timeout)
             await _warm_hit(base_url, model)
         except BaseException:
             # Shield: if the outer task is being cancelled (SIGTERM during a
@@ -347,8 +388,10 @@ class TargonSlots:
             if uid is not None:
                 await asyncio.shield(self._delete(uid))
             raise
-        log.info(f"targon slot ready: uid={uid} base_url={base_url}")
-        return Slot(model=model, revision=revision, base_url=base_url, slot_id=uid, name=name)
+        log.info(f"targon slot ready: uid={uid} base_url={base_url} sidecar={sidecar_url}")
+        return Slot(model=model, revision=revision, base_url=base_url,
+                    sidecar_url=sidecar_url, slot_token=slot_token,
+                    slot_id=uid, name=name)
 
     async def teardown(self, slot: Slot) -> None:
         if not slot.slot_id or slot.slot_id.startswith("local-"):
@@ -394,3 +437,83 @@ def _s3_env_from_configs(configs: list["S3Config"]) -> dict[str, str]:
     if not env:
         raise RuntimeError("no S3 configs available for backup restore")
     return env
+
+
+def _provider_payload(c: "S3Config") -> dict:
+    return {
+        "endpoint_url": c.endpoint_url,
+        "region": c.region,
+        "bucket": c.bucket,
+        "access_key": c.access_key,
+        "secret_key": c.secret_key,
+    }
+
+
+async def setup_backup(
+    slot: Slot,
+    s3_configs: list["S3Config"],
+    *,
+    prefix: str,
+    model: str,
+    revision: str,
+    artifact_id: str,
+) -> bool:
+    """Hand S3 creds to the slot's sidecar, telling it to start uploading the
+    local artifact. Returns False (not raising) on transport errors so a sidecar
+    that comes up unhealthy doesn't abort the duel — the validator gets refs
+    later through poll_backup, or never (and the dethrone proceeds with an
+    empty backup_manifest, repaired by the next reconcile)."""
+    if not slot.sidecar_url or not slot.slot_token or not s3_configs:
+        return False
+    payload = {
+        "providers": {c.name: _provider_payload(c) for c in s3_configs},
+        "prefix": prefix,
+        "model": model,
+        "revision": revision,
+        "artifact_id": artifact_id,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"{slot.sidecar_url}/setup-backup",
+                json=payload,
+                headers={"Authorization": f"Bearer {slot.slot_token}"},
+            )
+        if r.status_code != 204:
+            log.warning(f"setup-backup {slot.sidecar_url}: {r.status_code} {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        log.warning(f"setup-backup {slot.sidecar_url} failed: {type(e).__name__}: {e}")
+        return False
+
+
+async def poll_backup(slot: Slot) -> dict | None:
+    """Returns the sidecar's current state dict, or None on transport error."""
+    if not slot.sidecar_url:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{slot.sidecar_url}/backup")
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+async def teardown_backup(slot: Slot) -> bool:
+    """Tell the sidecar to abort upload, scrub creds, delete partial prefixes.
+    Best-effort: failure here doesn't block teardown of the slot itself."""
+    if not slot.sidecar_url or not slot.slot_token:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"{slot.sidecar_url}/teardown-backup",
+                headers={"Authorization": f"Bearer {slot.slot_token}"},
+            )
+        return r.status_code == 204
+    except Exception as e:
+        log.warning(f"teardown-backup {slot.sidecar_url} failed: {type(e).__name__}: {e}")
+        return False

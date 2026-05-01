@@ -45,6 +45,55 @@ from affine.paired import PairCounts, pair_p_value
 
 
 PROBE_WINDOW_S = 1800
+VERDICT_QUEUE_LIMIT = 12
+
+VERDICT_COLS = (
+    ("UID",     4,  ">"),
+    ("Repo",    28, "<"),
+    ("Rev",     8,  "<"),
+    ("Hotkey",  6,  "<"),
+    ("Verdict", 18, "<"),
+    ("W-L",     7,  ">"),
+    ("Ties",    5,  ">"),
+    ("p",       7,  ">"),
+    ("α",  7,  ">"),
+    ("Age",     5,  ">"),
+)
+
+
+def _trunc(s: str, n: int) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _age(now: float, ts: float) -> str:
+    d = max(int(now - ts), 0)
+    if d < 60:
+        return f"{d}s"
+    if d < 3600:
+        return f"{d // 60}m"
+    if d < 86400:
+        return f"{d // 3600}h"
+    return f"{d // 86400}d"
+
+
+def _fmt_row(cells: list[str]) -> str:
+    return "  " + " ".join(f"{c:{a}{w}}" for c, (_, w, a) in zip(cells, VERDICT_COLS))
+
+
+def _verdict_row(duel, counts: PairCounts, now: float) -> list[str]:
+    p = pair_p_value(counts.challenger_only, counts.discordant)
+    return [
+        str(duel["challenger_uid"]),
+        _trunc(str(duel["challenger_model"]), 28),
+        str(duel["challenger_revision"])[:8],
+        (str(duel["challenger_hotkey"]) or "——")[:6],
+        _trunc(str(duel["status"]), 18),
+        f"{counts.challenger_only}-{counts.champion_only}",
+        str(counts.both_pass + counts.both_fail),
+        "——" if counts.discordant == 0 else f"{p:.2g}",
+        f"{float(duel['alpha']):.2g}",
+        _age(now, float(duel["created_at"])),
+    ]
 
 
 def _pids() -> list[int]:
@@ -138,13 +187,12 @@ def main() -> int:
         by_status = Counter(str(d["status"]) for d in duels)
         print(f"  duels: {len(duels)} total  statuses={dict(by_status) or '—'}")
         if duels:
-            d = duels[0]
-            counts = _counts(db, int(d["id"]))
-            ties = counts.both_pass + counts.both_fail
-            print(f"  latest: id={d['id']} {d['status']} uid{d['challenger_uid']} "
-                  f"{d['challenger_model']}@{str(d['challenger_revision'])[:12]} "
-                  f"W-L={counts.challenger_only}-{counts.champion_only} ties={ties} "
-                  f"p={pair_p_value(counts.challenger_only, counts.discordant):.3g} alpha={float(d['alpha']):.3g}")
+            now = time.time()
+            header = [name for name, _, _ in VERDICT_COLS]
+            print(_fmt_row(header))
+            print(_fmt_row(["-" * w for _, w, _ in VERDICT_COLS]))
+            for d in duels[:VERDICT_QUEUE_LIMIT]:
+                print(_fmt_row(_verdict_row(d, _counts(db, int(d["id"])), now)))
 
     if samples:
         delivered = sum(1 for s in samples if s["champion_delivered"] and s["challenger_delivered"])

@@ -119,19 +119,6 @@ class Store:
                 payable INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS pending_champion (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                artifact_id TEXT NOT NULL,
-                model TEXT NOT NULL,
-                revision TEXT NOT NULL,
-                uid INTEGER,
-                hotkey TEXT,
-                reign_start INTEGER NOT NULL,
-                backup_manifest TEXT NOT NULL,
-                backup_prefix TEXT NOT NULL,
-                payable INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS backups (
                 artifact_id TEXT NOT NULL,
                 model TEXT NOT NULL,
@@ -199,138 +186,86 @@ class Store:
         row = self.db.execute("SELECT * FROM champion WHERE id = 1").fetchone()
         return _champion(row) if row else None
 
-    def pending_champion(self) -> Champion | None:
-        row = self.db.execute("SELECT * FROM pending_champion WHERE id = 1").fetchone()
-        return _champion(row) if row else None
-
-    def set_champion(self, champ: Champion, backup: BackupRecord) -> None:
+    def set_champion(self, champ: Champion, backup: BackupRecord | None = None) -> None:
         ts = now()
         with self.tx() as db:
+            if backup is not None:
+                db.execute(
+                    """
+                    INSERT INTO backups(artifact_id, model, revision, prefix, manifest_key,
+                                        manifest_sha256, status, created_at, verified_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'current', ?, ?)
+                    ON CONFLICT(manifest_key) DO UPDATE SET status='current', verified_at=excluded.verified_at
+                    """,
+                    (backup.artifact_id, backup.model, backup.revision, backup.prefix,
+                     backup.manifest_key, backup.manifest_sha256, ts, ts),
+                )
+                db.execute("UPDATE backups SET status='retiring' WHERE status='current' AND manifest_key <> ?",
+                           (backup.manifest_key,))
+            db.execute(
+                """
+                INSERT INTO champion(id, artifact_id, model, revision, uid, hotkey,
+                                     reign_start, backup_manifest, backup_prefix, payable, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    artifact_id=excluded.artifact_id,
+                    model=excluded.model,
+                    revision=excluded.revision,
+                    uid=excluded.uid,
+                    hotkey=excluded.hotkey,
+                    reign_start=excluded.reign_start,
+                    backup_manifest=excluded.backup_manifest,
+                    backup_prefix=excluded.backup_prefix,
+                    payable=excluded.payable,
+                    updated_at=excluded.updated_at
+                """,
+                (champ.artifact_id, champ.model, champ.revision, champ.uid, champ.hotkey,
+                 champ.reign_start, champ.backup_manifest, champ.backup_prefix,
+                 int(champ.payable), ts),
+            )
+
+    def update_backup_manifest(
+        self,
+        artifact_id: str,
+        manifest_key: str,
+        prefix: str,
+        manifest_sha256: str,
+        model: str,
+        revision: str,
+    ) -> bool:
+        """Persist a backup manifest produced by the slot's sidecar onto the
+        matching champion. Idempotent: refs may flip from one-provider to
+        two-provider as the second upload completes; the new ref string just
+        replaces the old. Old `current` rows for other artifacts are retired."""
+        ts = now()
+        with self.tx() as db:
+            row = db.execute("SELECT artifact_id FROM champion WHERE id=1").fetchone()
+            if row is None or row["artifact_id"] != artifact_id:
+                return False
             db.execute(
                 """
                 INSERT INTO backups(artifact_id, model, revision, prefix, manifest_key,
                                     manifest_sha256, status, created_at, verified_at)
                 VALUES (?, ?, ?, ?, ?, ?, 'current', ?, ?)
-                ON CONFLICT(manifest_key) DO UPDATE SET status='current', verified_at=excluded.verified_at
+                ON CONFLICT(manifest_key) DO UPDATE SET
+                    status='current',
+                    verified_at=excluded.verified_at,
+                    prefix=excluded.prefix,
+                    manifest_sha256=excluded.manifest_sha256
                 """,
-                (backup.artifact_id, backup.model, backup.revision, backup.prefix,
-                 backup.manifest_key, backup.manifest_sha256, ts, ts),
+                (artifact_id, model, revision, prefix, manifest_key, manifest_sha256, ts, ts),
             )
             db.execute("UPDATE backups SET status='retiring' WHERE status='current' AND manifest_key <> ?",
-                       (backup.manifest_key,))
+                       (manifest_key,))
             db.execute(
                 """
-                INSERT INTO champion(id, artifact_id, model, revision, uid, hotkey,
-                                     reign_start, backup_manifest, backup_prefix, payable, updated_at)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    artifact_id=excluded.artifact_id,
-                    model=excluded.model,
-                    revision=excluded.revision,
-                    uid=excluded.uid,
-                    hotkey=excluded.hotkey,
-                    reign_start=excluded.reign_start,
-                    backup_manifest=excluded.backup_manifest,
-                    backup_prefix=excluded.backup_prefix,
-                    payable=excluded.payable,
-                    updated_at=excluded.updated_at
+                UPDATE champion
+                SET backup_manifest=?, backup_prefix=?, updated_at=?
+                WHERE id=1 AND artifact_id=?
                 """,
-                (champ.artifact_id, champ.model, champ.revision, champ.uid, champ.hotkey,
-                 champ.reign_start, champ.backup_manifest, champ.backup_prefix,
-                 int(champ.payable), ts),
+                (manifest_key, prefix, ts, artifact_id),
             )
-
-    def set_pending_champion(self, champ: Champion, backup: BackupRecord) -> None:
-        ts = now()
-        with self.tx() as db:
-            db.execute(
-                """
-                INSERT INTO backups(artifact_id, model, revision, prefix, manifest_key,
-                                    manifest_sha256, status, created_at, verified_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-                ON CONFLICT(manifest_key) DO UPDATE SET status='pending', verified_at=excluded.verified_at
-                """,
-                (backup.artifact_id, backup.model, backup.revision, backup.prefix,
-                 backup.manifest_key, backup.manifest_sha256, ts, ts),
-            )
-            db.execute(
-                """
-                INSERT INTO pending_champion(id, artifact_id, model, revision, uid, hotkey,
-                                             reign_start, backup_manifest, backup_prefix, payable, updated_at)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    artifact_id=excluded.artifact_id,
-                    model=excluded.model,
-                    revision=excluded.revision,
-                    uid=excluded.uid,
-                    hotkey=excluded.hotkey,
-                    reign_start=excluded.reign_start,
-                    backup_manifest=excluded.backup_manifest,
-                    backup_prefix=excluded.backup_prefix,
-                    payable=excluded.payable,
-                    updated_at=excluded.updated_at
-                """,
-                (champ.artifact_id, champ.model, champ.revision, champ.uid, champ.hotkey,
-                 champ.reign_start, champ.backup_manifest, champ.backup_prefix,
-                 int(champ.payable), ts),
-            )
-
-    def finalize_pending_champion(self) -> Champion | None:
-        row = self.db.execute("SELECT * FROM pending_champion WHERE id = 1").fetchone()
-        if row is None:
-            return None
-        champ = _champion(row)
-        ts = now()
-        with self.tx() as db:
-            db.execute("UPDATE backups SET status='retiring' WHERE status='current' AND manifest_key <> ?",
-                       (champ.backup_manifest,))
-            db.execute("UPDATE backups SET status='current', verified_at=? WHERE manifest_key=?",
-                       (ts, champ.backup_manifest))
-            db.execute(
-                """
-                INSERT INTO champion(id, artifact_id, model, revision, uid, hotkey,
-                                     reign_start, backup_manifest, backup_prefix, payable, updated_at)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    artifact_id=excluded.artifact_id,
-                    model=excluded.model,
-                    revision=excluded.revision,
-                    uid=excluded.uid,
-                    hotkey=excluded.hotkey,
-                    reign_start=excluded.reign_start,
-                    backup_manifest=excluded.backup_manifest,
-                    backup_prefix=excluded.backup_prefix,
-                    payable=excluded.payable,
-                    updated_at=excluded.updated_at
-                """,
-                (champ.artifact_id, champ.model, champ.revision, champ.uid, champ.hotkey,
-                 champ.reign_start, champ.backup_manifest, champ.backup_prefix,
-                 int(champ.payable), ts),
-            )
-            db.execute("DELETE FROM pending_champion WHERE id=1")
-        return champ
-
-    def clear_pending_champion(self) -> BackupRecord | None:
-        row = self.db.execute(
-            """
-            SELECT b.*
-            FROM pending_champion p
-            JOIN backups b ON b.manifest_key = p.backup_manifest
-            WHERE p.id = 1
-            """
-        ).fetchone()
-        backup = _backup(row) if row else None
-        with self.tx() as db:
-            db.execute(
-                """
-                UPDATE backups
-                SET status='staging'
-                WHERE manifest_key=(SELECT backup_manifest FROM pending_champion WHERE id=1)
-                  AND status='pending'
-                """
-            )
-            db.execute("DELETE FROM pending_champion WHERE id=1")
-        return backup
+        return True
 
     def record_backup(self, backup: BackupRecord, status: str) -> None:
         ts = now()
