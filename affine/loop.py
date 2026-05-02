@@ -40,7 +40,8 @@ from .store import BackupRecord, Champion, PairSample, Store, artifact_id
 from .vllm import (
     Slot,
     SlotProvisionFailed,
-    TargonSlots,
+    VllmSlots,
+    make_slots,
     poll_backup,
 )
 
@@ -116,11 +117,12 @@ async def _cancellable(coro, stop: asyncio.Event, on_orphan=None):
                     log.warning(f"_cancellable: on_orphan failed: {type(e).__name__}: {e}")
 
 
-async def _safe_teardown(slots, slot: Slot, ctx: str) -> None:
-    """Shielded so an outer cancel during teardown doesn't interrupt the Targon
+async def _safe_teardown(slot: Slot, ctx: str) -> None:
+    """Shielded so an outer cancel during teardown doesn't interrupt the platform
     DELETE — the request keeps flying as a fire-and-forget task; reconcile() at
-    next startup is the backstop."""
-    try: await asyncio.shield(slots.teardown(slot))
+    next startup is the backstop. Slot owns its teardown closure (captures the
+    provider instance + handle), so dispatch is self-contained."""
+    try: await asyncio.shield(slot.teardown())
     except Exception as e: log.warning(f"teardown error ({ctx}): {e}")
 
 
@@ -143,22 +145,26 @@ def _install_signal_handlers(stop: asyncio.Event) -> None:
             signal.signal(sig, lambda *_args, request_stop=request_stop: request_stop())
 
 
-async def _provision(slots, miner: Miner, stop: asyncio.Event, **kwargs) -> Slot | None:
-    """Provision a slot or return None. The status string used to be returned
-    too — every caller only used it for logging, so collapsing to Slot|None and
-    logging the cause inside removes branching that wasn't load-bearing."""
-    try:
-        return await _cancellable(
-            slots.provision(miner.model, miner.revision, **kwargs), stop,
-            on_orphan=lambda s: _safe_teardown(slots, s, "provision-orphan"),
-        )
-    except SlotProvisionFailed as e:
-        log.warning(f"provision crashloop {miner.model}@{miner.revision}: {e}")
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        log.warning(f"provision failed uid{miner.uid} {miner.model}@{miner.revision}: "
-                    f"{type(e).__name__}: {e}")
+async def _provision(chain: list[VllmSlots], miner: Miner,
+                     stop: asyncio.Event, **kwargs) -> Slot | None:
+    """Iterate the provider chain on infra-class failure. `SlotProvisionFailed`
+    (miner-fault crashloop) does NOT fall through — the same artifact would
+    crashloop on every provider. `CancelledError` propagates."""
+    for i, slots in enumerate(chain):
+        try:
+            return await _cancellable(
+                slots.provision(miner.model, miner.revision, **kwargs), stop,
+                on_orphan=lambda s: _safe_teardown(s, "provision-orphan"),
+            )
+        except SlotProvisionFailed as e:
+            log.warning(f"provision crashloop {miner.model}@{miner.revision}: {e}")
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            tail = "; falling through" if i + 1 < len(chain) else " (no fallback left)"
+            log.warning(f"{slots.NAME} provision failed{tail} uid{miner.uid} "
+                        f"{miner.model}@{miner.revision}: {type(e).__name__}: {e}")
     return None
 
 
@@ -212,10 +218,10 @@ class _DuelRun:
     counts: PairCounts
 
 
-def _backup_configs(cfg: Config, chain: Chain, slots) -> list[S3Config]:
-    if slots is not None or _truthy_env("AFFINE_LOCAL"):
+def _backup_configs(cfg: Config, hotkey: str) -> list[S3Config]:
+    if _truthy_env("AFFINE_LOCAL"):
         return []
-    hot_hash = hashlib.sha256(chain.hotkey.encode()).hexdigest()[:16]
+    hot_hash = hashlib.sha256(hotkey.encode()).hexdigest()[:16]
     namespace = os.getenv("AFFINE_NAMESPACE", "prod").strip().strip("/") or "prod"
     configs = S3Config.from_env(default_prefix=f"{cfg.netuid}/{namespace}/{hot_hash}")
     if not configs:
@@ -315,7 +321,7 @@ def _is_current_champion_registration(m: Miner, champ: Champion, artifact_alive:
 async def _bootstrap_champion(
     store: Store,
     s3_configs: list[S3Config],
-    slots,
+    slots: list[VllmSlots],
     chain: Chain,
     cfg: Config,
     stop: asyncio.Event,
@@ -361,7 +367,7 @@ async def _bootstrap_champion(
 async def _ensure_king_slot(
     state: _RunState,
     champ: Champion,
-    slots,
+    slots: list[VllmSlots],
     stop: asyncio.Event,
     store: Store | None = None,
 ) -> Slot | None:
@@ -658,13 +664,15 @@ async def _retirement_task(store: Store, s3_configs: list[S3Config], stop: async
             return
 
 
-async def run(cfg: Config, chain: Chain, slots=None):
-    owned_slots = slots is None
-    s3_configs = _backup_configs(cfg, chain, slots)
-    if owned_slots:
-        slots = TargonSlots(cfg, hotkey=chain.hotkey, s3_configs=s3_configs)
-    if hasattr(slots, "reconcile"):
-        await slots.reconcile()
+async def run(cfg: Config, chain: Chain, slots: list[VllmSlots] | None = None):
+    if slots is None:
+        s3_configs = _backup_configs(cfg, chain.hotkey)
+        slots = make_slots(cfg=cfg, hotkey=chain.hotkey, s3_configs=s3_configs)
+    else:
+        # Test/external-injection mode: caller owns the slot list and S3 is
+        # disabled (sidecar-driven backups need real S3 endpoints).
+        s3_configs = []
+    await asyncio.gather(*(s.reconcile() for s in slots), return_exceptions=True)
     envs = await _load_envs(cfg)
     store = Store(cfg.db_path)
     store.abort_running_duels()
@@ -758,7 +766,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 result = await _run_fixed_duel(store, chain, _champion_miner(champ), king_slot,
                                                challenger, chal_slot, envs, cfg, duel, stop)
                 if result.status == "champion_slot_dead":
-                    await _safe_teardown(slots, king_slot, "champion-slot-dead")
+                    await _safe_teardown(king_slot, "champion-slot-dead")
                     state.king_slot = None
                     continue
                 if result.status == "delivery_stalled":
@@ -808,20 +816,23 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 promoted = True
                 state.attempted.clear()
                 if old_slot is not None:
-                    await _safe_teardown(slots, old_slot, "old-champion-promoted")
+                    await _safe_teardown(old_slot, "old-champion-promoted")
                 ok = await _publish_champion(store, chain, cfg, new_champ)
                 log.info(f"DETHRONE: {champ.model}@{champ.revision} -> uid {registered.uid}"
                          + ("" if ok else " (publish deferred)"))
             finally:
                 if chal_slot is not None and not promoted:
-                    await _safe_teardown(slots, chal_slot, "challenger-end")
+                    await _safe_teardown(chal_slot, "challenger-end")
     finally:
         log.info("shutdown")
         retirement.cancel()
         try: await retirement
         except (asyncio.CancelledError, BaseException): pass
         if state.king_slot is not None:
-            await _safe_teardown(slots, state.king_slot, "shutdown-king")
+            await _safe_teardown(state.king_slot, "shutdown-king")
+        for s in slots:
+            try: await s.aclose()
+            except Exception as e: log.warning(f"aclose {s.NAME}: {e}")
         store.close()
 
 
