@@ -29,3 +29,9 @@ include = ["affine*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+[tool.ruff.lint]
+# Dense one-liner style is a deliberate house preference (see CLAUDE.md
+# "dense, functional, low-ceremony Python"). Silencing E701/E702 keeps the
+# next `ruff check` signal-not-noise so dead imports and real bugs stand out.
+ignore = ["E701", "E702"]

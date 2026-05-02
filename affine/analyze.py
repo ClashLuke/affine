@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from .config import Config
-from .paired import PairCounts, decide_paired, pair_p_value
+from .paired import PairCounts, decide_paired
 
 
 def main() -> int:

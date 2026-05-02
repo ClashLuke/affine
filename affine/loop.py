@@ -480,8 +480,8 @@ def _pair_sample_from_rows(duel_id: int, env: str, task_id: int, iter_idx: int,
         if isinstance(result, BaseException):
             log.warning(f"sample raised uid{miner.uid}: {type(result).__name__}: {result}")
             return 0, 0.0, 0, 0
-        p, l, delivered, tokens = result
-        return p, l, int(delivered), tokens
+        p, latency, delivered, tokens = result
+        return p, latency, int(delivered), tokens
     kp, kl, kd, kt = unpack(rk, king)
     cp, cl, cd, ct = unpack(rc, chal)
     return PairSample(duel_id, env, task_id, iter_idx, block, kp, cp, kl, cl, kd, cd, kt, ct)
@@ -827,7 +827,7 @@ async def run(cfg: Config, chain: Chain, slots: list[VllmSlots] | None = None):
         log.info("shutdown")
         retirement.cancel()
         try: await retirement
-        except (asyncio.CancelledError, BaseException): pass
+        except (asyncio.CancelledError, Exception): pass
         if state.king_slot is not None:
             await _safe_teardown(state.king_slot, "shutdown-king")
         for s in slots:
