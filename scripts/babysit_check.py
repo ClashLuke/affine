@@ -181,7 +181,14 @@ def main() -> int:
 
     if champ:
         pay = f"uid{champ['uid']}" if champ["payable"] and champ["uid"] is not None else "burned/baseline"
-        print(f"  champion: {champ['model']}@{champ['revision'][:12]}  pay={pay}  backup={champ['backup_manifest']}")
+        with sqlite3.connect(path) as db:
+            db.row_factory = sqlite3.Row
+            backup = db.execute(
+                "SELECT manifest_key FROM backups WHERE artifact_id=? AND status='current'",
+                (champ["artifact_id"],),
+            ).fetchone()
+        manifest = backup["manifest_key"] if backup else ""
+        print(f"  champion: {champ['model']}@{champ['revision'][:12]}  pay={pay}  backup={manifest}")
 
     if duels is not None:
         by_status = Counter(str(d["status"]) for d in duels)

@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 import httpx
 from targon.client.client import Client
 
+from .store import artifact_id as _artifact_id
+
 if TYPE_CHECKING:
     from .backup import S3Config
 
@@ -187,13 +189,19 @@ async def _warm_hit(base_url: str, model: str, timeout: float = 120.0) -> None:
     log.info(f"warm hit ok in {time.monotonic() - t0:.1f}s: {base_url}")
 
 
-async def _wait_for_ready(uid: str, timeout: int, interval: float = 5.0) -> tuple[str, str]:
-    """Poll state+events until both vLLM `/v1/models` and sidecar `/healthz`
-    return 200. Returns (base_url, sidecar_url).
+async def _wait_for_ready(uid: str, timeout: int, interval: float = 5.0,
+                          *, require_vllm: bool = True) -> tuple[str | None, str | None]:
+    """Poll state+events until the desired endpoints are reachable.
 
-    The sidecar comes up before vLLM (it's started first in vllm_entrypoint.py),
-    so /healthz typically ready earlier; we still gate on /v1/models to ensure
-    the slot can serve inference. Crashloop detection runs throughout.
+    `require_vllm=True` (default): both vLLM `/v1/models` and sidecar `/healthz`
+    must return 200. Returns (base_url, sidecar_url).
+
+    `require_vllm=False`: returns as soon as `/healthz` is reachable, even if
+    vLLM hasn't started. Used for the s3-restore path where vLLM intentionally
+    blocks on `/setup` until the validator hands over creds. Returns
+    (base_url-or-None, sidecar_url).
+
+    Crashloop detection runs throughout.
 
     Raises `SlotProvisionFailed` ONLY on observed crashloop (miner-caused).
     Raises `TimeoutError` on deadline (could be infra — caller should not skiplist).
@@ -213,7 +221,7 @@ async def _wait_for_ready(uid: str, timeout: int, interval: float = 5.0) -> tupl
                     base_url = urls[8000].rstrip("/") + "/v1"
                 if sidecar_url is None and 8001 in urls:
                     sidecar_url = urls[8001].rstrip("/")
-            if base_url and not vllm_ok:
+            if base_url and not vllm_ok and require_vllm:
                 try:
                     r = await client.get(f"{base_url}/models")
                     vllm_ok = r.status_code == 200
@@ -225,12 +233,41 @@ async def _wait_for_ready(uid: str, timeout: int, interval: float = 5.0) -> tupl
                     sidecar_ok = r.status_code == 200
                 except Exception:
                     pass
-            if vllm_ok and sidecar_ok:
-                log.info(f"slot ready after {time.monotonic() - t0:.0f}s: vllm={base_url} sidecar={sidecar_url}")
+            if sidecar_ok and (vllm_ok or not require_vllm):
+                log.info(f"slot ready after {time.monotonic() - t0:.0f}s: vllm={base_url} sidecar={sidecar_url} require_vllm={require_vllm}")
                 return base_url, sidecar_url
             await asyncio.sleep(interval)
     raise TimeoutError(f"uid={uid} not ready within {timeout}s "
                        f"(vllm_ok={vllm_ok}, sidecar_ok={sidecar_ok})")
+
+
+def _derive_prefix(s3_configs: list["S3Config"], art: str) -> str:
+    """Per-artifact prefix root. The slot adds `{provider_name}-{ts}` inside,
+    so concurrent attempts on the same artifact don't collide."""
+    return f"{s3_configs[0].prefix}/artifacts/{art}"
+
+
+async def _post_setup(sidecar_url: str, slot_token: str,
+                      s3_configs: list["S3Config"], *,
+                      model: str, revision: str, artifact_id: str,
+                      manifest_key: str | None,
+                      timeout: float = 3600.0) -> None:
+    payload = {
+        "providers": {c.name: c.payload() for c in s3_configs},
+        "prefix": _derive_prefix(s3_configs, artifact_id),
+        "model": model,
+        "revision": revision,
+        "artifact_id": artifact_id,
+        "manifest_key": manifest_key,
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(
+            f"{sidecar_url}/setup",
+            json=payload,
+            headers={"Authorization": f"Bearer {slot_token}"},
+        )
+    if r.status_code != 204:
+        raise RuntimeError(f"setup failed: {r.status_code} {r.text[:200]}")
 
 
 class TargonSlots:
@@ -239,7 +276,7 @@ class TargonSlots:
         # S3 configs are kept for the in-container restore path: when a slot is
         # reprovisioned from a champion's existing backup, the slot needs creds
         # to read from S3 at startup. Upload-side creds are NOT injected into
-        # env; they ride the /setup-backup POST instead.
+        # env; they ride the /setup POST instead.
         self._s3_configs = list(s3_configs) if s3_configs else []
         # Lowercase-hex prefix scopes reconcile() to our own workloads when
         # multiple validators share a Targon API key. (Targon names are
@@ -318,7 +355,7 @@ class TargonSlots:
             "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "1",
             # Sidecar reads this once at startup, pops it from os.environ. The
             # validator presents the same token in the Authorization header on
-            # /setup-backup and /teardown-backup. Targon never sees S3 creds.
+            # /setup. Targon never sees S3 creds.
             "AFFINE_SLOT_TOKEN": slot_token,
         }
         for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
@@ -327,12 +364,8 @@ class TargonSlots:
                 env[k] = v
         if source not in ("hf", "s3"):
             raise ValueError(f"unknown vLLM source: {source}")
-        if source == "s3":
-            if not backup_manifest_key:
-                raise ValueError("backup_manifest_key is required for source='s3'")
-            # Restore-from-S3 needs creds in env at startup (read once before
-            # the entrypoint scrubs them). Upload-side creds never go through here.
-            env.update(_s3_env_from_configs(self._s3_configs))
+        if source == "s3" and not backup_manifest_key:
+            raise ValueError("backup_manifest_key is required for source='s3'")
         commands = ["python", "-m", "affine.vllm_entrypoint"]
         args = [
             "--source", source,
@@ -379,7 +412,21 @@ class TargonSlots:
             log.info(f"targon rental deploy: uid={uid}")
             await http._async_post(f"{_WORKLOADS}/{uid}/deploy")
             log.info(f"targon rental uid={uid}; waiting for ready (timeout {timeout}s)")
-            base_url, sidecar_url = await _wait_for_ready(uid, timeout=timeout)
+            art = _artifact_id(model, revision)
+            if source == "s3":
+                _, sidecar_url = await _wait_for_ready(uid, timeout=timeout, require_vllm=False)
+                log.info(f"targon rental uid={uid}; posting setup (restore)")
+                await _post_setup(sidecar_url, slot_token, self._s3_configs,
+                                  model=model, revision=revision, artifact_id=art,
+                                  manifest_key=backup_manifest_key)
+                base_url, sidecar_url = await _wait_for_ready(uid, timeout=timeout)
+            else:
+                base_url, sidecar_url = await _wait_for_ready(uid, timeout=timeout)
+                if self._s3_configs:
+                    log.info(f"targon rental uid={uid}; posting setup (backup-only)")
+                    await _post_setup(sidecar_url, slot_token, self._s3_configs,
+                                      model=model, revision=revision, artifact_id=art,
+                                      manifest_key=None)
             await _warm_hit(base_url, model)
         except BaseException:
             # Shield: if the outer task is being cancelled (SIGTERM during a
@@ -411,83 +458,6 @@ class TargonSlots:
             log.warning(f"targon delete failed for {uid}: {e}")
 
 
-def _s3_env_from_configs(configs: list["S3Config"]) -> dict[str, str]:
-    """Project S3Configs into the env vars the in-container restorer reads.
-    Mirrors the keys vllm_entrypoint.py + backup.S3Config.from_env_refs consume."""
-    env: dict[str, str] = {}
-    for c in configs:
-        if c.name == "hippius":
-            env.update({
-                "HIPPIUS_S3_ACCESS_KEY": c.access_key,
-                "HIPPIUS_S3_SECRET_KEY": c.secret_key,
-                "HIPPIUS_S3_BUCKET": c.bucket,
-                "HIPPIUS_S3_PREFIX": c.prefix,
-                "HIPPIUS_S3_ENDPOINT": c.endpoint_url,
-                "HIPPIUS_S3_REGION": c.region,
-            })
-        elif c.name == "r2":
-            env.update({
-                "R2_S3_ACCESS_KEY_ID": c.access_key,
-                "R2_S3_SECRET_ACCESS_KEY": c.secret_key,
-                "R2_S3_BUCKET": c.bucket,
-                "R2_S3_PREFIX": c.prefix,
-                "R2_S3_ENDPOINT_URL": c.endpoint_url,
-                "R2_S3_REGION": c.region,
-            })
-    if not env:
-        raise RuntimeError("no S3 configs available for backup restore")
-    return env
-
-
-def _provider_payload(c: "S3Config") -> dict:
-    return {
-        "endpoint_url": c.endpoint_url,
-        "region": c.region,
-        "bucket": c.bucket,
-        "access_key": c.access_key,
-        "secret_key": c.secret_key,
-    }
-
-
-async def setup_backup(
-    slot: Slot,
-    s3_configs: list["S3Config"],
-    *,
-    prefix: str,
-    model: str,
-    revision: str,
-    artifact_id: str,
-) -> bool:
-    """Hand S3 creds to the slot's sidecar, telling it to start uploading the
-    local artifact. Returns False (not raising) on transport errors so a sidecar
-    that comes up unhealthy doesn't abort the duel — the validator gets refs
-    later through poll_backup, or never (and the dethrone proceeds with an
-    empty backup_manifest, repaired by the next reconcile)."""
-    if not slot.sidecar_url or not slot.slot_token or not s3_configs:
-        return False
-    payload = {
-        "providers": {c.name: _provider_payload(c) for c in s3_configs},
-        "prefix": prefix,
-        "model": model,
-        "revision": revision,
-        "artifact_id": artifact_id,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
-                f"{slot.sidecar_url}/setup-backup",
-                json=payload,
-                headers={"Authorization": f"Bearer {slot.slot_token}"},
-            )
-        if r.status_code != 204:
-            log.warning(f"setup-backup {slot.sidecar_url}: {r.status_code} {r.text[:200]}")
-            return False
-        return True
-    except Exception as e:
-        log.warning(f"setup-backup {slot.sidecar_url} failed: {type(e).__name__}: {e}")
-        return False
-
-
 async def poll_backup(slot: Slot) -> dict | None:
     """Returns the sidecar's current state dict, or None on transport error."""
     if not slot.sidecar_url:
@@ -500,20 +470,3 @@ async def poll_backup(slot: Slot) -> dict | None:
         return r.json()
     except Exception:
         return None
-
-
-async def teardown_backup(slot: Slot) -> bool:
-    """Tell the sidecar to abort upload, scrub creds, delete partial prefixes.
-    Best-effort: failure here doesn't block teardown of the slot itself."""
-    if not slot.sidecar_url or not slot.slot_token:
-        return False
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
-                f"{slot.sidecar_url}/teardown-backup",
-                headers={"Authorization": f"Bearer {slot.slot_token}"},
-            )
-        return r.status_code == 204
-    except Exception as e:
-        log.warning(f"teardown-backup {slot.sidecar_url} failed: {type(e).__name__}: {e}")
-        return False

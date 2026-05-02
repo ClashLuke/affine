@@ -23,7 +23,12 @@ def main() -> int:
     champ = db.execute("SELECT * FROM champion WHERE id=1").fetchone()
     if champ:
         pay = f"uid{champ['uid']}" if champ["uid"] is not None else "unregistered/burn"
-        print(f"# champion {champ['model']}@{champ['revision']} {pay} backup={champ['backup_manifest']}")
+        backup = db.execute(
+            "SELECT manifest_key FROM backups WHERE artifact_id=? AND status='current'",
+            (champ["artifact_id"],),
+        ).fetchone()
+        manifest = backup["manifest_key"] if backup else ""
+        print(f"# champion {champ['model']}@{champ['revision']} {pay} backup={manifest}")
     duels = db.execute("SELECT * FROM duels ORDER BY id DESC LIMIT 20").fetchall()
     if not duels:
         print("no duels")

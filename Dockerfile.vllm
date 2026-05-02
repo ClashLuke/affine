@@ -1,0 +1,12 @@
+FROM vllm/vllm-openai:latest-cu130-ubuntu2404
+
+WORKDIR /app
+COPY affine/ affine/
+RUN python3 -m pip install --no-cache-dir \
+    "boto3>=1.34" \
+    "httpx>=0.27" \
+    "smart_open[s3]>=7.0" \
+    "scipy>=1.11"
+
+ENV PYTHONPATH=/app
+ENTRYPOINT ["python3", "-m", "affine.vllm_entrypoint"]

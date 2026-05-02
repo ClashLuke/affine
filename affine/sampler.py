@@ -224,8 +224,13 @@ async def run_one(
         await _drain(task, slot)
         log.warning(f"sample timed out after {timeout}s: {slot.model}")
         return False, dt, 0
+    # task.exception() / .result() raise CancelledError if the task was cancelled.
+    # Distinguish "task cancelled itself" (infra failure) from "outer scope
+    # cancelled us" (must propagate) using current_task().cancelling() — same
+    # pattern as _drain.
     try:
         exc = task.exception()
+        r = None if exc is not None else task.result()
     except asyncio.CancelledError:
         if (cur := asyncio.current_task()) is not None and cur.cancelling() > 0:
             raise
@@ -233,13 +238,6 @@ async def run_one(
         return None, dt, 0
     if exc is not None:
         log.warning(f"sample error ({slot.model}) after {dt:.2f}s: {type(exc).__name__}: {exc}")
-        return None, dt, 0
-    try:
-        r = task.result()
-    except asyncio.CancelledError:
-        if (cur := asyncio.current_task()) is not None and cur.cancelling() > 0:
-            raise
-        log.warning(f"infra failure ({slot.model}) in {dt:.2f}s — sample task cancelled itself")
         return None, dt, 0
     if not isinstance(r, dict):
         log.warning(f"infra failure ({slot.model}) in {dt:.2f}s — non-dict response: {str(r)[:200]}")

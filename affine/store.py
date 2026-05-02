@@ -29,8 +29,6 @@ class Champion:
     uid: int | None
     hotkey: str | None
     reign_start: int
-    backup_manifest: str
-    backup_prefix: str
     payable: bool
 
 
@@ -39,9 +37,7 @@ class BackupRecord:
     artifact_id: str
     model: str
     revision: str
-    prefix: str
     manifest_key: str
-    manifest_sha256: str
     status: str
 
 
@@ -114,8 +110,6 @@ class Store:
                 uid INTEGER,
                 hotkey TEXT,
                 reign_start INTEGER NOT NULL,
-                backup_manifest TEXT NOT NULL,
-                backup_prefix TEXT NOT NULL,
                 payable INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -123,9 +117,7 @@ class Store:
                 artifact_id TEXT NOT NULL,
                 model TEXT NOT NULL,
                 revision TEXT NOT NULL,
-                prefix TEXT NOT NULL,
                 manifest_key TEXT PRIMARY KEY,
-                manifest_sha256 TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 verified_at INTEGER
@@ -181,6 +173,13 @@ class Store:
             );
             """
         )
+        for table, col in (("champion", "backup_manifest"), ("champion", "backup_prefix"),
+                           ("backups", "prefix"), ("backups", "manifest_sha256")):
+            cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})").fetchall()}
+            if col in cols:
+                self.db.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+        self.db.execute("DELETE FROM backups WHERE status='staging'")
+        self.db.commit()
 
     def champion(self) -> Champion | None:
         row = self.db.execute("SELECT * FROM champion WHERE id = 1").fetchone()
@@ -192,21 +191,28 @@ class Store:
             if backup is not None:
                 db.execute(
                     """
-                    INSERT INTO backups(artifact_id, model, revision, prefix, manifest_key,
-                                        manifest_sha256, status, created_at, verified_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'current', ?, ?)
+                    INSERT INTO backups(artifact_id, model, revision, manifest_key,
+                                        status, created_at, verified_at)
+                    VALUES (?, ?, ?, ?, 'current', ?, ?)
                     ON CONFLICT(manifest_key) DO UPDATE SET status='current', verified_at=excluded.verified_at
                     """,
-                    (backup.artifact_id, backup.model, backup.revision, backup.prefix,
-                     backup.manifest_key, backup.manifest_sha256, ts, ts),
+                    (backup.artifact_id, backup.model, backup.revision,
+                     backup.manifest_key, ts, ts),
                 )
-                db.execute("UPDATE backups SET status='retiring' WHERE status='current' AND manifest_key <> ?",
-                           (backup.manifest_key,))
+            db.execute(
+                "UPDATE backups SET status='retiring' WHERE status='current' AND artifact_id <> ?",
+                (champ.artifact_id,),
+            )
+            db.execute(
+                "UPDATE publications SET status='superseded', updated_at=? "
+                "WHERE artifact_id<>? AND status IN ('confirmed','dry_run')",
+                (ts, champ.artifact_id),
+            )
             db.execute(
                 """
                 INSERT INTO champion(id, artifact_id, model, revision, uid, hotkey,
-                                     reign_start, backup_manifest, backup_prefix, payable, updated_at)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                     reign_start, payable, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     artifact_id=excluded.artifact_id,
                     model=excluded.model,
@@ -214,73 +220,37 @@ class Store:
                     uid=excluded.uid,
                     hotkey=excluded.hotkey,
                     reign_start=excluded.reign_start,
-                    backup_manifest=excluded.backup_manifest,
-                    backup_prefix=excluded.backup_prefix,
                     payable=excluded.payable,
                     updated_at=excluded.updated_at
                 """,
                 (champ.artifact_id, champ.model, champ.revision, champ.uid, champ.hotkey,
-                 champ.reign_start, champ.backup_manifest, champ.backup_prefix,
-                 int(champ.payable), ts),
+                 champ.reign_start, int(champ.payable), ts),
             )
 
-    def update_backup_manifest(
-        self,
-        artifact_id: str,
-        manifest_key: str,
-        prefix: str,
-        manifest_sha256: str,
-        model: str,
-        revision: str,
-    ) -> bool:
-        """Persist a backup manifest produced by the slot's sidecar onto the
-        matching champion. Idempotent: refs may flip from one-provider to
-        two-provider as the second upload completes; the new ref string just
-        replaces the old. Old `current` rows for other artifacts are retired."""
+    def update_backup_manifest(self, artifact_id: str, manifest_key: str,
+                               model: str, revision: str) -> None:
         ts = now()
         with self.tx() as db:
-            row = db.execute("SELECT artifact_id FROM champion WHERE id=1").fetchone()
-            if row is None or row["artifact_id"] != artifact_id:
-                return False
             db.execute(
                 """
-                INSERT INTO backups(artifact_id, model, revision, prefix, manifest_key,
-                                    manifest_sha256, status, created_at, verified_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'current', ?, ?)
+                INSERT INTO backups(artifact_id, model, revision, manifest_key,
+                                    status, created_at, verified_at)
+                VALUES (?, ?, ?, ?, 'current', ?, ?)
                 ON CONFLICT(manifest_key) DO UPDATE SET
                     status='current',
-                    verified_at=excluded.verified_at,
-                    prefix=excluded.prefix,
-                    manifest_sha256=excluded.manifest_sha256
-                """,
-                (artifact_id, model, revision, prefix, manifest_key, manifest_sha256, ts, ts),
-            )
-            db.execute("UPDATE backups SET status='retiring' WHERE status='current' AND manifest_key <> ?",
-                       (manifest_key,))
-            db.execute(
-                """
-                UPDATE champion
-                SET backup_manifest=?, backup_prefix=?, updated_at=?
-                WHERE id=1 AND artifact_id=?
-                """,
-                (manifest_key, prefix, ts, artifact_id),
-            )
-        return True
-
-    def record_backup(self, backup: BackupRecord, status: str) -> None:
-        ts = now()
-        with self.tx() as db:
-            db.execute(
-                """
-                INSERT INTO backups(artifact_id, model, revision, prefix, manifest_key,
-                                    manifest_sha256, status, created_at, verified_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(manifest_key) DO UPDATE SET
-                    status=excluded.status,
                     verified_at=excluded.verified_at
                 """,
-                (backup.artifact_id, backup.model, backup.revision, backup.prefix,
-                 backup.manifest_key, backup.manifest_sha256, status, ts, ts),
+                (artifact_id, model, revision, manifest_key, ts, ts),
+            )
+            # refs only append per artifact, so new key covers old prefixes; no S3 GC needed.
+            db.execute(
+                "DELETE FROM backups WHERE artifact_id=? AND manifest_key<>?",
+                (artifact_id, manifest_key),
+            )
+            db.execute(
+                "UPDATE backups SET status='retiring' "
+                "WHERE status='current' AND artifact_id<>?",
+                (artifact_id,),
             )
 
     def demote_champion(self, artifact: str) -> bool:
@@ -295,12 +265,22 @@ class Store:
             )
             return cur.rowcount > 0
 
+    def latest_backup_for(self, artifact_id: str) -> BackupRecord | None:
+        row = self.db.execute(
+            """
+            SELECT * FROM backups
+            WHERE artifact_id = ?
+            ORDER BY
+                CASE status WHEN 'current' THEN 0 WHEN 'retiring' THEN 1 ELSE 2 END,
+                COALESCE(verified_at, created_at) DESC
+            LIMIT 1
+            """,
+            (artifact_id,),
+        ).fetchone()
+        return _backup(row) if row else None
+
     def retiring_backups(self) -> list[BackupRecord]:
         rows = self.db.execute("SELECT * FROM backups WHERE status = 'retiring'").fetchall()
-        return [_backup(r) for r in rows]
-
-    def staging_backups(self) -> list[BackupRecord]:
-        rows = self.db.execute("SELECT * FROM backups WHERE status = 'staging'").fetchall()
         return [_backup(r) for r in rows]
 
     def mark_backup_deleted(self, manifest_key: str) -> None:
@@ -449,8 +429,6 @@ def _champion(row: sqlite3.Row) -> Champion:
         uid=row["uid"],
         hotkey=row["hotkey"],
         reign_start=int(row["reign_start"]),
-        backup_manifest=row["backup_manifest"],
-        backup_prefix=row["backup_prefix"],
         payable=bool(row["payable"]),
     )
 
@@ -460,8 +438,6 @@ def _backup(row: sqlite3.Row) -> BackupRecord:
         artifact_id=row["artifact_id"],
         model=row["model"],
         revision=row["revision"],
-        prefix=row["prefix"],
         manifest_key=row["manifest_key"],
-        manifest_sha256=row["manifest_sha256"],
         status=row["status"],
     )

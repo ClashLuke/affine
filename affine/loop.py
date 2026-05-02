@@ -28,11 +28,11 @@ from huggingface_hub import HfApi
 from huggingface_hub.errors import RepositoryNotFoundError, RevisionNotFoundError
 
 from .backup import (
-    BackupManager,
     ManifestRef,
     S3Config,
+    decode_refs,
+    delete_refs,
     encode_refs,
-    refs_digest,
 )
 from .chain import Miner, Subtensor, _tiebreak, _truthy_env, clear_weights, get_miners, set_weights
 from .config import BASELINE_MODELS, Config
@@ -45,8 +45,6 @@ from .vllm import (
     SlotProvisionFailed,
     TargonSlots,
     poll_backup,
-    setup_backup,
-    teardown_backup,
 )
 
 log = logging.getLogger(__name__)
@@ -222,14 +220,15 @@ class _DuelRun:
     counts: PairCounts
 
 
-def _make_backup_manager(cfg: Config, chain: Chain, slots) -> tuple[BackupManager | None, list[S3Config]]:
+def _backup_configs(cfg: Config, chain: Chain, slots) -> list[S3Config]:
     if slots is not None or _truthy_env("AFFINE_LOCAL"):
-        return None, []
-    if ((os.getenv("HIPPIUS_S3_ACCESS_KEY") and os.getenv("HIPPIUS_S3_SECRET_KEY"))
-            or (os.getenv("R2_S3_ACCESS_KEY_ID") and os.getenv("R2_S3_SECRET_ACCESS_KEY"))):
-        providers = S3Config.from_envs(hotkey=chain.hotkey, netuid=cfg.netuid)
-        return BackupManager(providers), providers
-    raise RuntimeError("Hippius S3 credentials are required for production runs")
+        return []
+    hot_hash = hashlib.sha256(chain.hotkey.encode()).hexdigest()[:16]
+    namespace = os.getenv("AFFINE_NAMESPACE", "prod").strip().strip("/") or "prod"
+    configs = S3Config.from_env(default_prefix=f"{cfg.netuid}/{namespace}/{hot_hash}")
+    if not configs:
+        raise RuntimeError("Hippius or R2 S3 credentials are required for production runs")
+    return list(configs.values())
 
 
 def _champion_miner(champ: Champion) -> Miner:
@@ -314,13 +313,6 @@ def _is_current_champion_registration(m: Miner, champ: Champion, artifact_alive:
     return (m.model, m.revision) == (champ.model, champ.revision)
 
 
-def _derive_prefix(s3_configs: list[S3Config], art: str) -> str:
-    """Per-artifact prefix root. The slot adds `{provider_name}-{ts}` inside,
-    so concurrent attempts on the same artifact don't collide."""
-    cfg = s3_configs[0]
-    return f"{cfg.prefix}/artifacts/{art}"
-
-
 async def _bootstrap_champion(
     store: Store,
     s3_configs: list[S3Config],
@@ -331,7 +323,7 @@ async def _bootstrap_champion(
 ) -> tuple[Champion, Slot]:
     """Bootstrap a fresh champion. The slot's sidecar takes over backup
     durability; this function only commits the in-DB champion and provisions
-    the king slot. The first reconcile pass calls setup_backup."""
+    the king slot. provision() POSTs /setup to kick off the upload."""
     baseline_model = os.getenv("AFFINE_BASELINE_MODEL", BASELINE_MODELS[0]).strip() or BASELINE_MODELS[0]
     baseline_revision = os.getenv("AFFINE_BASELINE_REVISION", "").strip()
     miners = await chain.list_miners()
@@ -356,8 +348,6 @@ async def _bootstrap_champion(
         uid=registered.uid if registered else None,
         hotkey=registered.hotkey if registered else None,
         reign_start=block,
-        backup_manifest="",
-        backup_prefix="",
         payable=registered is not None,
     )
     slot, status = await _provision(slots, _champion_miner(champ), stop, source="hf")
@@ -374,16 +364,26 @@ async def _ensure_king_slot(
     champ: Champion,
     slots,
     stop: asyncio.Event,
+    store: Store | None = None,
 ) -> Slot | None:
     if state.king_slot is not None:
         return state.king_slot
     miner = _champion_miner(champ)
     slot, status = await _provision(slots, miner, stop, source="hf")
-    if slot is None and champ.backup_manifest:
-        log.warning(f"champion HF reprovision failed ({status}); using backup")
-        slot, status = await _provision(
-            slots, miner, stop, source="s3", backup_manifest_key=champ.backup_manifest,
-        )
+    if slot is None:
+        recovered = store.latest_backup_for(champ.artifact_id) if store is not None else None
+        if recovered is not None:
+            log.warning(f"champion HF reprovision failed ({status}); using backup")
+            slot, status = await _provision(
+                slots, miner, stop, source="s3", backup_manifest_key=recovered.manifest_key,
+            )
+            if slot is not None and store is not None:
+                store.update_backup_manifest(
+                    artifact_id=champ.artifact_id,
+                    manifest_key=recovered.manifest_key,
+                    model=recovered.model,
+                    revision=recovered.revision,
+                )
     if slot is None:
         log.error(f"champion reprovision failed: {status}")
         return None
@@ -435,21 +435,20 @@ async def _reconcile_backup_manifest(
     slot: Slot,
     s3_configs: list[S3Config],
 ) -> None:
-    """If the champion has no manifest yet, drive the slot's sidecar to produce
-    one. Idempotent: if upload is already in flight this is a poll; if not yet
-    started this initiates it; if done this records refs onto the champion."""
-    if champ.backup_manifest or not slot.sidecar_url or not s3_configs:
+    if not slot.sidecar_url or not s3_configs:
         return
     state = await poll_backup(slot)
-    if state is None:
+    if state is None or state.get("state") != "done":
         return
-    if state.get("state") == "idle":
-        prefix = _derive_prefix(s3_configs, champ.artifact_id)
-        await setup_backup(slot, s3_configs, prefix=prefix, model=champ.model,
-                           revision=champ.revision, artifact_id=champ.artifact_id)
+    if state.get("artifact_id") != champ.artifact_id:
+        log.warning(f"sidecar artifact mismatch: slot={state.get('artifact_id')} "
+                    f"champ={champ.artifact_id}; skipping reconcile")
         return
-    if state.get("state") == "done" and state.get("refs"):
-        _persist_refs(store, champ, state["refs"])
+    new_refs = state.get("refs") or []
+    cur = store.latest_backup_for(champ.artifact_id)
+    cur_refs = decode_refs(cur.manifest_key) if cur else []
+    if len(new_refs) > len(cur_refs):
+        _persist_refs(store, champ, new_refs)
 
 
 def _persist_refs(store: Store, champ: Champion, refs: list[dict]) -> None:
@@ -460,12 +459,9 @@ def _persist_refs(store: Store, champ: Champion, refs: list[dict]) -> None:
         prefix=str(r["prefix"]),
         sha256=str(r.get("sha256", "")),
     ) for r in refs]
-    encoded = encode_refs(objs)
     store.update_backup_manifest(
         artifact_id=champ.artifact_id,
-        manifest_key=encoded,
-        prefix=encoded,
-        manifest_sha256=refs_digest(objs),
+        manifest_key=encode_refs(objs),
         model=champ.model,
         revision=champ.revision,
     )
@@ -612,12 +608,14 @@ async def _run_fixed_duel(
             king_dead = 0 if sample.champion_delivered else king_dead + 1
             chal_dead = 0 if sample.challenger_delivered else chal_dead + 1
         store.add_samples(samples)
-        if (king_dead >= SLOT_DEAD and chal_dead >= SLOT_DEAD) or pair_dead >= SLOT_DEAD:
+        if king_dead >= SLOT_DEAD and chal_dead >= SLOT_DEAD:
             return await _abort_duel("delivery-stalled", "delivery_stalled")
         if king_dead >= SLOT_DEAD:
             return await _abort_duel("champion-slot-dead", "champion_slot_dead")
         if chal_dead >= SLOT_DEAD:
             return await _abort_duel("challenger-slot-dead", "challenger_slot_dead")
+        if pair_dead >= SLOT_DEAD:
+            return await _abort_duel("delivery-stalled", "delivery_stalled")
         remaining = target_total - counts.total
         best_possible = PairCounts(
             counts.challenger_only + remaining,
@@ -637,27 +635,20 @@ async def _run_fixed_duel(
     return _DuelRun(decision, status, counts)
 
 
-async def _gc_retiring(store: Store, backup: BackupManager | None) -> None:
-    if backup is None:
+async def _gc_retiring(store: Store, s3_configs: list[S3Config]) -> None:
+    if not s3_configs:
         return
+    by_name = {c.name: c for c in s3_configs}
     for old in store.retiring_backups():
-        if await asyncio.to_thread(backup.delete_prefix, old.prefix):
+        if await asyncio.to_thread(delete_refs, old.manifest_key, by_name):
             store.mark_backup_deleted(old.manifest_key)
 
 
-async def _gc_staging(store: Store, backup: BackupManager | None) -> None:
-    if backup is None:
-        return
-    for old in store.staging_backups():
-        if await asyncio.to_thread(backup.delete_prefix, old.prefix):
-            store.mark_backup_deleted(old.manifest_key)
-
-
-async def _retirement_task(store: Store, backup: BackupManager | None, stop: asyncio.Event) -> None:
+async def _retirement_task(store: Store, s3_configs: list[S3Config], stop: asyncio.Event) -> None:
     """Background sweep: delete retiring prefixes off the dethrone critical path."""
     while not stop.is_set():
         try:
-            await _gc_retiring(store, backup)
+            await _gc_retiring(store, s3_configs)
         except Exception as e:
             log.warning(f"retirement sweep error: {e}")
         try:
@@ -668,7 +659,7 @@ async def _retirement_task(store: Store, backup: BackupManager | None, stop: asy
 
 async def run(cfg: Config, chain: Chain, slots=None):
     owned_slots = slots is None
-    backup, s3_configs = _make_backup_manager(cfg, chain, slots)
+    s3_configs = _backup_configs(cfg, chain, slots)
     if owned_slots:
         slots = TargonSlots(cfg, hotkey=chain.hotkey, s3_configs=s3_configs)
     if hasattr(slots, "reconcile"):
@@ -676,12 +667,11 @@ async def run(cfg: Config, chain: Chain, slots=None):
     envs = await _load_envs(cfg)
     store = Store(cfg.db_path)
     store.abort_running_duels()
-    await _gc_staging(store, backup)
     state = _RunState()
     king_provision_fails = 0
     stop = asyncio.Event()
     _install_signal_handlers(stop)
-    retirement = asyncio.create_task(_retirement_task(store, backup, stop))
+    retirement = asyncio.create_task(_retirement_task(store, s3_configs, stop))
     try:
         champ = store.champion()
         if champ is None:
@@ -708,7 +698,7 @@ async def run(cfg: Config, chain: Chain, slots=None):
             if not champ.payable:
                 champion_artifact_alive = False
 
-            king_slot = await _ensure_king_slot(state, champ, slots, stop)
+            king_slot = await _ensure_king_slot(state, champ, slots, stop, store)
             if king_slot is None:
                 king_provision_fails += 1
                 if king_provision_fails >= KING_REPROVISION_LIMIT:
@@ -748,18 +738,6 @@ async def run(cfg: Config, chain: Chain, slots=None):
                     log.warning(f"challenger provision failed uid{registered.uid}: {status}")
                     continue
 
-                # Kick off slot-side upload immediately. Refs come back via
-                # poll_backup; if the duel ends in dethrone we read the latest
-                # snapshot then. If hold, teardown_backup aborts.
-                if s3_configs:
-                    chal_art = artifact_id(challenger.model, challenger.revision)
-                    await setup_backup(
-                        chal_slot, s3_configs,
-                        prefix=_derive_prefix(s3_configs, chal_art),
-                        model=challenger.model, revision=challenger.revision,
-                        artifact_id=chal_art,
-                    )
-
                 block = await chain.current_block()
                 alpha = alpha_for_reign(block - champ.reign_start,
                                         cfg.alpha_start, cfg.alpha_final, cfg.alpha_halflife)
@@ -782,16 +760,13 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 if result.status == "champion_slot_dead":
                     await _safe_teardown(slots, king_slot, "champion-slot-dead")
                     state.king_slot = None
-                    await teardown_backup(chal_slot)
                     continue
                 if result.status == "delivery_stalled":
                     state.attempted.add((registered.model, registered.revision))
-                    await teardown_backup(chal_slot)
                     log.warning("delivery_stalled; keeping champion slot, skipping challenger this pass")
                     continue
                 if result.status != "dethrone" or result.decision is None or not result.decision.dethrone:
                     state.attempted.add((registered.model, registered.revision))
-                    await teardown_backup(chal_slot)
                     log.info(f"verdict: champion holds ({result.status}) counts={result.counts}")
                     continue
 
@@ -799,23 +774,12 @@ async def run(cfg: Config, chain: Chain, slots=None):
                 if not await _registered_artifact_alive(s3_configs, fresh, registered, challenger.revision):
                     log.warning(f"verdict skipped: challenger uid{registered.uid}@{registered.revision} identity changed")
                     state.attempted.add((registered.model, registered.revision))
-                    await teardown_backup(chal_slot)
                     continue
 
-                # Atomic promotion: db first, then king pointer, then chain.
+                # Pointer first so a mid-block raise leaves reconcile pointing at the new slot.
                 snapshot = await poll_backup(chal_slot) if s3_configs else None
                 refs = (snapshot or {}).get("refs") or []
                 new_art = artifact_id(challenger.model, challenger.revision)
-                manifest_str = ""
-                manifest_prefix = ""
-                if refs:
-                    objs = [ManifestRef(
-                        provider=str(r["provider"]), bucket=str(r["bucket"]),
-                        key=str(r["key"]), prefix=str(r["prefix"]),
-                        sha256=str(r.get("sha256", "")),
-                    ) for r in refs]
-                    manifest_str = encode_refs(objs)
-                    manifest_prefix = manifest_str
                 new_champ = Champion(
                     artifact_id=new_art,
                     model=challenger.model,
@@ -823,19 +787,16 @@ async def run(cfg: Config, chain: Chain, slots=None):
                     uid=registered.uid,
                     hotkey=registered.hotkey,
                     reign_start=await chain.current_block(),
-                    backup_manifest=manifest_str,
-                    backup_prefix=manifest_prefix,
                     payable=True,
                 )
-                store.set_champion(new_champ)
-                if refs:
-                    _persist_refs(store, new_champ, refs)
-
                 old_slot = state.king_slot
                 state.king_slot = chal_slot
                 chal_slot = None
                 promoted = True
                 state.attempted.clear()
+                store.set_champion(new_champ)
+                if refs:
+                    _persist_refs(store, new_champ, refs)
                 await _publish_champion(store, chain, cfg, new_champ)
                 if old_slot is not None:
                     await _safe_teardown(slots, old_slot, "old-champion-promoted")

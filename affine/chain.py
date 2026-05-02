@@ -280,50 +280,39 @@ async def clear_weights(sub: Subtensor, wallet, netuid: int, retries: int = 3) -
     return False
 
 
-async def _confirm_on_chain(sub: Subtensor, netuid: int, my_hotkey: str,
-                             winner_uid: int, settle_s: float = 12.0) -> bool:
-    """Best-effort: did our last set_weights actually land? Re-read metagraph and
-    inspect our own weight row. Returns True iff the row exclusively concentrates
-    on `winner_uid`. Sleep one block first so a just-broadcast extrinsic has time
-    to be included before we read.
-    """
+async def _read_my_weights(sub: Subtensor, netuid: int, my_hotkey: str,
+                           settle_s: float) -> list[float] | None:
+    """Sleep one block, then return our weight row. None on any failure or if
+    we have no row (caller treats as 'cannot confirm')."""
     try:
         await asyncio.sleep(settle_s)
         meta = await sub.metagraph(netuid)
         my_uid = next((i for i, h in enumerate(meta.hotkeys) if h == my_hotkey), None)
-        if my_uid is None:
-            return False
         W = getattr(meta, "W", None)
-        if W is None or my_uid >= len(W):
-            return False
+        if my_uid is None or W is None or my_uid >= len(W):
+            return None
         row = W[my_uid]
         if hasattr(row, "tolist"):
             row = row.tolist()
-        if not row or winner_uid >= len(row):
-            return False
-        # Winner-takes-all: row[winner_uid] dominates. Threshold 0.99 since on-chain
-        # encoding is u16-quantized so 1.0 round-trips to ~0.999985.
-        return float(row[winner_uid]) >= 0.99
+        return [float(w) for w in row] if row else []
     except Exception as e:
-        log.warning(f"on-chain weight verification failed: {e}")
+        log.warning(f"on-chain weight read failed: {e}")
+        return None
+
+
+async def _confirm_on_chain(sub: Subtensor, netuid: int, my_hotkey: str,
+                             winner_uid: int, settle_s: float = 12.0) -> bool:
+    """Best-effort: did our last set_weights actually land? Threshold 0.99 since
+    on-chain encoding is u16-quantized so 1.0 round-trips to ~0.999985."""
+    row = await _read_my_weights(sub, netuid, my_hotkey, settle_s)
+    if row is None or winner_uid >= len(row):
         return False
+    return row[winner_uid] >= 0.99
 
 
 async def _confirm_no_weights(sub: Subtensor, netuid: int, my_hotkey: str,
                               settle_s: float = 12.0) -> bool:
-    try:
-        await asyncio.sleep(settle_s)
-        meta = await sub.metagraph(netuid)
-        my_uid = next((i for i, h in enumerate(meta.hotkeys) if h == my_hotkey), None)
-        if my_uid is None:
-            return False
-        W = getattr(meta, "W", None)
-        if W is None or my_uid >= len(W):
-            return False
-        row = W[my_uid]
-        if hasattr(row, "tolist"):
-            row = row.tolist()
-        return not row or max(float(w) for w in row) <= 1e-6
-    except Exception as e:
-        log.warning(f"on-chain clear-weight verification failed: {e}")
+    row = await _read_my_weights(sub, netuid, my_hotkey, settle_s)
+    if row is None:
         return False
+    return not row or max(row) <= 1e-6

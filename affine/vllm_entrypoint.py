@@ -1,17 +1,5 @@
-"""Slot lifecycle: restore artifact, start sidecar HTTP control plane, run vLLM.
-
-The validator no longer ships bytes through itself. The slot pulls the artifact
-(HF or restore-from-S3), then the sidecar accepts S3 credentials over a bearer-
-authenticated POST and uploads the local artifact dir back to the configured
-providers in parallel.
-
-Two security pins, asserted before vLLM starts:
-  --trust-remote-code=False       blocks miner-controlled Python execution
-  --load-format=safetensors       blocks pickle-format weight loading
-
-The sidecar runs in a thread alongside vLLM (a subprocess). Signals are
-forwarded to vLLM; the entrypoint exits with vLLM's status.
-"""
+"""Slot lifecycle: restore artifact (HF or S3), run a sidecar that accepts
+upload creds over bearer auth, exec vLLM with safetensors + no-remote-code."""
 
 from __future__ import annotations
 
@@ -27,8 +15,10 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from huggingface_hub import snapshot_download
+
 from . import slot_backup
-from .backup import restore_from_env
+from .backup import S3Config, restore_refs
 
 log = logging.getLogger(__name__)
 
@@ -38,19 +28,11 @@ DEFAULT_SIDECAR_PORT = 8001
 
 _token: str | None = None
 _model_dir: Path | None = None
-
-
-def _assert_flags(argv: list[str]) -> None:
-    for flag in REQUIRED_FLAGS:
-        if flag not in argv:
-            raise SystemExit(f"vllm_entrypoint: missing required flag {flag!r}; refusing to start")
-
-
-def _scrub_token() -> str:
-    token = os.environ.pop("AFFINE_SLOT_TOKEN", "").strip()
-    if not token:
-        raise SystemExit("vllm_entrypoint: AFFINE_SLOT_TOKEN missing or empty")
-    return token
+_setup_lock = threading.Lock()
+_setup_event = threading.Event()
+_setup_payload: dict | None = None
+_restore_done = threading.Event()
+_restore_error: str | None = None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -70,9 +52,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _auth_ok(self) -> bool:
-        h = self.headers.get("Authorization", "")
-        prefix = "Bearer "
-        return _token is not None and h.startswith(prefix) and h[len(prefix):] == _token
+        return _token is not None and self.headers.get("Authorization") == f"Bearer {_token}"
 
     def _read_json(self) -> dict:
         n = int(self.headers.get("Content-Length", 0) or 0)
@@ -88,52 +68,44 @@ class _Handler(BaseHTTPRequestHandler):
         return self._empty(404)
 
     def do_POST(self):
+        global _setup_payload
         path = self.path.rstrip("/")
-        if path == "/setup-backup":
-            if not self._auth_ok():
-                return self._empty(401)
-            try:
-                payload = self._read_json()
-                providers = [
-                    slot_backup.ProviderCreds(
-                        name=name,
-                        endpoint_url=p["endpoint_url"],
-                        region=p.get("region", "auto"),
-                        bucket=p["bucket"],
-                        access_key=p["access_key"],
-                        secret_key=p["secret_key"],
-                    )
-                    for name, p in payload["providers"].items()
-                ]
-                slot_backup.start(
-                    _model_dir,
-                    providers,
-                    prefix=payload["prefix"],
-                    model=payload["model"],
-                    revision=payload["revision"],
-                    artifact_id=payload["artifact_id"],
-                )
-            except Exception as e:
-                log.warning(f"setup-backup failed: {e}")
-                return self._json(400, {"error": str(e)})
-            return self._empty(204)
-        if path == "/teardown-backup":
-            if not self._auth_ok():
-                return self._empty(401)
-            try:
-                slot_backup.abort()
-            except Exception as e:
-                log.warning(f"teardown-backup failed: {e}")
-                return self._json(500, {"error": str(e)})
-            return self._empty(204)
-        return self._empty(404)
-
-
-def _start_sidecar(port: int) -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
-    threading.Thread(target=server.serve_forever, daemon=True, name="sidecar").start()
-    log.info(f"sidecar listening on :{port}")
-    return server
+        if path != "/setup":
+            return self._empty(404)
+        if not self._auth_ok():
+            return self._empty(401)
+        try:
+            payload = self._read_json()
+            if not isinstance(payload.get("providers"), dict):
+                return self._json(400, {"error": "providers required"})
+            for field in ("prefix", "model", "revision", "artifact_id"):
+                if field not in payload:
+                    return self._json(400, {"error": f"{field} required"})
+            with _setup_lock:
+                if _setup_event.is_set() and _setup_payload is not None:
+                    if payload["artifact_id"] == _setup_payload.get("artifact_id"):
+                        return self._empty(204)
+                    return self._json(409, {"error": "setup already received for different artifact"})
+                _setup_payload = payload
+                _setup_event.set()
+            if payload.get("manifest_key"):
+                if not _restore_done.wait(timeout=3600):
+                    return self._json(504, {"error": "restore did not complete"})
+                if _restore_error:
+                    return self._json(500, {"error": _restore_error})
+            slot_backup.start(
+                _model_dir,
+                [slot_backup.ProviderCreds(
+                    name=name, endpoint_url=p["endpoint_url"], region=p.get("region", "auto"),
+                    bucket=p["bucket"], access_key=p["access_key"], secret_key=p["secret_key"],
+                ) for name, p in payload["providers"].items()],
+                prefix=payload["prefix"], model=payload["model"],
+                revision=payload["revision"], artifact_id=payload["artifact_id"],
+            )
+        except Exception as e:
+            log.warning(f"setup failed: {e}")
+            return self._json(400, {"error": str(e)})
+        return self._empty(204)
 
 
 def main() -> int:
@@ -151,41 +123,77 @@ def main() -> int:
     ap.add_argument("vllm_args", nargs=argparse.REMAINDER)
     args = ap.parse_args()
 
-    global _token, _model_dir
-    _token = _scrub_token()
+    global _token, _model_dir, _restore_error
+    _token = os.environ.pop("AFFINE_SLOT_TOKEN", "").strip()
+    if not _token:
+        raise SystemExit("vllm_entrypoint: AFFINE_SLOT_TOKEN missing or empty")
 
-    model_path = args.model
+    server = ThreadingHTTPServer(("0.0.0.0", args.sidecar_port), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True, name="sidecar").start()
+    log.info(f"sidecar listening on :{args.sidecar_port}")
+
+    dest = Path(os.getenv("AFFINE_MODEL_DIR", "/models")) / args.served_model_name.replace("/", "__")
     if args.source == "s3":
         if not args.manifest_key:
             raise SystemExit("--manifest-key is required for --source=s3")
-        dest = Path(os.getenv("AFFINE_MODEL_DIR", "/models")) / args.served_model_name.replace("/", "__")
-        tmp = Path(f"{dest}.tmp")
-        if tmp.exists():
-            shutil.rmtree(tmp)
-        restore_from_env(args.manifest_key, tmp)
-        if dest.exists():
-            shutil.rmtree(dest)
-        tmp.rename(dest)
-        model_path = str(dest)
-    _model_dir = Path(model_path)
+        log.info("waiting for /setup credentials")
+        if not _setup_event.wait(timeout=int(os.getenv("AFFINE_RESTORE_TIMEOUT", "3600"))):
+            raise SystemExit("vllm_entrypoint: /setup not received within timeout")
+        with _setup_lock:
+            payload = _setup_payload
+        try:
+            configs = {
+                name: S3Config(
+                    name=name,
+                    endpoint_url=p["endpoint_url"],
+                    region=p.get("region", "auto"),
+                    bucket=p["bucket"],
+                    prefix=p.get("prefix", ""),
+                    access_key=p["access_key"],
+                    secret_key=p["secret_key"],
+                )
+                for name, p in payload["providers"].items()
+            }
+            tmp = Path(f"{dest}.tmp")
+            if tmp.exists():
+                shutil.rmtree(tmp)
+            restore_refs(args.manifest_key, configs, tmp)
+            if dest.exists():
+                shutil.rmtree(dest)
+            tmp.rename(dest)
+        except Exception as e:
+            _restore_error = str(e)
+            _restore_done.set()
+            raise
+        _model_dir = dest
+        _restore_done.set()
+    else:
+        log.info(f"snapshot_download: {args.model}@{args.revision} -> {dest}")
+        snapshot_download(
+            repo_id=args.model, revision=args.revision, local_dir=str(dest),
+            token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"),
+        )
+        _model_dir = dest
 
     extra = args.vllm_args[1:] if args.vllm_args[:1] == ["--"] else args.vllm_args
     argv = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", model_path,
+        "--model", str(dest),
         "--served-model-name", args.served_model_name,
     ]
-    if args.source == "hf":
-        argv.extend(["--revision", args.revision])
     argv.extend(extra)
-    _assert_flags(argv)
-
-    _start_sidecar(args.sidecar_port)
+    for flag in REQUIRED_FLAGS:
+        if flag not in argv:
+            raise SystemExit(f"vllm_entrypoint: missing required flag {flag!r}; refusing to start")
 
     proc = subprocess.Popen(argv)
 
     def forward(sig, _frame):
         log.info(f"forwarding {signal.Signals(sig).name} to vllm pid={proc.pid}")
+        try:
+            slot_backup.abort()
+        except Exception as e:
+            log.warning(f"slot_backup.abort failed: {e}")
         try:
             proc.send_signal(sig)
         except ProcessLookupError:
