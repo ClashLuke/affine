@@ -82,6 +82,7 @@ class LocalSlots:
 
 _WORKLOADS = "/tha/v2/workloads"
 _CRASH_EVENTS = {"POD_CRASHLOOP_BACKOFF", "POD_BACK_OFF", "POD_FAILED", "POD_OOM_KILLED"}
+_EVENTS_404_WARNED: set[str] = set()  # warn once per uid — _wait_for_ready hits this every 5s for up to 900s
 
 
 def _vllm_image() -> str:
@@ -119,7 +120,8 @@ async def _targon_crashed(uid: str) -> bool:
     try:
         ev = await _http()._async_get(f"{_WORKLOADS}/{uid}/events")
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
+        if e.response.status_code == 404 and uid not in _EVENTS_404_WARNED:
+            _EVENTS_404_WARNED.add(uid)
             log.warning(f"events endpoint 404 for uid={uid}; crashloop detection disabled")
         return False
     except Exception:
@@ -243,8 +245,17 @@ async def _wait_for_ready(uid: str, timeout: int, interval: float = 5.0,
 
 def _derive_prefix(s3_configs: list["S3Config"], art: str) -> str:
     """Per-artifact prefix root. The slot adds `{provider_name}-{ts}` inside,
-    so concurrent attempts on the same artifact don't collide."""
-    return f"{s3_configs[0].prefix}/artifacts/{art}"
+    so concurrent attempts on the same artifact don't collide.
+
+    Validator passes one prefix to the slot for every provider; if operators set
+    HIPPIUS_S3_PREFIX and R2_S3_PREFIX inconsistently, R2 uploads would land in
+    Hippius's path and the manifest would be unreachable. Default config gives
+    both providers the same prefix, so this only fires on a deliberate misconfig.
+    """
+    prefixes = {c.prefix for c in s3_configs}
+    if len(prefixes) != 1:
+        raise ValueError(f"backup providers must share a prefix, got {sorted(prefixes)}")
+    return f"{next(iter(prefixes))}/artifacts/{art}"
 
 
 async def _post_setup(sidecar_url: str, slot_token: str,

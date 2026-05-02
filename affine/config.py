@@ -69,6 +69,16 @@ def _reject_nonfinite(c: str):
     raise ValueError(f"AFFINE_CONFIG_SPEC: non-finite JSON constant {c!r} is not allowed")
 
 
+def _reject_inf(s: str) -> float:
+    # parse_constant only catches literal NaN/Infinity tokens. A numeric literal
+    # like 1e999 parses through float() and overflows to inf, slipping past
+    # parse_constant. Reject explicitly here.
+    f = float(s)
+    if not math.isfinite(f):
+        raise ValueError(f"AFFINE_CONFIG_SPEC: non-finite JSON number {s!r} is not allowed")
+    return f
+
+
 def _apply_config_spec(cfg: Config, spec: str) -> Config:
     if spec in _PROFILES:
         return _apply_json_overrides(cfg, _PROFILES[spec])
@@ -78,10 +88,9 @@ def _apply_config_spec(cfg: Config, spec: str) -> Config:
             f"AFFINE_CONFIG_SPEC={spec!r} is not a known profile "
             f"({', '.join(_PROFILES)}) and not a file path"
         )
-    # parse_constant rejects NaN/Infinity. Without this, a NaN timeout in the
-    # spec would silently flow into asyncio.wait, which returns immediately for
-    # NaN → every sample looks like a timeout → every miner appears to lose.
-    return _apply_json_overrides(cfg, json.loads(path.read_text(), parse_constant=_reject_nonfinite))
+    return _apply_json_overrides(cfg, json.loads(path.read_text(),
+                                                 parse_float=_reject_inf,
+                                                 parse_constant=_reject_nonfinite))
 
 
 # Named profiles. default = shipping config; full = mid-budget gate; smoke = fast CI gate.
@@ -212,11 +221,13 @@ def _validate(cfg: Config) -> None:
         # Per-env timeout drives asyncio.wait deadlines. NaN/Infinity make
         # asyncio.wait return immediately with empty done set → sample looks
         # timed out → False (miner-loss) for every sample. Negative is
-        # equivalent. Validate at config load to fail fast.
-        t = spec.params.get("timeout")
-        if t is not None and not (isinstance(t, (int, float))
-                                  and not isinstance(t, bool)
-                                  and math.isfinite(t) and t > 0):
+        # equivalent. Explicit-null in JSON would slip past `t is not None`
+        # and crash float(None) deeper; default-substitution form rejects null
+        # at the boundary instead.
+        t = spec.params.get("timeout", 600)
+        if not (isinstance(t, (int, float))
+                and not isinstance(t, bool)
+                and math.isfinite(t) and t > 0):
             raise ValueError(f"env '{spec.name}': params['timeout'] must be finite > 0, got {t!r}")
         _validate_env_params(spec.name, spec.entrypoint, spec.params)
 

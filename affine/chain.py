@@ -10,6 +10,12 @@ import bittensor as bt
 
 log = logging.getLogger(__name__)
 
+# Reads (metagraph, current_block, commitments) finish in milliseconds against a
+# healthy node; 60s is a generous cap for transient lag. Writes use the longer
+# budget because set_weights with wait_for_finalization legitimately takes 60-90s.
+RPC_TIMEOUT_READ = 60.0
+RPC_TIMEOUT_WRITE = 300.0
+
 
 # ---------------------------------------------------------------------------
 # Subtensor wrapper — auto-reconnect on any failure, primary + fallback
@@ -51,9 +57,12 @@ class Subtensor:
     async def _reconnect(self, stale):
         """Reconnect ONLY if the caller's failed instance is still active. Two coros
         on a transient blip would otherwise both reconnect, the second tearing down
-        the first's freshly-opened connection."""
+        the first's freshly-opened connection. Also reconnect when self._sub is
+        None: a previous _connect() that raised inside _reconnect leaves _sub=None,
+        and a subsequent caller holding a stale handle would otherwise return None
+        and crash the next getattr in the calling RPC."""
         async with self._lock:
-            if self._sub is stale:
+            if self._sub is stale or self._sub is None:
                 await self._close_sub()
                 self._sub = await self._connect()
             return self._sub
@@ -70,20 +79,28 @@ class Subtensor:
     async def _call_retry(self, name: str, *args, **kwargs):
         """Auto-reconnect on failure and retry once. Use for read-only RPCs only —
         a transport drop after a successful mutation broadcast would silently
-        double-submit on reconnect."""
+        double-submit on reconnect.
+
+        A WebSocket wedged after a TCP RST sits forever without an outer deadline;
+        wrap each attempt so we surface failure within minutes and let the
+        supervisor's restart story take over."""
         sub = await self._ensure()
         try:
-            return await getattr(sub, name)(*args, **kwargs)
+            return await asyncio.wait_for(getattr(sub, name)(*args, **kwargs),
+                                          timeout=RPC_TIMEOUT_READ)
         except Exception as e:
             log.warning(f"subtensor.{name} failed ({type(e).__name__}: {e}); reconnecting")
             sub = await self._reconnect(stale=sub)
-            return await getattr(sub, name)(*args, **kwargs)
+            return await asyncio.wait_for(getattr(sub, name)(*args, **kwargs),
+                                          timeout=RPC_TIMEOUT_READ)
 
     async def _call_no_retry(self, name: str, *args, **kwargs):
         """Raise on failure. Use for mutations: callers own their own retry loop
-        with idempotency (nonce / version_key)."""
+        with idempotency (nonce / version_key). The longer write budget covers
+        wait_for_finalization (60-90s legitimately)."""
         sub = await self._ensure()
-        return await getattr(sub, name)(*args, **kwargs)
+        return await asyncio.wait_for(getattr(sub, name)(*args, **kwargs),
+                                      timeout=RPC_TIMEOUT_WRITE)
 
     async def get_current_block(self):
         return await self._call_retry("get_current_block")
@@ -269,11 +286,8 @@ async def clear_weights(sub: Subtensor, wallet, netuid: int, retries: int = 3) -
             return False
         log.debug(f"clear_weights response: success={ok.success} message={ok.message}")
         if ok.success:
-            if await _confirm_no_weights(sub, netuid, wallet.hotkey.ss58_address):
-                log.info("weights cleared: no payable winner")
-                return True
-            log.warning("clear_weights accepted but on-chain row is not clear yet")
-            return False
+            log.info("weights cleared: no payable winner")
+            return True
         log.warning(f"clear_weights rejected (attempt {attempt + 1}/{retries}): {ok.message}")
         if attempt < retries - 1:
             await asyncio.sleep(60)

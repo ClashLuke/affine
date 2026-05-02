@@ -24,6 +24,9 @@ log = logging.getLogger(__name__)
 
 REQUIRED_FLAGS = ("--trust-remote-code=False", "--load-format=safetensors")
 DEFAULT_SIDECAR_PORT = 8001
+# Read once at module load — re-reading per request would let an env-var rotation
+# silently change the timeout in flight.
+_RESTORE_TIMEOUT_S = int(os.getenv("AFFINE_RESTORE_TIMEOUT", "3600"))
 
 
 _token: str | None = None
@@ -82,14 +85,17 @@ class _Handler(BaseHTTPRequestHandler):
                 if field not in payload:
                     return self._json(400, {"error": f"{field} required"})
             with _setup_lock:
-                if _setup_event.is_set() and _setup_payload is not None:
-                    if payload["artifact_id"] == _setup_payload.get("artifact_id"):
-                        return self._empty(204)
-                    return self._json(409, {"error": "setup already received for different artifact"})
+                # Guard against contradictory setups, but otherwise do not dedupe:
+                # slot_backup.start() and _restore_done.wait() are already idempotent,
+                # and the previous dedupe shortcut returned 204 without ever calling
+                # start() on the retry path — so a 504 retry never recovered.
+                if _setup_payload is not None and \
+                        payload["artifact_id"] != _setup_payload.get("artifact_id"):
+                    return self._json(409, {"error": "different artifact in flight"})
                 _setup_payload = payload
                 _setup_event.set()
             if payload.get("manifest_key"):
-                if not _restore_done.wait(timeout=3600):
+                if not _restore_done.wait(timeout=_RESTORE_TIMEOUT_S):
                     return self._json(504, {"error": "restore did not complete"})
                 if _restore_error:
                     return self._json(500, {"error": _restore_error})
@@ -137,7 +143,7 @@ def main() -> int:
         if not args.manifest_key:
             raise SystemExit("--manifest-key is required for --source=s3")
         log.info("waiting for /setup credentials")
-        if not _setup_event.wait(timeout=int(os.getenv("AFFINE_RESTORE_TIMEOUT", "3600"))):
+        if not _setup_event.wait(timeout=_RESTORE_TIMEOUT_S):
             raise SystemExit("vllm_entrypoint: /setup not received within timeout")
         with _setup_lock:
             payload = _setup_payload
@@ -174,6 +180,9 @@ def main() -> int:
             token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"),
         )
         _model_dir = dest
+        # No restore happened, but the wait flag must still be set so a /setup
+        # POST that arrives after HF download (rare) doesn't block forever.
+        _restore_done.set()
 
     extra = args.vllm_args[1:] if args.vllm_args[:1] == ["--"] else args.vllm_args
     argv = [
@@ -189,11 +198,10 @@ def main() -> int:
     proc = subprocess.Popen(argv)
 
     def forward(sig, _frame):
-        log.info(f"forwarding {signal.Signals(sig).name} to vllm pid={proc.pid}")
-        try:
-            slot_backup.abort()
-        except Exception as e:
-            log.warning(f"slot_backup.abort failed: {e}")
+        # One syscall, no Python locks. Python signal handlers run on the main
+        # thread, which may already hold the logging RLock or slot_backup._lock;
+        # touching either here would deadlock. Cleanup runs after proc.wait()
+        # returns, off the signal-handler stack.
         try:
             proc.send_signal(sig)
         except ProcessLookupError:
@@ -206,6 +214,10 @@ def main() -> int:
             pass
 
     rc = proc.wait()
+    try:
+        slot_backup.abort()
+    except Exception as e:
+        log.warning(f"slot_backup.abort failed: {e}")
     log.info(f"vllm exited rc={rc}")
     return rc
 

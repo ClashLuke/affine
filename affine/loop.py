@@ -14,7 +14,6 @@ recoverable by the next reconcile pass.
 from __future__ import annotations
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import secrets
@@ -23,14 +22,12 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 import bittensor as bt
-import httpx
 from huggingface_hub import HfApi
 from huggingface_hub.errors import RepositoryNotFoundError, RevisionNotFoundError
 
 from .backup import (
     ManifestRef,
     S3Config,
-    decode_refs,
     delete_refs,
     encode_refs,
 )
@@ -39,7 +36,7 @@ from .config import BASELINE_MODELS, Config
 from .envs import EnvFactory
 from .paired import PairCounts, PairDecision, alpha_for_reign, decide_paired, pair_p_value
 from .sampler import run_one
-from .store import Champion, PairSample, Store, artifact_id
+from .store import BackupRecord, Champion, PairSample, Store, artifact_id
 from .vllm import (
     Slot,
     SlotProvisionFailed,
@@ -146,28 +143,23 @@ def _install_signal_handlers(stop: asyncio.Event) -> None:
             signal.signal(sig, lambda *_args, request_stop=request_stop: request_stop())
 
 
-async def _provision(slots, miner: Miner, stop: asyncio.Event, **kwargs) -> tuple[Slot | None, str]:
-    """Returns (slot|None, status). `crashloop` is the only miner-fault signal."""
+async def _provision(slots, miner: Miner, stop: asyncio.Event, **kwargs) -> Slot | None:
+    """Provision a slot or return None. The status string used to be returned
+    too — every caller only used it for logging, so collapsing to Slot|None and
+    logging the cause inside removes branching that wasn't load-bearing."""
     try:
-        slot = await _cancellable(
+        return await _cancellable(
             slots.provision(miner.model, miner.revision, **kwargs), stop,
             on_orphan=lambda s: _safe_teardown(slots, s, "provision-orphan"),
         )
     except SlotProvisionFailed as e:
         log.warning(f"provision crashloop {miner.model}@{miner.revision}: {e}")
-        return None, "crashloop"
-    except TimeoutError as e:
-        log.warning(f"provision timeout uid {miner.uid} {miner.model}@{miner.revision}: {e}")
-        return None, "timeout"
     except asyncio.CancelledError:
         raise
-    except httpx.HTTPError as e:
-        log.warning(f"provision transient uid {miner.uid}: {type(e).__name__}: {e}")
-        return None, "transient"
     except Exception as e:
-        log.error(f"provision error uid {miner.uid}: {e}")
-        return None, "error"
-    return slot, "ok"
+        log.warning(f"provision failed uid{miner.uid} {miner.model}@{miner.revision}: "
+                    f"{type(e).__name__}: {e}")
+    return None
 
 
 def _seed(uid: int, rev: str, env: str, c: int, salt: str = "") -> int:
@@ -308,6 +300,13 @@ async def _champion_registration_status(
 
 
 def _is_current_champion_registration(m: Miner, champ: Champion, artifact_alive: bool = False) -> bool:
+    # Demoted champion: payable=0, uid=NULL after demote_champion. The (model,
+    # revision) arm below would otherwise blacklist every miner sharing the dead
+    # artifact and starve the queue, deadlocking recovery. Live-case second arm
+    # stays: a different miner re-registering the same (model, revision) as the
+    # live champion still gets filtered (identical-artifact duels add no evidence).
+    if not champ.payable:
+        return False
     if champ.uid is not None and m.uid == champ.uid and m.hotkey == champ.hotkey:
         return (m.model, m.revision) == (champ.model, champ.revision) or (artifact_alive and m.model == champ.model)
     return (m.model, m.revision) == (champ.model, champ.revision)
@@ -350,9 +349,9 @@ async def _bootstrap_champion(
         reign_start=block,
         payable=registered is not None,
     )
-    slot, status = await _provision(slots, _champion_miner(champ), stop, source="hf")
+    slot = await _provision(slots, _champion_miner(champ), stop, source="hf")
     if slot is None:
-        raise RuntimeError(f"baseline provision failed: {status}")
+        raise RuntimeError(f"baseline provision failed for {model}@{revision}")
     store.set_champion(champ)
     kind = f"uid{registered.uid}" if registered else "unregistered"
     log.info(f"bootstrap champion: {kind} baseline {model}@{revision}")
@@ -369,12 +368,12 @@ async def _ensure_king_slot(
     if state.king_slot is not None:
         return state.king_slot
     miner = _champion_miner(champ)
-    slot, status = await _provision(slots, miner, stop, source="hf")
+    slot = await _provision(slots, miner, stop, source="hf")
     if slot is None:
         recovered = store.latest_backup_for(champ.artifact_id) if store is not None else None
         if recovered is not None:
-            log.warning(f"champion HF reprovision failed ({status}); using backup")
-            slot, status = await _provision(
+            log.warning("champion HF reprovision failed; using backup")
+            slot = await _provision(
                 slots, miner, stop, source="s3", backup_manifest_key=recovered.manifest_key,
             )
             if slot is not None and store is not None:
@@ -385,7 +384,7 @@ async def _ensure_king_slot(
                     revision=recovered.revision,
                 )
     if slot is None:
-        log.error(f"champion reprovision failed: {status}")
+        log.error("champion reprovision failed")
         return None
     state.king_slot = slot
     return slot
@@ -429,6 +428,16 @@ async def _publish_burn(store: Store, chain: Chain, cfg: Config, artifact: str) 
     return ok
 
 
+def _refs_to_objs(refs: list[dict]) -> list[ManifestRef]:
+    return [ManifestRef(
+        provider=str(r["provider"]),
+        bucket=str(r["bucket"]),
+        key=str(r["key"]),
+        prefix=str(r["prefix"]),
+        sha256=str(r.get("sha256", "")),
+    ) for r in refs]
+
+
 async def _reconcile_backup_manifest(
     store: Store,
     champ: Champion,
@@ -445,26 +454,18 @@ async def _reconcile_backup_manifest(
                     f"champ={champ.artifact_id}; skipping reconcile")
         return
     new_refs = state.get("refs") or []
+    if not new_refs:
+        return
+    # Content compare, not length: a reprovision can produce a different set of
+    # refs with the same count (different prefixes, same provider count). Length
+    # would skip persisting and leave the DB pointing at stale prefixes.
+    new_key = encode_refs(_refs_to_objs(new_refs))
     cur = store.latest_backup_for(champ.artifact_id)
-    cur_refs = decode_refs(cur.manifest_key) if cur else []
-    if len(new_refs) > len(cur_refs):
-        _persist_refs(store, champ, new_refs)
-
-
-def _persist_refs(store: Store, champ: Champion, refs: list[dict]) -> None:
-    objs = [ManifestRef(
-        provider=str(r["provider"]),
-        bucket=str(r["bucket"]),
-        key=str(r["key"]),
-        prefix=str(r["prefix"]),
-        sha256=str(r.get("sha256", "")),
-    ) for r in refs]
-    store.update_backup_manifest(
-        artifact_id=champ.artifact_id,
-        manifest_key=encode_refs(objs),
-        model=champ.model,
-        revision=champ.revision,
-    )
+    if cur is None or cur.manifest_key != new_key:
+        store.update_backup_manifest(
+            artifact_id=champ.artifact_id, manifest_key=new_key,
+            model=champ.model, revision=champ.revision,
+        )
 
 
 def _pair_sample_from_rows(duel_id: int, env: str, task_id: int, iter_idx: int,
@@ -732,10 +733,9 @@ async def run(cfg: Config, chain: Chain, slots=None):
                     log.warning(f"challenger pin failed uid{registered.uid}: {exc}")
                     state.attempted.add((registered.model, registered.revision))
                     continue
-                chal_slot, status = await _provision(slots, challenger, stop, source="hf")
+                chal_slot = await _provision(slots, challenger, stop, source="hf")
                 if chal_slot is None:
                     state.attempted.add((registered.model, registered.revision))
-                    log.warning(f"challenger provision failed uid{registered.uid}: {status}")
                     continue
 
                 block = await chain.current_block()
@@ -776,7 +776,13 @@ async def run(cfg: Config, chain: Chain, slots=None):
                     state.attempted.add((registered.model, registered.revision))
                     continue
 
-                # Pointer first so a mid-block raise leaves reconcile pointing at the new slot.
+                # Atomic commit: champion + backup land in the same transaction.
+                # Order is set_champion → pointer flip → teardown → publish.
+                # set_champion raising leaves state.king_slot untouched; the
+                # `chal_slot is not None and not promoted` finally tears down the
+                # would-be challenger. After the commit succeeds, the in-memory
+                # tuple unpack is atomic (Python doesn't raise on assignment), so
+                # state.king_slot is the new slot for any subsequent failure.
                 snapshot = await poll_backup(chal_slot) if s3_configs else None
                 refs = (snapshot or {}).get("refs") or []
                 new_art = artifact_id(challenger.model, challenger.revision)
@@ -789,18 +795,23 @@ async def run(cfg: Config, chain: Chain, slots=None):
                     reign_start=await chain.current_block(),
                     payable=True,
                 )
-                old_slot = state.king_slot
-                state.king_slot = chal_slot
+                backup = BackupRecord(
+                    artifact_id=new_art,
+                    model=new_champ.model,
+                    revision=new_champ.revision,
+                    manifest_key=encode_refs(_refs_to_objs(refs)),
+                    status="current",
+                ) if refs else None
+                store.set_champion(new_champ, backup=backup)
+                old_slot, state.king_slot = state.king_slot, chal_slot
                 chal_slot = None
                 promoted = True
                 state.attempted.clear()
-                store.set_champion(new_champ)
-                if refs:
-                    _persist_refs(store, new_champ, refs)
-                await _publish_champion(store, chain, cfg, new_champ)
                 if old_slot is not None:
                     await _safe_teardown(slots, old_slot, "old-champion-promoted")
-                log.info(f"DETHRONE: {champ.model}@{champ.revision} -> uid {registered.uid}")
+                ok = await _publish_champion(store, chain, cfg, new_champ)
+                log.info(f"DETHRONE: {champ.model}@{champ.revision} -> uid {registered.uid}"
+                         + ("" if ok else " (publish deferred)"))
             finally:
                 if chal_slot is not None and not promoted:
                     await _safe_teardown(slots, chal_slot, "challenger-end")

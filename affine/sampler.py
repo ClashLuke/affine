@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import atexit
 import asyncio
 import inspect
 import logging
@@ -18,15 +17,7 @@ GENERATION_KEYS = {
     "repetition_penalty", "stop", "temperature", "top_k", "top_p",
 }
 
-_CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=None))
-
-
-@atexit.register
-def _close_client() -> None:
-    try:
-        asyncio.run(_CLIENT.aclose())
-    except RuntimeError:
-        pass
+_CLIENT = httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=120.0, write=60.0, pool=10.0))
 
 
 async def _drain(task: asyncio.Task, slot) -> None:
@@ -147,8 +138,20 @@ async def _gym_eval(env_wrapper, params: dict, slot, seed: int, task_id: int):
         for step_idx in range(max_steps):
             raw = await _chat(slot, messages, params, seed)
             _usage_add(usage, raw.get("usage"))
-            answer = _content(raw)
-            next_obs, reward, terminated, truncated, info = await _maybe_await(env.step(answer))
+            try:
+                answer = _content(raw)
+                next_obs, reward, terminated, truncated, info = await _maybe_await(env.step(answer))
+            except Exception as e:
+                # Miner output broke the env (or vLLM-side OpenAI envelope).
+                # Score as a loss: a model whose answer crashes the env parser
+                # is failing the task, not infrastructure failing the validator.
+                # _chat above stays outside the try — vLLM transport errors are
+                # infra-fault and propagate to outcome=None.
+                return {"score": 0.0, "success": False,
+                        "usage": usage or None,
+                        "extra": {"reset": reset_info,
+                                  "error": f"{type(e).__name__}: {e}",
+                                  "turns": step_idx + 1}}
             last_info = info
             if terminated or truncated:
                 success = info.get("success") if isinstance(info, dict) else None
