@@ -1,8 +1,9 @@
 from __future__ import annotations
-from collections.abc import Iterable
+
 import json
 import math
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
@@ -27,14 +28,14 @@ class Config:
     hotkey_name: str = "default"
     subtensor_endpoint: str = "finney"
     subtensor_fallback: str = "wss://lite.sub.latent.to:443"
-    dwell_batch: int = 1                  # matched-task pairs kept in flight at all times; parallelism ceiling.
+    dwell_batch: int = 1  # matched-task pairs kept in flight at all times; parallelism ceiling.
     db_path: str = "./.affine/affine.sqlite3"
     duel_pairs_per_env: int = 32
     duel_min_discordant: int = 16
     alpha_start: float = 0.005
     alpha_final: float = 0.05
     alpha_halflife: int = 7200
-    provision_timeout: int = 900          # seconds to wait for a vLLM slot to become /v1/models ready
+    provision_timeout: int = 900  # seconds to wait for a vLLM slot to become /v1/models ready
     dry_run: bool = False
     log_level: str = "INFO"
     model_skiplist: tuple[str, ...] = ()
@@ -43,11 +44,8 @@ class Config:
     @classmethod
     def from_env(cls) -> Config:
         endpoint = os.getenv("SUBTENSOR_ENDPOINT", "finney")
-        cfg = cls(
-            netuid=int(os.getenv("NETUID", "120")),
-            wallet_name=os.getenv("BT_WALLET_COLD", "default"),
-            hotkey_name=os.getenv("BT_WALLET_HOT", "default"),
-            subtensor_endpoint=endpoint,
+        cfg = cls(netuid=int(os.getenv("NETUID", "120")), wallet_name=os.getenv("BT_WALLET_COLD", "default"),
+            hotkey_name=os.getenv("BT_WALLET_HOT", "default"), subtensor_endpoint=endpoint,
             subtensor_fallback=os.getenv("SUBTENSOR_FALLBACK", "wss://lite.sub.latent.to:443"),
             dwell_batch=int(os.getenv("AFFINE_DWELL_BATCH", "1")),
             db_path=os.getenv("AFFINE_DB_PATH", "./.affine/affine.sqlite3"),
@@ -56,12 +54,10 @@ class Config:
             alpha_start=float(os.getenv("AFFINE_ALPHA_START", "0.005")),
             alpha_final=float(os.getenv("AFFINE_ALPHA_FINAL", "0.05")),
             alpha_halflife=int(os.getenv("AFFINE_ALPHA_HALFLIFE", "7200")),
-            provision_timeout=int(os.getenv("AFFINE_PROVISION_TIMEOUT", "900")),
-            dry_run=_truthy_env("AFFINE_DRY_RUN"),
+            provision_timeout=int(os.getenv("AFFINE_PROVISION_TIMEOUT", "900")), dry_run=_truthy_env("AFFINE_DRY_RUN"),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
             model_skiplist=parse_model_skiplist(os.getenv("AFFINE_MODEL_SKIPLIST", "")),
-            environments=_default_environments(),
-        )
+            environments=_default_environments(), )
         spec = os.getenv("AFFINE_CONFIG_SPEC", "").strip()
         cfg = _apply_config_spec(cfg, spec) if spec else cfg
         _validate(cfg)
@@ -87,43 +83,26 @@ def _apply_config_spec(cfg: Config, spec: str) -> Config:
         return _apply_json_overrides(cfg, _PROFILES[spec])
     path = Path(spec).expanduser()
     if not path.is_file():
-        raise FileNotFoundError(
-            f"AFFINE_CONFIG_SPEC={spec!r} is not a known profile "
-            f"({', '.join(_PROFILES)}) and not a file path"
-        )
-    return _apply_json_overrides(cfg, json.loads(path.read_text(),
-                                                 parse_float=_reject_inf,
+        raise FileNotFoundError(f"AFFINE_CONFIG_SPEC={spec!r} is not a known profile "
+                                f"({', '.join(_PROFILES)}) and not a file path")
+    return _apply_json_overrides(cfg, json.loads(path.read_text(), parse_float=_reject_inf,
                                                  parse_constant=_reject_nonfinite))
 
 
 # Named profiles. default = shipping config; full = mid-budget gate; smoke = fast CI gate.
 # Per-env timeouts under env_overrides so they ride on top of ENV_REGISTRY.
-_PROFILES: dict[str, dict] = {
-    "default": {},
-    "full": {
-        "env_overrides": {
-            "python": {"params": {"timeout": 300}},
-            "nfa": {"params": {"timeout": 300}},
-            "graph": {"params": {"timeout": 300}},
-            "modular": {"params": {"timeout": 300}},
-            "sudoku": {"params": {"timeout": 300}},
-            "boolean": {"params": {"timeout": 300}},
-            "tree": {"params": {"timeout": 300}},
-        },
-    },
-    "smoke": {
-        "env_overrides": {
-            "python": {"params": {"timeout": 90, "lines": 16}},
-            "nfa": {"params": {"timeout": 90, "states": 7, "length": 8, "accept_count": 2}},
-            "graph": {"params": {"timeout": 90, "nodes": 9, "edges": 18, "min_path_len": 3}},
-            "modular": {"params": {"timeout": 90, "moduli": 2, "steps": 3}},
-            "sudoku": {"params": {"timeout": 90, "clues": 40, "min_branch_points": 0}},
-            "boolean": {"params": {"timeout": 90, "variables": 6, "gates": 10, "min_influence": 4}},
-            "tree": {"params": {"timeout": 120, "n": 10, "max_queries": 32, "max_turns": 16}},
-        },
-    },
-}
-
+_PROFILES: dict[str, dict] = {"default": {}, "full": {
+    "env_overrides": {"python": {"params": {"timeout": 300}}, "nfa": {"params": {"timeout": 300}},
+        "graph": {"params": {"timeout": 300}}, "modular": {"params": {"timeout": 300}},
+        "sudoku": {"params": {"timeout": 300}}, "boolean": {"params": {"timeout": 300}},
+        "tree": {"params": {"timeout": 300}}, }, }, "smoke": {
+    "env_overrides": {"python": {"params": {"timeout": 90, "lines": 16}},
+        "nfa": {"params": {"timeout": 90, "states": 7, "length": 8, "accept_count": 2}},
+        "graph": {"params": {"timeout": 90, "nodes": 9, "edges": 18, "min_path_len": 3}},
+        "modular": {"params": {"timeout": 90, "moduli": 2, "steps": 3}},
+        "sudoku": {"params": {"timeout": 90, "clues": 40, "min_branch_points": 0}},
+        "boolean": {"params": {"timeout": 90, "variables": 6, "gates": 10, "min_influence": 4}},
+        "tree": {"params": {"timeout": 120, "n": 10, "max_queries": 32, "max_turns": 16}}, }, }, }
 
 _TOP_LEVEL_KEYS = frozenset(f.name for f in fields(Config)) | {"env_overrides", "environments"}
 _JSON_DENIED = frozenset({"dry_run"})  # env-only kill switch, never from config spec
@@ -232,9 +211,7 @@ def _validate(cfg: Config) -> None:
         # and crash float(None) deeper; default-substitution form rejects null
         # at the boundary instead.
         t = spec.params.get("timeout", 600)
-        if not (isinstance(t, (int, float))
-                and not isinstance(t, bool)
-                and math.isfinite(t) and t > 0):
+        if not (isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) and t > 0):
             raise ValueError(f"env '{spec.name}': params['timeout'] must be finite > 0, got {t!r}")
         _validate_env_params(spec.name, spec.entrypoint, spec.params)
 
@@ -274,10 +251,9 @@ def _validate_model_skiplist(skiplist: tuple[str, ...]) -> None:
             raise ValueError(f"model_skiplist entries must be non-empty strings, got {model!r}")
 
 
-_GENERATION_KEYS = frozenset({
-    "api_key", "frequency_penalty", "logit_bias", "max_tokens", "min_p", "presence_penalty",
-    "repetition_penalty", "stop", "temperature", "top_k", "top_p", "gym_max_steps",
-})
+_GENERATION_KEYS = frozenset(
+    {"api_key", "frequency_penalty", "logit_bias", "max_tokens", "min_p", "presence_penalty", "repetition_penalty",
+        "stop", "temperature", "top_k", "top_p", "gym_max_steps", })
 
 
 def _validate_env_params(name: str, entrypoint: str, params: dict) -> None:
@@ -336,15 +312,8 @@ def _bounded_int(name: str, key: str, value, *, min_value: int, max_value: int) 
     return value
 
 
-def _finite_number(
-    name: str,
-    key: str,
-    value,
-    *,
-    min_value: float,
-    max_value: float,
-    inclusive_min: bool = True,
-) -> float:
+def _finite_number(name: str, key: str, value, *, min_value: float, max_value: float,
+        inclusive_min: bool = True, ) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError(f"env '{name}': {key} must be finite, got {value!r}")
     lo_ok = value >= min_value if inclusive_min else value > min_value
@@ -367,12 +336,8 @@ def _merge_env(base: EnvSpec, override: dict) -> EnvSpec:
     if not entrypoint:
         raise ValueError(f"environment '{base.name}' has empty entrypoint")
     tr = _validate_task_range(base.name, override.get("task_range", base.task_range))
-    return replace(base,
-        name=str(override.get("name", base.name)),
-        entrypoint=entrypoint,
-        params={**base.params, **params},
-        task_range=tr,
-    )
+    return replace(base, name=str(override.get("name", base.name)), entrypoint=entrypoint,
+                   params={**base.params, **params}, task_range=tr, )
 
 
 def _validate_task_range(name: str, raw) -> tuple[int, int]:
@@ -390,8 +355,8 @@ def _validate_task_range(name: str, raw) -> tuple[int, int]:
 
 # First-ever bootstrap baseline. Recovery never uses aggregate scores; once a
 # reign exists, its saved artifact remains the baseline until direct dethrone.
-BASELINE_MODELS: tuple[str, ...] = ("Qwen/Qwen3-32B", "openai/gpt-oss-120b")
-
+BASELINE_MODELS: tuple[str, ...] = ("Qwen/Qwen3-32B", "nvidia/Qwen3-Nemotron-32B-RLBFF",
+                                    "OpenBuddy/OpenBuddy-R1-0528-Distill-Qwen3-32B-Preview7-QAT-200Kbett")
 
 _BASE_PARAMS = {"temperature": 0.0, "timeout": 600}
 
@@ -401,21 +366,15 @@ def _spec(name: str, entrypoint: str, **params) -> EnvSpec:
 
 
 ENV_REGISTRY: dict[str, EnvSpec] = {
-    "python": _spec("python", "affine.envs.python_interpreter:PythonInterpreterEnv",
-                    lines=64, max_tokens=4096),
-    "nfa": _spec("nfa", "affine.envs.nfa_trace:NFATraceEnv",
-                 states=10, length=16, accept_count=3, max_tokens=1024),
-    "graph": _spec("graph", "affine.envs.graph_path:GraphPathEnv",
-                   nodes=16, edges=46, min_path_len=5, max_tokens=2048),
-    "modular": _spec("modular", "affine.envs.modular_crt:ModularCRTEnv",
-                     moduli=3, steps=5, max_tokens=2048),
-    "sudoku": _spec("sudoku", "affine.envs.sudoku:SudokuEnv",
-                    clues=36, min_branch_points=2, max_tokens=4096),
-    "boolean": _spec("boolean", "affine.envs.boolean_circuit:BooleanCircuitEnv",
-                     variables=9, gates=18, min_influence=7, max_tokens=2048),
-    "tree": _spec("tree", "affine.envs.tree_reconstruction:TreeReconstructionEnv",
-                  n=20, method="prufer", max_queries=64, max_turns=32, max_tokens=4096),
-}
+    "python": _spec("python", "affine.envs.python_interpreter:PythonInterpreterEnv", lines=64, max_tokens=4096),
+    "nfa": _spec("nfa", "affine.envs.nfa_trace:NFATraceEnv", states=10, length=16, accept_count=3, max_tokens=1024),
+    "graph": _spec("graph", "affine.envs.graph_path:GraphPathEnv", nodes=16, edges=46, min_path_len=5, max_tokens=2048),
+    "modular": _spec("modular", "affine.envs.modular_crt:ModularCRTEnv", moduli=3, steps=5, max_tokens=2048),
+    "sudoku": _spec("sudoku", "affine.envs.sudoku:SudokuEnv", clues=36, min_branch_points=2, max_tokens=4096),
+    "boolean": _spec("boolean", "affine.envs.boolean_circuit:BooleanCircuitEnv", variables=9, gates=18, min_influence=7,
+                     max_tokens=2048),
+    "tree": _spec("tree", "affine.envs.tree_reconstruction:TreeReconstructionEnv", n=20, method="prufer",
+                  max_queries=64, max_turns=32, max_tokens=4096), }
 
 
 def _default_environments() -> tuple[EnvSpec, ...]:
