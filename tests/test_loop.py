@@ -88,7 +88,6 @@ async def test_challenger_dethrones(tmp_path, monkeypatch):
             db_path=str(tmp_path / "affine.sqlite3"),
             environments=(EnvSpec(name="stub", entrypoint="test_loop:StubEnv",
                                   params={"timeout": 30}),),
-            duel_pairs_per_env=16, duel_min_discordant=1,
             dwell_batch=4, provision_timeout=15,
         )
         slots = [LocalSlots(f"http://127.0.0.1:{s_champ.server_port}/v1",

@@ -41,7 +41,7 @@ def _prime_shadow_env() -> None:
 
 _prime_shadow_env()
 
-from affine.paired import PairCounts, pair_p_value
+from affine.paired import PairCounts, pair_anytime_p
 from affine.config import parse_model_skiplist
 
 
@@ -82,7 +82,7 @@ def _fmt_row(cells: list[str]) -> str:
 
 
 def _verdict_row(duel, counts: PairCounts, now: float) -> list[str]:
-    p = pair_p_value(counts.challenger_only, counts.discordant)
+    p = pair_anytime_p(counts.challenger_only, counts.discordant)
     return [
         str(duel["challenger_uid"]),
         _trunc(str(duel["challenger_model"]), 28),

@@ -51,9 +51,9 @@ class DuelRecord:
     challenger_model: str
     challenger_revision: str
     schedule_seed: str
-    pairs_per_env: int
-    min_discordant: int
     alpha: float
+    delta_p: float
+    env_weights: dict[str, float]
     status: str
 
 
@@ -63,6 +63,7 @@ class PairSample:
     env: str
     task_id: int
     iter_idx: int
+    launch_seq: int
     block: int
     champion_pass: int
     challenger_pass: int
@@ -131,12 +132,14 @@ class Store:
                 challenger_model TEXT NOT NULL,
                 challenger_revision TEXT NOT NULL,
                 schedule_seed TEXT NOT NULL,
-                pairs_per_env INTEGER NOT NULL,
-                min_discordant INTEGER NOT NULL,
                 alpha REAL NOT NULL,
+                delta_p REAL NOT NULL,
+                env_weights_json TEXT NOT NULL,
                 status TEXT NOT NULL,
                 counts_json TEXT,
-                p_value REAL,
+                env_cs_json TEXT,
+                l_mu REAL,
+                u_mu REAL,
                 started_block INTEGER NOT NULL,
                 finished_block INTEGER,
                 created_at INTEGER NOT NULL,
@@ -148,6 +151,7 @@ class Store:
                 env TEXT NOT NULL,
                 task_id INTEGER NOT NULL,
                 iter_idx INTEGER NOT NULL,
+                launch_seq INTEGER NOT NULL,
                 block INTEGER NOT NULL,
                 champion_pass INTEGER NOT NULL,
                 challenger_pass INTEGER NOT NULL,
@@ -157,7 +161,7 @@ class Store:
                 challenger_delivered INTEGER NOT NULL,
                 champion_tokens INTEGER NOT NULL,
                 challenger_tokens INTEGER NOT NULL,
-                UNIQUE(duel_id, env, iter_idx)
+                UNIQUE(duel_id, launch_seq)
             );
             CREATE TABLE IF NOT EXISTS publications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,10 +178,27 @@ class Store:
             """
         )
         for table, col in (("champion", "backup_manifest"), ("champion", "backup_prefix"),
-                           ("backups", "prefix"), ("backups", "manifest_sha256")):
+                           ("backups", "prefix"), ("backups", "manifest_sha256"),
+                           ("duels", "min_discordant"), ("duels", "pairs_per_env"),
+                           ("duels", "precision"), ("duels", "p_value"),
+                           ("duels", "log_e_final"), ("duels", "cs_lower"), ("duels", "cs_upper")):
             cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})").fetchall()}
             if col in cols:
                 self.db.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+        duel_cols = {r["name"] for r in self.db.execute("PRAGMA table_info(duels)").fetchall()}
+        if "delta_p" not in duel_cols:
+            self.db.execute("ALTER TABLE duels ADD COLUMN delta_p REAL NOT NULL DEFAULT 0.05")
+        if "env_weights_json" not in duel_cols:
+            self.db.execute("ALTER TABLE duels ADD COLUMN env_weights_json TEXT NOT NULL DEFAULT '{}'")
+        if "env_cs_json" not in duel_cols:
+            self.db.execute("ALTER TABLE duels ADD COLUMN env_cs_json TEXT")
+        if "l_mu" not in duel_cols:
+            self.db.execute("ALTER TABLE duels ADD COLUMN l_mu REAL")
+        if "u_mu" not in duel_cols:
+            self.db.execute("ALTER TABLE duels ADD COLUMN u_mu REAL")
+        sample_cols = {r["name"] for r in self.db.execute("PRAGMA table_info(samples)").fetchall()}
+        if "launch_seq" not in sample_cols:
+            self.db.execute("ALTER TABLE samples ADD COLUMN launch_seq INTEGER NOT NULL DEFAULT 0")
         self.db.execute("DELETE FROM backups WHERE status='staging'")
         self.db.commit()
 
@@ -296,30 +317,31 @@ class Store:
         challenger_model: str,
         challenger_revision: str,
         schedule_seed: str,
-        pairs_per_env: int,
-        min_discordant: int,
         alpha: float,
+        delta_p: float,
+        env_weights: dict[str, float],
         started_block: int,
     ) -> DuelRecord:
         ts = now()
         challenger_art = artifact_id(challenger_model, challenger_revision)
+        weights_json = json.dumps(env_weights, sort_keys=True)
         with self.tx() as db:
             cur = db.execute(
                 """
                 INSERT INTO duels(champion_artifact_id, challenger_artifact_id, challenger_uid,
                                   challenger_hotkey, challenger_model, challenger_revision,
-                                  schedule_seed, pairs_per_env, min_discordant, alpha,
+                                  schedule_seed, alpha, delta_p, env_weights_json,
                                   status, started_block, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
                 """,
                 (champion.artifact_id, challenger_art, challenger_uid, challenger_hotkey,
-                 challenger_model, challenger_revision, schedule_seed, pairs_per_env,
-                 min_discordant, alpha, started_block, ts, ts),
+                 challenger_model, challenger_revision, schedule_seed, alpha, delta_p,
+                 weights_json, started_block, ts, ts),
             )
             duel_id = int(cur.lastrowid)
         return DuelRecord(duel_id, champion.artifact_id, challenger_art, challenger_uid,
                           challenger_hotkey, challenger_model, challenger_revision,
-                          schedule_seed, pairs_per_env, min_discordant, alpha, "running")
+                          schedule_seed, alpha, delta_p, dict(env_weights), "running")
 
     def add_samples(self, samples: list[PairSample]) -> None:
         if not samples:
@@ -328,13 +350,14 @@ class Store:
         with self.tx() as db:
             db.executemany(
                 """
-                INSERT INTO samples(duel_id, env, task_id, iter_idx, block,
+                INSERT INTO samples(duel_id, env, task_id, iter_idx, launch_seq, block,
                     champion_pass, challenger_pass, champion_latency, challenger_latency,
                     champion_delivered, challenger_delivered, champion_tokens, challenger_tokens)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                [(s.duel_id, s.env, s.task_id, s.iter_idx, s.block, s.champion_pass,
-                  s.challenger_pass, s.champion_latency, s.challenger_latency,
+                [(s.duel_id, s.env, s.task_id, s.iter_idx, s.launch_seq, s.block,
+                  s.champion_pass, s.challenger_pass,
+                  s.champion_latency, s.challenger_latency,
                   s.champion_delivered, s.challenger_delivered, s.champion_tokens,
                   s.challenger_tokens) for s in samples],
             )
@@ -354,17 +377,45 @@ class Store:
             counts = counts.add(int(r["champion_pass"]), int(r["challenger_pass"]))
         return counts
 
-    def finish_duel(self, duel_id: int, status: str, counts: PairCounts, p_value: float,
-                    finished_block: int | None) -> None:
-        payload = json.dumps(counts.__dict__, sort_keys=True)
+    def per_env_counts(self, duel_id: int) -> dict[str, PairCounts]:
+        rows = self.db.execute(
+            """
+            SELECT env, champion_pass, challenger_pass
+            FROM samples
+            WHERE duel_id = ? AND champion_delivered = 1 AND challenger_delivered = 1
+            """,
+            (duel_id,),
+        ).fetchall()
+        out: dict[str, PairCounts] = {}
+        for r in rows:
+            env = str(r["env"])
+            out[env] = out.get(env, PairCounts()).add(
+                int(r["champion_pass"]), int(r["challenger_pass"])
+            )
+        return out
+
+    def finish_duel(
+        self,
+        duel_id: int,
+        status: str,
+        counts: PairCounts,
+        l_mu: float | None,
+        u_mu: float | None,
+        env_cs_payload: dict[str, dict] | None,
+        finished_block: int | None,
+    ) -> None:
+        counts_json = json.dumps(counts.__dict__, sort_keys=True)
+        env_cs_json = json.dumps(env_cs_payload, sort_keys=True) if env_cs_payload else None
         with self.tx() as db:
             db.execute(
                 """
                 UPDATE duels
-                SET status = ?, counts_json = ?, p_value = ?, finished_block = ?, updated_at = ?
+                SET status = ?, counts_json = ?, env_cs_json = ?, l_mu = ?, u_mu = ?,
+                    finished_block = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (status, payload, p_value, finished_block, now(), duel_id),
+                (status, counts_json, env_cs_json, l_mu, u_mu,
+                 finished_block, now(), duel_id),
             )
 
     def abort_running_duels(self) -> None:

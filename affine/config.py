@@ -16,9 +16,13 @@ class EnvSpec:
     name: str
     entrypoint: str
     params: dict = field(default_factory=dict)
-    # Inclusive challenge-id range. The validator draws task_ids uniformly per
-    # duel iteration so both miners see the same task.
-    task_range: tuple[int, int] = (0, (1 << 31) - 1)
+    # Inclusive challenge-id range. The validator draws task_ids uniformly
+    # per duel iteration so both miners see the same task. 63-bit space
+    # (capped by SQLite signed INTEGER) defeats weight-side memorization:
+    # ~9.2e18 unique (env, task_id) prompts per env exceeds any plausible
+    # fine-tune dataset, so a model can only encode the capability, not the
+    # task->answer table.
+    task_range: tuple[int, int] = (0, (1 << 63) - 1)
 
 
 @dataclass
@@ -28,13 +32,13 @@ class Config:
     hotkey_name: str = "default"
     subtensor_endpoint: str = "finney"
     subtensor_fallback: str = "wss://lite.sub.latent.to:443"
-    dwell_batch: int = 1  # matched-task pairs kept in flight at all times; parallelism ceiling.
+    dwell_batch: int = 512  # matched-task pairs kept in flight; saturates --max-num-seqs 1024 (2 streams per pair)
+    max_pairs_per_duel: int = 2000  # anytime-valid stopping budget; hold_inconclusive once cursor reaches this
     db_path: str = "./.affine/affine.sqlite3"
-    duel_pairs_per_env: int = 32
-    duel_min_discordant: int = 16
-    alpha_start: float = 0.005
-    alpha_final: float = 0.05
-    alpha_halflife: int = 7200
+    alpha: float = 0.05
+    delta_p: float = 0.05  # non-inferiority margin: dethrone null is mu <= 1/2 + delta_p
+    n_min_per_env: int = 1  # cold-start floor; UCB term drives steady-state revisits
+    score_lambda: float = 0.5  # sampler weighting: lambda * KL(dethrone) + (1-lambda) * uncertainty
     provision_timeout: int = 900  # seconds to wait for a vLLM slot to become /v1/models ready
     dry_run: bool = False
     log_level: str = "INFO"
@@ -47,13 +51,13 @@ class Config:
         cfg = cls(netuid=int(os.getenv("NETUID", "120")), wallet_name=os.getenv("BT_WALLET_COLD", "default"),
             hotkey_name=os.getenv("BT_WALLET_HOT", "default"), subtensor_endpoint=endpoint,
             subtensor_fallback=os.getenv("SUBTENSOR_FALLBACK", "wss://lite.sub.latent.to:443"),
-            dwell_batch=int(os.getenv("AFFINE_DWELL_BATCH", "1")),
+            dwell_batch=int(os.getenv("AFFINE_DWELL_BATCH", "512")),
+            max_pairs_per_duel=int(os.getenv("AFFINE_MAX_PAIRS_PER_DUEL", "2000")),
             db_path=os.getenv("AFFINE_DB_PATH", "./.affine/affine.sqlite3"),
-            duel_pairs_per_env=int(os.getenv("AFFINE_DUEL_PAIRS_PER_ENV", "32")),
-            duel_min_discordant=int(os.getenv("AFFINE_DUEL_MIN_DISCORDANT", "16")),
-            alpha_start=float(os.getenv("AFFINE_ALPHA_START", "0.005")),
-            alpha_final=float(os.getenv("AFFINE_ALPHA_FINAL", "0.05")),
-            alpha_halflife=int(os.getenv("AFFINE_ALPHA_HALFLIFE", "7200")),
+            alpha=float(os.getenv("AFFINE_ALPHA", "0.05")),
+            delta_p=float(os.getenv("AFFINE_DELTA_P", "0.05")),
+            n_min_per_env=int(os.getenv("AFFINE_N_MIN_PER_ENV", "1")),
+            score_lambda=float(os.getenv("AFFINE_SCORE_LAMBDA", "0.5")),
             provision_timeout=int(os.getenv("AFFINE_PROVISION_TIMEOUT", "900")), dry_run=_truthy_env("AFFINE_DRY_RUN"),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
             model_skiplist=parse_model_skiplist(os.getenv("AFFINE_MODEL_SKIPLIST", "")),
@@ -178,20 +182,18 @@ def _validate(cfg: Config) -> None:
     we use math.isfinite explicitly."""
     if cfg.dwell_batch <= 0:
         raise ValueError(f"dwell_batch must be > 0, got {cfg.dwell_batch}")
+    if cfg.max_pairs_per_duel <= 0:
+        raise ValueError(f"max_pairs_per_duel must be > 0, got {cfg.max_pairs_per_duel}")
     if cfg.provision_timeout <= 0:
         raise ValueError(f"provision_timeout must be > 0, got {cfg.provision_timeout}")
-    if cfg.duel_pairs_per_env <= 0:
-        raise ValueError(f"duel_pairs_per_env must be > 0, got {cfg.duel_pairs_per_env}")
-    if cfg.duel_min_discordant < 0:
-        raise ValueError(f"duel_min_discordant must be >= 0, got {cfg.duel_min_discordant}")
-    if cfg.alpha_halflife <= 0:
-        raise ValueError(f"alpha_halflife must be > 0, got {cfg.alpha_halflife}")
-    for n in ("alpha_start", "alpha_final"):
-        v = getattr(cfg, n)
-        if not (math.isfinite(v) and 0.0 < v < 1.0):
-            raise ValueError(f"{n} must be in (0, 1), got {v}")
-    if cfg.alpha_start > cfg.alpha_final:
-        raise ValueError(f"alpha_start ({cfg.alpha_start}) must be <= alpha_final ({cfg.alpha_final})")
+    if not (math.isfinite(cfg.alpha) and 0.0 < cfg.alpha < 1.0):
+        raise ValueError(f"alpha must be in (0, 1), got {cfg.alpha}")
+    if not (math.isfinite(cfg.delta_p) and 0.0 < cfg.delta_p < 0.5):
+        raise ValueError(f"delta_p must be in (0, 0.5), got {cfg.delta_p}")
+    if cfg.n_min_per_env < 1:
+        raise ValueError(f"n_min_per_env must be >= 1, got {cfg.n_min_per_env}")
+    if not (math.isfinite(cfg.score_lambda) and 0.0 <= cfg.score_lambda <= 1.0):
+        raise ValueError(f"score_lambda must be in [0, 1], got {cfg.score_lambda}")
     _validate_log_level(cfg.log_level)
     _validate_model_skiplist(cfg.model_skiplist)
     if not cfg.environments:
@@ -346,8 +348,8 @@ def _validate_task_range(name: str, raw) -> tuple[int, int]:
     lo, hi = raw
     if any(isinstance(x, bool) or not isinstance(x, int) for x in (lo, hi)):
         raise ValueError(f"environment '{name}' task_range endpoints must be integers, got {raw!r}")
-    if not (0 <= lo <= hi <= (1 << 31) - 1):
-        raise ValueError(f"environment '{name}' task_range must be within [0, {((1 << 31) - 1)}], got {raw!r}")
+    if not (0 <= lo <= hi <= (1 << 63) - 1):
+        raise ValueError(f"environment '{name}' task_range must be within [0, {((1 << 63) - 1)}], got {raw!r}")
     if lo > hi:
         raise ValueError(f"environment '{name}' has invalid task_range: {raw!r}")
     return lo, hi

@@ -34,7 +34,15 @@ from .backup import (
 from .chain import Miner, Subtensor, _tiebreak, _truthy_env, clear_weights, get_miners, set_weights
 from .config import BASELINE_MODELS, Config
 from .envs import EnvFactory
-from .paired import PairCounts, PairDecision, alpha_for_reign, decide_paired, pair_p_value
+from .paired import (
+    EnvCS,
+    MeanDecision,
+    PairCounts,
+    decide_dethrone,
+    env_lower_cs,
+    env_upper_cs,
+    select_env,
+)
 from .sampler import run_one
 from .store import BackupRecord, Champion, PairSample, Store, artifact_id
 from .vllm import (
@@ -117,6 +125,41 @@ async def _cancellable(coro, stop: asyncio.Event, on_orphan=None):
                     log.warning(f"_cancellable: on_orphan failed: {type(e).__name__}: {e}")
 
 
+def _start_prefetch(state: "_RunState", slots: list[VllmSlots], miner: Miner,
+                    stop: asyncio.Event) -> None:
+    """Kick off a background provision of `miner` so it overlaps the current duel.
+
+    Caller must already have ensured `state.prefetch_task is None`. The task is
+    cancellable via the same `stop` event used by foreground provisions; on
+    shutdown, `run()`'s outer `finally` cancels and tears down its result."""
+    state.next_challenger = miner
+    state.prefetch_task = asyncio.create_task(_provision(slots, miner, stop, source="hf"))
+
+
+async def _consume_prefetch(state: "_RunState", expected: Miner | None) -> Slot | None:
+    """Await the in-flight prefetch task. Return the slot iff (a) a task exists
+    and (b) the queued challenger matches `expected` and (c) provision succeeded.
+    Otherwise tear down any successfully-provisioned slot (stale prefetch) and
+    return None. Always clears `state.next_challenger` and `state.prefetch_task`."""
+    task, queued = state.prefetch_task, state.next_challenger
+    state.prefetch_task = None
+    state.next_challenger = None
+    if task is None:
+        return None
+    try:
+        slot = await task
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning(f"prefetch failed: {type(e).__name__}: {e}")
+        return None
+    if expected is None or queued != expected or slot is None:
+        if slot is not None:
+            await _safe_teardown(slot, "prefetch-stale")
+        return None
+    return slot
+
+
 async def _safe_teardown(slot: Slot, ctx: str) -> None:
     """Shielded so an outer cancel during teardown doesn't interrupt the platform
     DELETE — the request keeps flying as a fire-and-forget task; reconcile() at
@@ -193,15 +236,42 @@ async def _sample(chain: Chain, wrapper, params: dict, timeout: float, slot: Slo
     return int(bool(outcome)), float(latency), True, int(tokens)
 
 
+def _delivered(r) -> bool:
+    if isinstance(r, BaseException) or not isinstance(r, tuple) or len(r) != 4:
+        return False
+    return bool(r[2])
+
+
 async def _pair_sample(chain: Chain, wrapper, params: dict, timeout: float,
                        king_slot: Slot, king: Miner, ck: int,
                        chal_slot: Slot, challenger: Miner, cc: int,
                        env_name: str, task_id: int, e_idx: int):
-    rk, rc = await asyncio.gather(
-        _sample(chain, wrapper, params, timeout, king_slot, king, env_name, ck, task_id),
-        _sample(chain, wrapper, params, timeout, chal_slot, challenger, env_name, cc, task_id),
-        return_exceptions=True,
-    )
+    """One bounded retry per side on infra-fault. Same task_id, deterministic
+    prompt and (at temperature=0) deterministic model output, so retry only
+    changes outcome when transport recovers. Bounds asymmetric-censoring bias
+    when king and chal slots have different infra-fault rates: pair retain
+    rate becomes ~(1 - r^2) instead of (1 - r) per side."""
+    async def king_call():
+        return await _sample(chain, wrapper, params, timeout, king_slot, king, env_name, ck, task_id)
+
+    async def chal_call():
+        return await _sample(chain, wrapper, params, timeout, chal_slot, challenger, env_name, cc, task_id)
+
+    async def maybe_retry(retry_fn, original):
+        if _delivered(original):
+            return original
+        try:
+            result = await retry_fn()
+        except BaseException as exc:
+            return exc
+        return result if _delivered(result) else original
+
+    rk, rc = await asyncio.gather(king_call(), chal_call(), return_exceptions=True)
+    if not _delivered(rk) or not _delivered(rc):
+        rk, rc = await asyncio.gather(
+            maybe_retry(king_call, rk),
+            maybe_retry(chal_call, rc),
+        )
     return e_idx, env_name, rk, rc
 
 
@@ -209,13 +279,32 @@ async def _pair_sample(chain: Chain, wrapper, params: dict, timeout: float,
 class _RunState:
     king_slot: Slot | None = None
     attempted: set[ArtKey] = field(default_factory=set)
+    # Prefetch the next challenger so its provisioning (5–15 min) overlaps the
+    # current duel. `next_challenger` is the (model, revision) the in-flight
+    # task is provisioning. On dethrone the prefetch is discarded (queue may
+    # not be valid under the new champion); on hold the prefetched slot is
+    # consumed if the next iteration's queue[0] still matches.
+    next_challenger: Miner | None = None
+    prefetch_task: asyncio.Task | None = None
 
 
 @dataclass(frozen=True)
 class _DuelRun:
-    decision: PairDecision | None
+    decision: MeanDecision | None
     status: str
-    counts: PairCounts
+    per_env_counts: dict[str, PairCounts]
+
+    @property
+    def counts(self) -> PairCounts:
+        out = PairCounts()
+        for c in self.per_env_counts.values():
+            out = PairCounts(
+                challenger_only=out.challenger_only + c.challenger_only,
+                champion_only=out.champion_only + c.champion_only,
+                both_pass=out.both_pass + c.both_pass,
+                both_fail=out.both_fail + c.both_fail,
+            )
+        return out
 
 
 def _backup_configs(cfg: Config, hotkey: str) -> list[S3Config]:
@@ -487,7 +576,8 @@ async def _reconcile_backup_manifest(
 
 
 def _pair_sample_from_rows(duel_id: int, env: str, task_id: int, iter_idx: int,
-                           block: int, king: Miner, chal: Miner, rk, rc) -> PairSample:
+                           launch_seq: int, block: int, king: Miner, chal: Miner,
+                           rk, rc) -> PairSample:
     def unpack(result, miner: Miner) -> tuple[int, float, int, int]:
         if isinstance(result, BaseException):
             log.warning(f"sample raised uid{miner.uid}: {type(result).__name__}: {result}")
@@ -496,10 +586,11 @@ def _pair_sample_from_rows(duel_id: int, env: str, task_id: int, iter_idx: int,
         return p, latency, int(delivered), tokens
     kp, kl, kd, kt = unpack(rk, king)
     cp, cl, cd, ct = unpack(rc, chal)
-    return PairSample(duel_id, env, task_id, iter_idx, block, kp, cp, kl, cl, kd, cd, kt, ct)
+    return PairSample(duel_id, env, task_id, iter_idx, launch_seq, block,
+                      kp, cp, kl, cl, kd, cd, kt, ct)
 
 
-async def _run_fixed_duel(
+async def _run_duel(
     store: Store,
     chain: Chain,
     king: Miner,
@@ -511,16 +602,42 @@ async def _run_fixed_duel(
     duel,
     stop: asyncio.Event,
 ) -> _DuelRun:
+    """Stratified anytime-valid duel.
+
+    Per-env counts feed independent always-valid CSs at level (alpha/2)/E,
+    aggregated at the parameter level: L_mu = sum pi_e L_e, U_mu = sum pi_e U_e.
+    Dethrone iff L_mu > p_star = 0.5 + delta_p. Futility iff U_mu <= p_star.
+
+    Concurrency: launch-order ledger. Each task is tagged with a launch_seq;
+    completed results are buffered keyed by seq; the analysis cursor advances
+    only through the completed launch-order prefix; verdict checks happen only
+    after the cursor moves. dwell_batch tasks are kept in flight at all times
+    via continuous refill (FIRST_COMPLETED). This keeps the e-process update
+    order predictable from the past filtration even though completions can
+    arrive out of order.
+
+    Sampling: cold-start round-robin until each env has n_min total samples,
+    then argmax of env_score. Selection depends only on past cursor data.
+
+    SLOT_DEAD checks run before the statistical decision so infra failures
+    never cost a reign on the decision side."""
     env_names = [spec.name for spec in cfg.environments]
-    target_per_env = duel.pairs_per_env
-    target_total = target_per_env * len(env_names)
-    delivered_by_env = {env: 0 for env in env_names}
-    inflight_by_env = {env: 0 for env in env_names}
-    launched_by_env = {env: 0 for env in env_names}
-    env_rank = {env: i for i, env in enumerate(env_names)}
+    e_count = len(env_names)
+    weights = duel.env_weights
+    p_star = 0.5 + duel.delta_p
+    alpha_d = duel.alpha / 2.0
+    alpha_f = duel.alpha / 2.0
+    am = alpha_d / e_count
+    ap = alpha_f / e_count
+
+    per_env_counts: dict[str, PairCounts] = {e: PairCounts() for e in env_names}
     counters: dict[tuple[int, str, str], int] = {}
-    inflight: set[asyncio.Task] = set()
-    counts = PairCounts()
+    in_flight: dict[int, asyncio.Task] = {}
+    pending: dict[int, tuple] = {}
+    env_latency_total: dict[str, float] = {e: 0.0 for e in env_names}
+    env_latency_count: dict[str, int] = {e: 0 for e in env_names}
+    cursor = 0
+    next_seq = 0
     king_dead = chal_dead = 0
     pair_dead = 0
 
@@ -530,18 +647,33 @@ async def _run_fixed_duel(
         counters[key] = c + 1
         return c
 
+    def env_cs_now() -> dict[str, EnvCS]:
+        out: dict[str, EnvCS] = {}
+        for e in env_names:
+            c = per_env_counts[e]
+            out[e] = EnvCS(
+                k=c.challenger_only,
+                n=c.discordant,
+                L=env_lower_cs(c.challenger_only, c.discordant, am),
+                U=env_upper_cs(c.challenger_only, c.discordant, ap),
+            )
+        return out
+
+    def env_cs_payload(env_cs: dict[str, EnvCS]) -> dict[str, dict]:
+        return {e: {"k": cs.k, "n": cs.n, "L": cs.L, "U": cs.U} for e, cs in env_cs.items()}
+
     async def drain(reason: str) -> None:
-        for task in inflight:
+        for task in in_flight.values():
             if not task.done():
                 task.cancel()
-        for task in list(inflight):
+        for task in list(in_flight.values()):
             try:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
                 pass
             except BaseException as exc:
                 log.warning(f"duel drain ({reason}) interrupted: {type(exc).__name__}: {exc}")
-        inflight.clear()
+        in_flight.clear()
 
     async def block() -> int:
         try:
@@ -552,81 +684,106 @@ async def _run_fixed_duel(
 
     async def _abort_duel(reason: str, status: str) -> _DuelRun:
         await drain(reason)
-        store.finish_duel(duel.id, status, counts, pair_p_value(counts.challenger_only, counts.discordant), await block())
-        return _DuelRun(None, status, counts)
+        env_cs = env_cs_now()
+        l_mu = sum(weights[e] * env_cs[e].L for e in env_names)
+        u_mu = sum(weights[e] * env_cs[e].U for e in env_names)
+        store.finish_duel(duel.id, status, _DuelRun(None, status, per_env_counts).counts,
+                          l_mu, u_mu, env_cs_payload(env_cs), await block())
+        return _DuelRun(None, status, per_env_counts)
 
-    def next_env() -> str | None:
-        eligible = [
-            env for env in env_names
-            if delivered_by_env[env] + inflight_by_env[env] < target_per_env
-        ]
-        if not eligible:
-            return None
-        return min(eligible, key=lambda env: (delivered_by_env[env] + inflight_by_env[env], env_rank[env]))
-
-    async def launch(env_name: str) -> asyncio.Task:
-        iter_idx = launched_by_env[env_name]
+    async def launch_one(env_name: str, seq: int) -> asyncio.Task:
         wrapper, spec = envs[env_name]
         params = {k: v for k, v in spec.params.items() if k != "timeout"}
         timeout = float(spec.params.get("timeout", 600))
         lo, hi = spec.task_range
         task_id = _task_id(
-            king.uid if king.uid is not None else -1, challenger.uid if challenger.uid is not None else -1,
-            env_name, iter_idx, lo, hi,
+            king.uid if king.uid is not None else -1,
+            challenger.uid if challenger.uid is not None else -1,
+            env_name, seq, lo, hi,
             salt=f"{chain.hotkey}:{duel.schedule_seed}")
-        task = asyncio.create_task(_pair_sample(
+        return asyncio.create_task(_pair_sample(
             chain, wrapper, params, timeout,
             king_slot, king, alloc(king, env_name),
             chal_slot, challenger, alloc(challenger, env_name),
-            env_name, task_id, iter_idx))
-        launched_by_env[env_name] = iter_idx + 1
-        inflight_by_env[env_name] += 1
-        return task
+            env_name, task_id, seq))
+
+    def env_costs() -> dict[str, float]:
+        # Pair latency = slower side. Floor at 1.0 so cost stays meaningful and
+        # never zero (avoid division-by-zero in env_score).
+        return {
+            e: max(env_latency_total[e] / env_latency_count[e], 1.0)
+            if env_latency_count[e] > 0 else 1.0
+            for e in env_names
+        }
 
     async def fill() -> None:
-        while len(inflight) < cfg.dwell_batch:
-            env_name = next_env()
-            if env_name is None:
-                return
-            inflight.add(await launch(env_name))
+        nonlocal next_seq
+        while len(in_flight) < cfg.dwell_batch:
+            env_cs = env_cs_now()
+            env_name = select_env(per_env_counts, weights, env_cs,
+                                  p_star, cfg.n_min_per_env, cfg.score_lambda,
+                                  costs=env_costs())
+            seq = next_seq
+            in_flight[seq] = await launch_one(env_name, seq)
+            next_seq += 1
 
-    await fill()
-
-    while inflight:
-        if stop.is_set():
-            await drain("stop")
-            store.finish_duel(duel.id, "cancelled", counts, pair_p_value(counts.challenger_only, counts.discordant), None)
-            return _DuelRun(None, "cancelled", counts)
+    while not stop.is_set():
+        await fill()
         try:
-            done, _ = await _cancellable(asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED), stop)
+            done, _ = await _cancellable(
+                asyncio.wait(list(in_flight.values()), return_when=asyncio.FIRST_COMPLETED),
+                stop,
+            )
         except asyncio.CancelledError:
             await drain("stop")
-            store.finish_duel(duel.id, "cancelled", counts, pair_p_value(counts.challenger_only, counts.discordant), None)
+            env_cs = env_cs_now()
+            l_mu = sum(weights[e] * env_cs[e].L for e in env_names)
+            u_mu = sum(weights[e] * env_cs[e].U for e in env_names)
+            run = _DuelRun(None, "cancelled", per_env_counts)
+            store.finish_duel(duel.id, "cancelled", run.counts, l_mu, u_mu,
+                              env_cs_payload(env_cs), None)
             if stop.is_set():
-                return _DuelRun(None, "cancelled", counts)
+                return run
             raise
-        samples = []
+
+        # Move completed tasks into the pending buffer keyed by launch_seq.
         for task in done:
-            inflight.discard(task)
-            e_idx, env_name, rk, rc = task.result()
-            inflight_by_env[env_name] -= 1
+            seq = next(s for s, t in in_flight.items() if t is task)
+            del in_flight[seq]
+            pending[seq] = task.result()
+
+        # Advance cursor through the completed launch-order prefix.
+        new_samples: list[PairSample] = []
+        progressed = False
+        while cursor in pending:
+            e_idx, env_name, rk, rc = pending.pop(cursor)
+            wrapper, spec = envs[env_name]
+            lo, hi = spec.task_range
             task_id = _task_id(
-                king.uid if king.uid is not None else -1, challenger.uid if challenger.uid is not None else -1,
-                env_name, e_idx,
-                envs[env_name][1].task_range[0], envs[env_name][1].task_range[1],
+                king.uid if king.uid is not None else -1,
+                challenger.uid if challenger.uid is not None else -1,
+                env_name, e_idx, lo, hi,
                 salt=f"{chain.hotkey}:{duel.schedule_seed}")
             b = await block()
-            sample = _pair_sample_from_rows(duel.id, env_name, task_id, e_idx, b, king, challenger, rk, rc)
-            samples.append(sample)
+            sample = _pair_sample_from_rows(duel.id, env_name, task_id, e_idx, cursor,
+                                            b, king, challenger, rk, rc)
+            new_samples.append(sample)
             if sample.champion_delivered and sample.challenger_delivered:
-                counts = counts.add(sample.champion_pass, sample.challenger_pass)
-                delivered_by_env[env_name] += 1
+                per_env_counts[env_name] = per_env_counts[env_name].add(
+                    sample.champion_pass, sample.challenger_pass)
+                env_latency_total[env_name] += max(sample.champion_latency, sample.challenger_latency)
+                env_latency_count[env_name] += 1
                 pair_dead = 0
             else:
                 pair_dead += 1
             king_dead = 0 if sample.champion_delivered else king_dead + 1
             chal_dead = 0 if sample.challenger_delivered else chal_dead + 1
-        store.add_samples(samples)
+            cursor += 1
+            progressed = True
+        if new_samples:
+            store.add_samples(new_samples)
+
+        # SLOT_DEAD takes precedence over the statistical decision.
         if king_dead >= SLOT_DEAD and chal_dead >= SLOT_DEAD:
             return await _abort_duel("delivery-stalled", "delivery_stalled")
         if king_dead >= SLOT_DEAD:
@@ -635,23 +792,32 @@ async def _run_fixed_duel(
             return await _abort_duel("challenger-slot-dead", "challenger_slot_dead")
         if pair_dead >= SLOT_DEAD:
             return await _abort_duel("delivery-stalled", "delivery_stalled")
-        remaining = target_total - counts.total
-        best_possible = PairCounts(
-            counts.challenger_only + remaining,
-            counts.champion_only,
-            counts.both_pass,
-            counts.both_fail,
-        )
-        if not decide_paired(best_possible, alpha=duel.alpha,
-                             min_discordant=duel.min_discordant).dethrone:
-            await drain("best-possible-hold")
-            break
-        await fill()
 
-    decision = decide_paired(counts, alpha=duel.alpha, min_discordant=duel.min_discordant)
-    status = "dethrone" if decision.dethrone else "hold"
-    store.finish_duel(duel.id, status, counts, decision.p_value, await block())
-    return _DuelRun(decision, status, counts)
+        # Verdict check only after cursor advancement (launch-order ledger).
+        if not progressed:
+            continue
+        decision = decide_dethrone(per_env_counts, weights, p_star, alpha_d, alpha_f)
+        if decision.dethrone or decision.futility:
+            status = "dethrone" if decision.dethrone else "hold_with_evidence"
+            await drain(status)
+            run = _DuelRun(decision, status, per_env_counts)
+            cs_payload = {e: {"k": cs.k, "n": cs.n, "L": cs.L, "U": cs.U}
+                          for e, cs in decision.env_cs}
+            store.finish_duel(duel.id, status, run.counts,
+                              decision.L_mu, decision.U_mu, cs_payload, await block())
+            return run
+        # Anytime-valid stopping budget: hold_inconclusive once cursor reaches the cap.
+        if cursor >= cfg.max_pairs_per_duel:
+            return await _abort_duel("budget-exhausted", "hold_inconclusive")
+
+    await drain("stop")
+    env_cs = env_cs_now()
+    l_mu = sum(weights[e] * env_cs[e].L for e in env_names)
+    u_mu = sum(weights[e] * env_cs[e].U for e in env_names)
+    run = _DuelRun(None, "cancelled", per_env_counts)
+    store.finish_duel(duel.id, "cancelled", run.counts, l_mu, u_mu,
+                      env_cs_payload(env_cs), None)
+    return run
 
 
 async def _gc_retiring(store: Store, s3_configs: list[S3Config]) -> None:
@@ -739,29 +905,40 @@ async def run(cfg: Config, chain: Chain, slots: list[VllmSlots] | None = None):
                 key=lambda m: (m.block, _tiebreak(m)),
             )
             if not queue:
-                state.attempted.clear()
-                log.info("queue exhausted this reign; sleeping 120s before re-probe")
+                # No retries: a challenger that already held stays in `_attempted`
+                # until dethrone (which clears it). Sleep, then re-list miners; if
+                # new commits appear they'll show up; old held artifacts stay out.
+                log.info("queue exhausted this reign; sleeping 120s before re-probe (no retry of attempted)")
                 await _cancellable(asyncio.sleep(120), stop)
                 continue
 
             registered = queue[0]
-            chal_slot = None
+            # Consume the prefetch if it targeted this challenger; otherwise
+            # discard (queue may have shifted under a new champion / new commit).
+            chal_slot = await _consume_prefetch(state, expected=registered)
             promoted = False
             try:
                 try:
                     challenger = await _pin_artifact(s3_configs, registered)
                 except Exception as exc:
                     log.warning(f"challenger pin failed uid{registered.uid}: {exc}")
+                    if chal_slot is not None:
+                        await _safe_teardown(chal_slot, "pin-failed")
+                        chal_slot = None
                     state.attempted.add((registered.model, registered.revision))
                     continue
-                chal_slot = await _provision(slots, challenger, stop, source="hf")
+                if chal_slot is None:
+                    chal_slot = await _provision(slots, challenger, stop, source="hf")
                 if chal_slot is None:
                     state.attempted.add((registered.model, registered.revision))
                     continue
+                # Kick off prefetch of queue[1] so its provisioning overlaps the duel.
+                if state.prefetch_task is None and len(queue) > 1:
+                    _start_prefetch(state, slots, queue[1], stop)
 
                 block = await chain.current_block()
-                alpha = alpha_for_reign(block - champ.reign_start,
-                                        cfg.alpha_start, cfg.alpha_final, cfg.alpha_halflife)
+                env_names = [spec.name for spec in cfg.environments]
+                env_weights = {e: 1.0 / len(env_names) for e in env_names}
                 duel = store.create_duel(
                     champion=champ,
                     challenger_uid=registered.uid,
@@ -769,15 +946,17 @@ async def run(cfg: Config, chain: Chain, slots: list[VllmSlots] | None = None):
                     challenger_model=challenger.model,
                     challenger_revision=challenger.revision,
                     schedule_seed=secrets.token_hex(16),
-                    pairs_per_env=cfg.duel_pairs_per_env,
-                    min_discordant=cfg.duel_min_discordant,
-                    alpha=alpha,
+                    alpha=cfg.alpha,
+                    delta_p=cfg.delta_p,
+                    env_weights=env_weights,
                     started_block=block,
                 )
                 log.info(f"duel: champion {champ.model}@{champ.revision} vs uid{registered.uid} "
-                         f"{challenger.model}@{challenger.revision} alpha={alpha:.4g}")
-                result = await _run_fixed_duel(store, chain, _champion_miner(champ), king_slot,
-                                               challenger, chal_slot, envs, cfg, duel, stop)
+                         f"{challenger.model}@{challenger.revision} "
+                         f"alpha={cfg.alpha:.3g} delta_p={cfg.delta_p:.3g} "
+                         f"p_star={0.5 + cfg.delta_p:.3g}")
+                result = await _run_duel(store, chain, _champion_miner(champ), king_slot,
+                                         challenger, chal_slot, envs, cfg, duel, stop)
                 if result.status == "champion_slot_dead":
                     await _safe_teardown(king_slot, "champion-slot-dead")
                     state.king_slot = None
@@ -806,6 +985,17 @@ async def run(cfg: Config, chain: Chain, slots: list[VllmSlots] | None = None):
                 # state.king_slot is the new slot for any subsequent failure.
                 snapshot = await poll_backup(chal_slot) if s3_configs else None
                 refs = (snapshot or {}).get("refs") or []
+                # Re-list-and-re-pin again immediately before commit. poll_backup
+                # is a 1-5s HTTP call; an on-chain rotation in that window would
+                # otherwise let us commit a stale artifact identity. Repeating the
+                # check here closes the window. Identity rotations take ~36s, so
+                # the residual window between this check and `set_champion` is
+                # negligible.
+                fresh2 = await chain.list_miners()
+                if not await _registered_artifact_alive(s3_configs, fresh2, registered, challenger.revision):
+                    log.warning(f"verdict skipped post-poll: challenger uid{registered.uid}@{registered.revision} identity changed")
+                    state.attempted.add((registered.model, registered.revision))
+                    continue
                 new_art = artifact_id(challenger.model, challenger.revision)
                 new_champ = Champion(
                     artifact_id=new_art,
@@ -830,6 +1020,10 @@ async def run(cfg: Config, chain: Chain, slots: list[VllmSlots] | None = None):
                 state.attempted.clear()
                 if old_slot is not None:
                     await _safe_teardown(old_slot, "old-champion-promoted")
+                # The prefetch was for the previous reign's queue[1]; under the
+                # new champion the queue is recomputed and that miner may be
+                # filtered out. Discard.
+                await _consume_prefetch(state, expected=None)
                 ok = await _publish_champion(store, chain, cfg, new_champ)
                 log.info(f"DETHRONE: {champ.model}@{champ.revision} -> uid {registered.uid}"
                          + ("" if ok else " (publish deferred)"))
@@ -841,6 +1035,14 @@ async def run(cfg: Config, chain: Chain, slots: list[VllmSlots] | None = None):
         retirement.cancel()
         try: await retirement
         except (asyncio.CancelledError, Exception): pass
+        if state.prefetch_task is not None:
+            state.prefetch_task.cancel()
+            try: prefetched = await state.prefetch_task
+            except (asyncio.CancelledError, Exception): prefetched = None
+            if prefetched is not None:
+                await _safe_teardown(prefetched, "shutdown-prefetch")
+            state.prefetch_task = None
+            state.next_challenger = None
         if state.king_slot is not None:
             await _safe_teardown(state.king_slot, "shutdown-king")
         for s in slots:

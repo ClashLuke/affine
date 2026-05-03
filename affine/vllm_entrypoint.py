@@ -22,7 +22,7 @@ from .backup import S3Config, restore_refs
 
 log = logging.getLogger(__name__)
 
-REQUIRED_FLAGS = ("--trust-remote-code=False", "--load-format=safetensors")
+REQUIRED_FLAGS = ("--no-trust-remote-code", "--load-format=safetensors")
 DEFAULT_SIDECAR_PORT = 8001
 # Read once at module load — re-reading per request would let an env-var rotation
 # silently change the timeout in flight.
