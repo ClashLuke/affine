@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections.abc import Iterable
 import json
 import math
 import os
@@ -36,6 +37,7 @@ class Config:
     provision_timeout: int = 900          # seconds to wait for a vLLM slot to become /v1/models ready
     dry_run: bool = False
     log_level: str = "INFO"
+    model_skiplist: tuple[str, ...] = ()
     environments: tuple[EnvSpec, ...] = ()
 
     @classmethod
@@ -57,6 +59,7 @@ class Config:
             provision_timeout=int(os.getenv("AFFINE_PROVISION_TIMEOUT", "900")),
             dry_run=_truthy_env("AFFINE_DRY_RUN"),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
+            model_skiplist=parse_model_skiplist(os.getenv("AFFINE_MODEL_SKIPLIST", "")),
             environments=_default_environments(),
         )
         spec = os.getenv("AFFINE_CONFIG_SPEC", "").strip()
@@ -148,6 +151,9 @@ def _apply_json_overrides(cfg: Config, raw: dict) -> Config:
             raise TypeError(f"config key {f.name!r}: expected float, got {type(v).__name__}={v!r}")
         if f.type == "str" and not isinstance(v, str):
             raise TypeError(f"config key {f.name!r}: expected str, got {type(v).__name__}={v!r}")
+        if f.name == "model_skiplist":
+            overrides[f.name] = normalize_model_skiplist(v)
+            continue
         overrides[f.name] = type(getattr(cfg, f.name))(v)
     return replace(cfg, environments=_apply_env_overrides(cfg.environments, raw), **overrides)
 
@@ -208,6 +214,7 @@ def _validate(cfg: Config) -> None:
     if cfg.alpha_start > cfg.alpha_final:
         raise ValueError(f"alpha_start ({cfg.alpha_start}) must be <= alpha_final ({cfg.alpha_final})")
     _validate_log_level(cfg.log_level)
+    _validate_model_skiplist(cfg.model_skiplist)
     if not cfg.environments:
         raise ValueError("environments must not be empty")
     seen: set[str] = set()
@@ -238,6 +245,33 @@ _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 def _validate_log_level(level: str) -> None:
     if level not in _LOG_LEVELS:
         raise ValueError(f"LOG_LEVEL must be one of {sorted(_LOG_LEVELS)}, got {level!r}")
+
+
+def parse_model_skiplist(raw: str) -> tuple[str, ...]:
+    return normalize_model_skiplist(raw.replace("\n", ",").split(","))
+
+
+def normalize_model_skiplist(raw: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(raw, str):
+        raise TypeError("model_skiplist must be a list of model ids, not a string")
+    if not isinstance(raw, Iterable):
+        raise TypeError(f"model_skiplist must be iterable, got {type(raw).__name__}")
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            raise TypeError(f"model_skiplist entries must be strings, got {type(item).__name__}")
+        model = item.strip()
+        if model and model not in seen:
+            out.append(model)
+            seen.add(model)
+    return tuple(out)
+
+
+def _validate_model_skiplist(skiplist: tuple[str, ...]) -> None:
+    for model in skiplist:
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError(f"model_skiplist entries must be non-empty strings, got {model!r}")
 
 
 _GENERATION_KEYS = frozenset({

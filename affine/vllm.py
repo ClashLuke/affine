@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -138,7 +139,7 @@ def _vllm_launch_spec(*, model: str, revision: str, source: str,
         # Belt-and-suspenders code-execution guards. Asserted in
         # vllm_entrypoint.py before launch; both must survive any future
         # refactor untouched.
-        "--trust-remote-code=False",
+        "--no-trust-remote-code",
         "--load-format=safetensors",
         "--enable-prefix-caching",
         "--enable-chunked-prefill",
@@ -166,7 +167,7 @@ def _vllm_launch_spec(*, model: str, revision: str, source: str,
     for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
         if v := os.environ.get(k):
             env[k] = v
-    commands = ["python", "-m", "affine.vllm_entrypoint"]
+    commands = ["python3", "-m", "affine.vllm_entrypoint"]
     args = [
         "--source", source,
         "--model", model,
@@ -723,6 +724,7 @@ class LiumSlots(VllmSlots):
             tag = suffix
         else:
             image, tag = self._image, "latest"
+        command = shlex.join(list(spec["commands"]) + list(spec["args"]))
         body: dict[str, Any] = {
             "name": name,
             "docker_image": image,
@@ -730,7 +732,8 @@ class LiumSlots(VllmSlots):
             "category": "UBUNTU",
             "internal_ports": [8000, 8001],
             "environment": dict(spec["env"]),
-            "entrypoint": list(spec["commands"]) + list(spec["args"]),
+            "entrypoint": "sh",
+            "startup_commands": shlex.join(["-c", command]),
             "is_temporary": True,
             "container_start_immediately": True,
             "verify_ssh_connection": False,

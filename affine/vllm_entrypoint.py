@@ -174,10 +174,17 @@ def main() -> int:
         _model_dir = dest
         _restore_done.set()
     else:
+        ignore_patterns = [
+            p.strip() for p in os.getenv(
+                "AFFINE_HF_IGNORE_PATTERNS", "original/*,metal/*",
+            ).split(",")
+            if p.strip()
+        ]
         log.info(f"snapshot_download: {args.model}@{args.revision} -> {dest}")
         snapshot_download(
             repo_id=args.model, revision=args.revision, local_dir=str(dest),
             token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"),
+            ignore_patterns=ignore_patterns or None,
         )
         _model_dir = dest
         # No restore happened, but the wait flag must still be set so a /setup

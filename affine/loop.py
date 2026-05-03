@@ -318,6 +318,18 @@ def _is_current_champion_registration(m: Miner, champ: Champion, artifact_alive:
     return (m.model, m.revision) == (champ.model, champ.revision)
 
 
+def _baseline_model(cfg: Config) -> str:
+    explicit = os.getenv("AFFINE_BASELINE_MODEL", "").strip()
+    if explicit:
+        if explicit in cfg.model_skiplist:
+            raise RuntimeError(f"AFFINE_BASELINE_MODEL={explicit!r} is skiplisted")
+        return explicit
+    for model in BASELINE_MODELS:
+        if model not in cfg.model_skiplist:
+            return model
+    raise RuntimeError("all baseline models are skiplisted")
+
+
 async def _bootstrap_champion(
     store: Store,
     s3_configs: list[S3Config],
@@ -329,9 +341,9 @@ async def _bootstrap_champion(
     """Bootstrap a fresh champion. The slot's sidecar takes over backup
     durability; this function only commits the in-DB champion and provisions
     the king slot. provision() POSTs /setup to kick off the upload."""
-    baseline_model = os.getenv("AFFINE_BASELINE_MODEL", BASELINE_MODELS[0]).strip() or BASELINE_MODELS[0]
+    baseline_model = _baseline_model(cfg)
     baseline_revision = os.getenv("AFFINE_BASELINE_REVISION", "").strip()
-    miners = await chain.list_miners()
+    miners = [m for m in await chain.list_miners() if m.model not in cfg.model_skiplist]
     registered = next(
         (m for m in miners
          if m.model == baseline_model and (not baseline_revision or m.revision == baseline_revision)),
@@ -721,7 +733,8 @@ async def run(cfg: Config, chain: Chain, slots: list[VllmSlots] | None = None):
 
             queue = sorted(
                 (m for m in all_miners
-                 if not _is_current_champion_registration(m, champ, champion_artifact_alive)
+                 if m.model not in cfg.model_skiplist
+                 and not _is_current_champion_registration(m, champ, champion_artifact_alive)
                  and (m.model, m.revision) not in state.attempted),
                 key=lambda m: (m.block, _tiebreak(m)),
             )

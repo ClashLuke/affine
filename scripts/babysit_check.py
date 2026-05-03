@@ -42,6 +42,7 @@ def _prime_shadow_env() -> None:
 _prime_shadow_env()
 
 from affine.paired import PairCounts, pair_p_value
+from affine.config import parse_model_skiplist
 
 
 PROBE_WINDOW_S = 1800
@@ -105,25 +106,10 @@ def _pids() -> list[int]:
 
 def _sqlite_db_path() -> Path | None:
     shadow = REPO / ".shadow" / "affine.sqlite3"
-    pids = _pids()
-    if pids and shadow.exists():
-        return shadow
     env = os.environ.get("AFFINE_DB_PATH")
     if env and Path(env).exists():
         return Path(env)
-    candidates = [REPO / ".affine" / "affine.sqlite3", shadow]
-    existing = [p for p in candidates if p.exists()]
-    if existing:
-        return max(existing, key=_sqlite_mtime)
-    return None
-
-
-def _sqlite_mtime(path: Path) -> float:
-    return max(
-        (p.stat().st_mtime for p in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm"))
-         if p.exists()),
-        default=0.0,
-    )
+    return shadow if shadow.exists() else None
 
 
 def _counts(db: sqlite3.Connection, duel_id: int) -> PairCounts:
@@ -146,6 +132,7 @@ def main() -> int:
     pids = _pids()
     problems: list[str] = []
     warns: list[str] = []
+    model_skiplist = parse_model_skiplist(os.environ.get("AFFINE_MODEL_SKIPLIST", ""))
     if not pids:
         problems.append("no validator process running")
     elif len(pids) > 1:
@@ -173,6 +160,8 @@ def main() -> int:
         samples = db.execute("SELECT * FROM samples").fetchall()
         if champ is None:
             problems.append("no SQLite champion")
+        elif str(champ["model"]) in model_skiplist:
+            problems.append(f"skiplisted champion active: {champ['model']}")
 
     status = "OK" if not problems and not warns else ("WARN" if not problems else "FAIL")
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
