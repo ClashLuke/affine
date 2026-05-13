@@ -4,12 +4,11 @@ import hashlib
 import json
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
-
-from .paired import PairCounts
 
 
 def now() -> int:
@@ -52,27 +51,54 @@ class DuelRecord:
     challenger_revision: str
     schedule_seed: str
     alpha: float
-    delta_p: float
-    env_weights: dict[str, float]
+    delta_theta: float
+    pi_json: str
     status: str
 
 
 @dataclass(frozen=True)
-class PairSample:
-    duel_id: int
-    env: str
+class CellObservation:
+    """One (miner, env, task_id) Bernoulli outcome.
+
+    Replaces the matched-pair `PairSample`. Each cell is an independent
+    observation; the IRT model joins them at fit time without requiring two
+    miners to share a task_id.
+    """
+    observation_id: str
+    miner_artifact_id: str
+    env_id: str
+    env_version: str
     task_id: int
-    iter_idx: int
-    launch_seq: int
-    block: int
-    champion_pass: int
-    challenger_pass: int
-    champion_latency: float
-    challenger_latency: float
-    champion_delivered: int
-    challenger_delivered: int
-    champion_tokens: int
-    challenger_tokens: int
+    task_spec_hash: str
+    grader_hash: str
+    serving_hash: str
+    raw_outcome: int
+    outcome: int
+    gated: int
+    latency_s: float
+    tokens: int
+    observed_at: int
+    collection_context: str
+    sampler_policy_hash: str
+
+
+@dataclass(frozen=True)
+class Cell:
+    """Canonical-view row: (miner, env, task) → outcome with timing.
+
+    The IRT fit consumes these; the underlying observation_id and versioning
+    metadata stay in cell_observations for audit.
+    """
+    miner_artifact_id: str
+    env_id: str
+    task_id: int
+    outcome: int
+    latency_s: float
+    tokens: int
+    observed_at: int
+
+
+ArtKey = tuple[str, str]
 
 
 class Store:
@@ -133,35 +159,60 @@ class Store:
                 challenger_revision TEXT NOT NULL,
                 schedule_seed TEXT NOT NULL,
                 alpha REAL NOT NULL,
-                delta_p REAL NOT NULL,
-                env_weights_json TEXT NOT NULL,
+                delta_theta REAL NOT NULL,
+                pi_json TEXT NOT NULL,
+                evaluation_version TEXT NOT NULL,
                 status TEXT NOT NULL,
-                counts_json TEXT,
-                env_cs_json TEXT,
-                l_mu REAL,
-                u_mu REAL,
+                cells_collected INTEGER,
+                delta_theta_observed REAL,
+                se_theta REAL,
+                rating_diff_diagnostic REAL,
+                decision_statistic TEXT NOT NULL DEFAULT 'theta',
+                calibration_snapshot_hash TEXT,
                 started_block INTEGER NOT NULL,
                 finished_block INTEGER,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS samples (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                duel_id INTEGER NOT NULL REFERENCES duels(id) ON DELETE CASCADE,
-                env TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS cell_observations (
+                observation_id TEXT PRIMARY KEY,
+                miner_artifact_id TEXT NOT NULL,
+                env_id TEXT NOT NULL,
+                env_version TEXT NOT NULL,
                 task_id INTEGER NOT NULL,
-                iter_idx INTEGER NOT NULL,
-                launch_seq INTEGER NOT NULL,
-                block INTEGER NOT NULL,
-                champion_pass INTEGER NOT NULL,
-                challenger_pass INTEGER NOT NULL,
-                champion_latency REAL NOT NULL,
-                challenger_latency REAL NOT NULL,
-                champion_delivered INTEGER NOT NULL,
-                challenger_delivered INTEGER NOT NULL,
-                champion_tokens INTEGER NOT NULL,
-                challenger_tokens INTEGER NOT NULL,
-                UNIQUE(duel_id, launch_seq)
+                task_spec_hash TEXT NOT NULL,
+                grader_hash TEXT NOT NULL,
+                serving_hash TEXT NOT NULL,
+                raw_outcome INTEGER NOT NULL CHECK (raw_outcome IN (0,1)),
+                outcome INTEGER NOT NULL CHECK (outcome IN (0,1)),
+                gated INTEGER NOT NULL CHECK (gated IN (0,1)),
+                latency_s REAL NOT NULL CHECK (latency_s >= 0),
+                tokens INTEGER NOT NULL CHECK (tokens >= 0),
+                observed_at INTEGER NOT NULL,
+                collection_context TEXT NOT NULL,
+                sampler_policy_hash TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS cells_artifact_env
+                ON cell_observations (miner_artifact_id, env_id, env_version);
+            CREATE INDEX IF NOT EXISTS cells_observed_at
+                ON cell_observations (observed_at);
+            CREATE TABLE IF NOT EXISTS env_state (
+                env_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                env_version TEXT NOT NULL,
+                task_spec_hash TEXT NOT NULL,
+                grader_hash TEXT NOT NULL,
+                serving_hash TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS attempted_artifacts (
+                miner_artifact_id TEXT NOT NULL,
+                evaluation_version TEXT NOT NULL,
+                model TEXT NOT NULL,            -- audit columns; identity is miner_artifact_id
+                revision TEXT NOT NULL,
+                archive_snapshot_hash TEXT,     -- D15 of eval-target.md (drift replay)
+                first_observed_at INTEGER NOT NULL,
+                PRIMARY KEY (miner_artifact_id, evaluation_version)
             );
             CREATE TABLE IF NOT EXISTS publications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,30 +228,49 @@ class Store:
             );
             """
         )
-        for table, col in (("champion", "backup_manifest"), ("champion", "backup_prefix"),
-                           ("backups", "prefix"), ("backups", "manifest_sha256"),
-                           ("duels", "min_discordant"), ("duels", "pairs_per_env"),
-                           ("duels", "precision"), ("duels", "p_value"),
-                           ("duels", "log_e_final"), ("duels", "cs_lower"), ("duels", "cs_upper")):
+        # Legacy schema cleanup: drop columns that don't exist in the new design.
+        for table, col in (
+            ("champion", "backup_manifest"), ("champion", "backup_prefix"),
+            ("backups", "prefix"), ("backups", "manifest_sha256"),
+            ("duels", "min_discordant"), ("duels", "pairs_per_env"),
+            ("duels", "precision"), ("duels", "p_value"),
+            ("duels", "log_e_final"), ("duels", "cs_lower"), ("duels", "cs_upper"),
+        ):
             cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})").fetchall()}
             if col in cols:
                 self.db.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+        # Migrate old `samples` table into cells if present (rename + emit cells).
+        tables = {r["name"] for r in self.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "samples" in tables and "legacy_samples" not in tables:
+            self.db.execute("ALTER TABLE samples RENAME TO legacy_samples")
+        # Ensure duels has the new columns even on legacy DBs.
         duel_cols = {r["name"] for r in self.db.execute("PRAGMA table_info(duels)").fetchall()}
-        if "delta_p" not in duel_cols:
-            self.db.execute("ALTER TABLE duels ADD COLUMN delta_p REAL NOT NULL DEFAULT 0.05")
-        if "env_weights_json" not in duel_cols:
-            self.db.execute("ALTER TABLE duels ADD COLUMN env_weights_json TEXT NOT NULL DEFAULT '{}'")
-        if "env_cs_json" not in duel_cols:
-            self.db.execute("ALTER TABLE duels ADD COLUMN env_cs_json TEXT")
-        if "l_mu" not in duel_cols:
-            self.db.execute("ALTER TABLE duels ADD COLUMN l_mu REAL")
-        if "u_mu" not in duel_cols:
-            self.db.execute("ALTER TABLE duels ADD COLUMN u_mu REAL")
-        sample_cols = {r["name"] for r in self.db.execute("PRAGMA table_info(samples)").fetchall()}
-        if "launch_seq" not in sample_cols:
-            self.db.execute("ALTER TABLE samples ADD COLUMN launch_seq INTEGER NOT NULL DEFAULT 0")
+        if "delta_theta" not in duel_cols:
+            self.db.execute("ALTER TABLE duels ADD COLUMN delta_theta REAL NOT NULL DEFAULT 0.4")
+        if "pi_json" not in duel_cols:
+            self.db.execute("ALTER TABLE duels ADD COLUMN pi_json TEXT NOT NULL DEFAULT '{}'")
+        if "evaluation_version" not in duel_cols:
+            self.db.execute(
+                "ALTER TABLE duels ADD COLUMN evaluation_version TEXT NOT NULL DEFAULT ''"
+            )
+        if "cells_collected" not in duel_cols:
+            self.db.execute("ALTER TABLE duels ADD COLUMN cells_collected INTEGER")
+        if "delta_theta_observed" not in duel_cols:
+            self.db.execute("ALTER TABLE duels ADD COLUMN delta_theta_observed REAL")
+        if "se_theta" not in duel_cols:
+            self.db.execute("ALTER TABLE duels ADD COLUMN se_theta REAL")
+        if "rating_diff_diagnostic" not in duel_cols:
+            self.db.execute("ALTER TABLE duels ADD COLUMN rating_diff_diagnostic REAL")
+        if "decision_statistic" not in duel_cols:
+            self.db.execute("ALTER TABLE duels ADD COLUMN decision_statistic TEXT NOT NULL DEFAULT 'theta'")
+        if "calibration_snapshot_hash" not in duel_cols:
+            self.db.execute("ALTER TABLE duels ADD COLUMN calibration_snapshot_hash TEXT")
         self.db.execute("DELETE FROM backups WHERE status='staging'")
         self.db.commit()
+
+    # -- champion / backup --
 
     def champion(self) -> Champion | None:
         row = self.db.execute("SELECT * FROM champion WHERE id = 1").fetchone()
@@ -263,7 +333,6 @@ class Store:
                 """,
                 (artifact_id, model, revision, manifest_key, ts, ts),
             )
-            # refs only append per artifact, so new key covers old prefixes; no S3 GC needed.
             db.execute(
                 "DELETE FROM backups WHERE artifact_id=? AND manifest_key<>?",
                 (artifact_id, manifest_key),
@@ -308,6 +377,8 @@ class Store:
         with self.tx() as db:
             db.execute("DELETE FROM backups WHERE manifest_key = ?", (manifest_key,))
 
+    # -- duel records --
+
     def create_duel(
         self,
         *,
@@ -318,109 +389,249 @@ class Store:
         challenger_revision: str,
         schedule_seed: str,
         alpha: float,
-        delta_p: float,
-        env_weights: dict[str, float],
+        delta_theta: float,
+        pi: dict[str, float],
+        evaluation_version: str,
         started_block: int,
     ) -> DuelRecord:
         ts = now()
         challenger_art = artifact_id(challenger_model, challenger_revision)
-        weights_json = json.dumps(env_weights, sort_keys=True)
+        pi_json = json.dumps(pi, sort_keys=True)
         with self.tx() as db:
             cur = db.execute(
                 """
                 INSERT INTO duels(champion_artifact_id, challenger_artifact_id, challenger_uid,
                                   challenger_hotkey, challenger_model, challenger_revision,
-                                  schedule_seed, alpha, delta_p, env_weights_json,
+                                  schedule_seed, alpha, delta_theta, pi_json, evaluation_version,
                                   status, started_block, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
                 """,
                 (champion.artifact_id, challenger_art, challenger_uid, challenger_hotkey,
-                 challenger_model, challenger_revision, schedule_seed, alpha, delta_p,
-                 weights_json, started_block, ts, ts),
+                 challenger_model, challenger_revision, schedule_seed, alpha, delta_theta,
+                 pi_json, evaluation_version, started_block, ts, ts),
             )
             duel_id = int(cur.lastrowid)
         return DuelRecord(duel_id, champion.artifact_id, challenger_art, challenger_uid,
                           challenger_hotkey, challenger_model, challenger_revision,
-                          schedule_seed, alpha, delta_p, dict(env_weights), "running")
-
-    def add_samples(self, samples: list[PairSample]) -> None:
-        if not samples:
-            return
-        ts = now()
-        with self.tx() as db:
-            db.executemany(
-                """
-                INSERT INTO samples(duel_id, env, task_id, iter_idx, launch_seq, block,
-                    champion_pass, challenger_pass, champion_latency, challenger_latency,
-                    champion_delivered, challenger_delivered, champion_tokens, challenger_tokens)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [(s.duel_id, s.env, s.task_id, s.iter_idx, s.launch_seq, s.block,
-                  s.champion_pass, s.challenger_pass,
-                  s.champion_latency, s.challenger_latency,
-                  s.champion_delivered, s.challenger_delivered, s.champion_tokens,
-                  s.challenger_tokens) for s in samples],
-            )
-            db.execute("UPDATE duels SET updated_at = ? WHERE id = ?", (ts, samples[0].duel_id))
-
-    def counts(self, duel_id: int) -> PairCounts:
-        rows = self.db.execute(
-            """
-            SELECT champion_pass, challenger_pass
-            FROM samples
-            WHERE duel_id = ? AND champion_delivered = 1 AND challenger_delivered = 1
-            """,
-            (duel_id,),
-        ).fetchall()
-        counts = PairCounts()
-        for r in rows:
-            counts = counts.add(int(r["champion_pass"]), int(r["challenger_pass"]))
-        return counts
-
-    def per_env_counts(self, duel_id: int) -> dict[str, PairCounts]:
-        rows = self.db.execute(
-            """
-            SELECT env, champion_pass, challenger_pass
-            FROM samples
-            WHERE duel_id = ? AND champion_delivered = 1 AND challenger_delivered = 1
-            """,
-            (duel_id,),
-        ).fetchall()
-        out: dict[str, PairCounts] = {}
-        for r in rows:
-            env = str(r["env"])
-            out[env] = out.get(env, PairCounts()).add(
-                int(r["champion_pass"]), int(r["challenger_pass"])
-            )
-        return out
+                          schedule_seed, alpha, delta_theta, pi_json, "running")
 
     def finish_duel(
         self,
         duel_id: int,
         status: str,
-        counts: PairCounts,
-        l_mu: float | None,
-        u_mu: float | None,
-        env_cs_payload: dict[str, dict] | None,
+        cells_collected: int,
+        delta_theta_observed: float | None,
+        se_theta: float | None,
+        rating_diff_diagnostic: float | None,
+        calibration_snapshot_hash: str | None,
         finished_block: int | None,
     ) -> None:
-        counts_json = json.dumps(counts.__dict__, sort_keys=True)
-        env_cs_json = json.dumps(env_cs_payload, sort_keys=True) if env_cs_payload else None
         with self.tx() as db:
             db.execute(
                 """
                 UPDATE duels
-                SET status = ?, counts_json = ?, env_cs_json = ?, l_mu = ?, u_mu = ?,
+                SET status = ?, cells_collected = ?, delta_theta_observed = ?, se_theta = ?,
+                    rating_diff_diagnostic = ?, calibration_snapshot_hash = ?,
                     finished_block = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (status, counts_json, env_cs_json, l_mu, u_mu,
+                (status, cells_collected, delta_theta_observed, se_theta,
+                 rating_diff_diagnostic, calibration_snapshot_hash,
                  finished_block, now(), duel_id),
             )
 
     def abort_running_duels(self) -> None:
         with self.tx() as db:
             db.execute("UPDATE duels SET status='aborted_crash', updated_at=? WHERE status='running'", (now(),))
+
+    # -- cell observations --
+
+    def add_observation(self, obs: CellObservation) -> None:
+        with self.tx() as db:
+            db.execute(
+                """
+                INSERT INTO cell_observations(
+                    observation_id, miner_artifact_id, env_id, env_version, task_id,
+                    task_spec_hash, grader_hash, serving_hash,
+                    raw_outcome, outcome, gated, latency_s, tokens, observed_at,
+                    collection_context, sampler_policy_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (obs.observation_id, obs.miner_artifact_id, obs.env_id, obs.env_version,
+                 obs.task_id, obs.task_spec_hash, obs.grader_hash, obs.serving_hash,
+                 obs.raw_outcome, obs.outcome, obs.gated, obs.latency_s, obs.tokens,
+                 obs.observed_at, obs.collection_context, obs.sampler_policy_hash),
+            )
+
+    def cells_view(
+        self,
+        env_set: set[str],
+        env_version: dict[str, str],
+        task_spec_hash: dict[str, str],
+        grader_hash: dict[str, str],
+        serving_hash: dict[str, str],
+        *,
+        rule: str = "first",
+        exclude_artifacts: set[str] | None = None,
+    ) -> list[Cell]:
+        """Materialize the canonical view as a list of `Cell` rows.
+
+        `rule` is "first" (default; first-observation per (miner, env, task))
+        or "latest". Filters by current `(env_version, task_spec_hash,
+        grader_hash, serving_hash)` per env *before* aggregation, so old-version
+        observations can't shadow current ones (D1).
+        """
+        if rule not in {"first", "latest"}:
+            raise ValueError(f"unknown view rule: {rule!r}")
+        if not env_set:
+            return []
+        order = "ASC" if rule == "first" else "DESC"
+        placeholders = ",".join("?" * len(env_set))
+        envs = sorted(env_set)
+        sql = f"""
+            SELECT miner_artifact_id, env_id, task_id, outcome, latency_s, tokens, observed_at
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY miner_artifact_id, env_id, task_id
+                           ORDER BY observed_at {order}, observation_id {order}
+                       ) AS rn
+                FROM cell_observations
+                WHERE env_id IN ({placeholders})
+            )
+            WHERE rn = 1
+        """
+        rows = self.db.execute(sql, envs).fetchall()
+        cur_env_version = env_version
+        cur_task = task_spec_hash
+        cur_grader = grader_hash
+        cur_serving = serving_hash
+        excl = exclude_artifacts or set()
+        out: list[Cell] = []
+        # Re-filter by per-env current versioning (the canonical view's full
+        # filter is on the underlying observation rows; we re-check here so
+        # the view stays consistent even if the SELECT retrieved a stale row
+        # for a (miner, env, task) the current version doesn't recognize).
+        # In practice cell_observations stores env_version etc. per row, and
+        # we want only observations whose versioning matches current. Pull
+        # the full row and filter:
+        rows = self.db.execute(
+            f"""
+            SELECT miner_artifact_id, env_id, env_version, task_id,
+                   task_spec_hash, grader_hash, serving_hash,
+                   outcome, latency_s, tokens, observed_at, observation_id
+            FROM (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY miner_artifact_id, env_id, task_id
+                           ORDER BY observed_at {order}, observation_id {order}
+                       ) AS rn
+                FROM cell_observations
+                WHERE env_id IN ({placeholders})
+            )
+            WHERE rn = 1
+            """,
+            envs,
+        ).fetchall()
+        for r in rows:
+            env = r["env_id"]
+            if r["miner_artifact_id"] in excl:
+                continue
+            if cur_env_version.get(env) != r["env_version"]:
+                continue
+            if cur_task.get(env) != r["task_spec_hash"]:
+                continue
+            if cur_grader.get(env) != r["grader_hash"]:
+                continue
+            if cur_serving.get(env) != r["serving_hash"]:
+                continue
+            out.append(Cell(
+                miner_artifact_id=r["miner_artifact_id"],
+                env_id=env,
+                task_id=int(r["task_id"]),
+                outcome=int(r["outcome"]),
+                latency_s=float(r["latency_s"]),
+                tokens=int(r["tokens"]),
+                observed_at=int(r["observed_at"]),
+            ))
+        return out
+
+    # -- env lifecycle (D10, simplified for MVP) --
+
+    def env_state(self, env_id: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT * FROM env_state WHERE env_id = ?", (env_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {k: row[k] for k in row.keys()}
+
+    def upsert_env_state(
+        self,
+        env_id: str,
+        state: str,
+        env_version: str,
+        task_spec_hash: str,
+        grader_hash: str,
+        serving_hash: str,
+    ) -> None:
+        ts = now()
+        with self.tx() as db:
+            db.execute(
+                """
+                INSERT INTO env_state(env_id, state, env_version, task_spec_hash,
+                                      grader_hash, serving_hash, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(env_id) DO UPDATE SET
+                    state=excluded.state,
+                    env_version=excluded.env_version,
+                    task_spec_hash=excluded.task_spec_hash,
+                    grader_hash=excluded.grader_hash,
+                    serving_hash=excluded.serving_hash,
+                    updated_at=excluded.updated_at
+                """,
+                (env_id, state, env_version, task_spec_hash, grader_hash, serving_hash, ts),
+            )
+
+    def all_env_states(self) -> dict[str, dict]:
+        rows = self.db.execute("SELECT * FROM env_state").fetchall()
+        return {r["env_id"]: {k: r[k] for k in r.keys()} for r in rows}
+
+    # -- cummax: persistent attempted set --
+
+    def attempted_artifacts(self, evaluation_version: str) -> set[str]:
+        """Return set of `miner_artifact_id`s already attempted under this
+        evaluation_version. Identity is the full content hash (D9 of
+        eval-target.md), not (model, revision) — different tokenizer /
+        adapter / decoding configs are different artifacts."""
+        rows = self.db.execute(
+            "SELECT miner_artifact_id FROM attempted_artifacts WHERE evaluation_version = ?",
+            (evaluation_version,),
+        ).fetchall()
+        return {r["miner_artifact_id"] for r in rows}
+
+    def mark_attempted(
+        self,
+        miner_artifact_id: str,
+        evaluation_version: str,
+        *,
+        model: str,
+        revision: str,
+        archive_snapshot_hash: str | None = None,
+    ) -> None:
+        with self.tx() as db:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO attempted_artifacts(
+                    miner_artifact_id, evaluation_version, model, revision,
+                    archive_snapshot_hash, first_observed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (miner_artifact_id, evaluation_version, model, revision,
+                 archive_snapshot_hash, now()),
+            )
+
+    # -- publications (unchanged) --
 
     def publication_intent(self, artifact: str, action: str, uid: int | None,
                            hotkey: str | None, dry_run: bool) -> int:
@@ -470,6 +681,10 @@ class Store:
                 "UPDATE publications SET status=?, attempts=attempts+1, updated_at=? WHERE id=?",
                 (status, now(), pub_id),
             )
+
+
+def make_observation_id() -> str:
+    return uuid.uuid4().hex
 
 
 def _champion(row: sqlite3.Row) -> Champion:

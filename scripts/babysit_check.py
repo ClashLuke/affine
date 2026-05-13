@@ -10,6 +10,7 @@ Exits 0 clean, 1 if any FAIL.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -41,7 +42,7 @@ def _prime_shadow_env() -> None:
 
 _prime_shadow_env()
 
-from affine.paired import PairCounts, pair_anytime_p
+from affine.paired import PairCounts, decide_dethrone, discordant_weights
 from affine.config import parse_model_skiplist
 
 
@@ -56,8 +57,10 @@ VERDICT_COLS = (
     ("Verdict", 18, "<"),
     ("W-L",     7,  ">"),
     ("Ties",    5,  ">"),
-    ("p",       7,  ">"),
-    ("α",  7,  ">"),
+    ("L_mu",    6,  ">"),
+    ("U_mu",    6,  ">"),
+    ("p*",      6,  ">"),
+    ("α",       6,  ">"),
     ("Age",     5,  ">"),
 )
 
@@ -81,8 +84,9 @@ def _fmt_row(cells: list[str]) -> str:
     return "  " + " ".join(f"{c:{a}{w}}" for c, (_, w, a) in zip(cells, VERDICT_COLS))
 
 
-def _verdict_row(duel, counts: PairCounts, now: float) -> list[str]:
-    p = pair_anytime_p(counts.challenger_only, counts.discordant)
+def _verdict_row(duel, counts: PairCounts, l_mu: float | None, u_mu: float | None, now: float) -> list[str]:
+    delta_p = float(duel["delta_p"]) if duel["delta_p"] is not None else 0.05
+    p_star = 0.5 + delta_p
     return [
         str(duel["challenger_uid"]),
         _trunc(str(duel["challenger_model"]), 28),
@@ -91,7 +95,9 @@ def _verdict_row(duel, counts: PairCounts, now: float) -> list[str]:
         _trunc(str(duel["status"]), 18),
         f"{counts.challenger_only}-{counts.champion_only}",
         str(counts.both_pass + counts.both_fail),
-        "——" if counts.discordant == 0 else f"{p:.2g}",
+        "——" if l_mu is None else f"{l_mu:.3f}",
+        "——" if u_mu is None else f"{u_mu:.3f}",
+        f"{p_star:.3f}",
         f"{float(duel['alpha']):.2g}",
         _age(now, float(duel["created_at"])),
     ]
@@ -112,19 +118,57 @@ def _sqlite_db_path() -> Path | None:
     return shadow if shadow.exists() else None
 
 
-def _counts(db: sqlite3.Connection, duel_id: int) -> PairCounts:
+def _per_env_counts(db: sqlite3.Connection, duel_id: int) -> dict[str, PairCounts]:
     rows = db.execute(
         """
-        SELECT champion_pass, challenger_pass
+        SELECT env, champion_pass, challenger_pass
         FROM samples
         WHERE duel_id=? AND champion_delivered=1 AND challenger_delivered=1
         """,
         (duel_id,),
     ).fetchall()
-    counts = PairCounts()
+    out: dict[str, PairCounts] = {}
     for r in rows:
-        counts = counts.add(int(r["champion_pass"]), int(r["challenger_pass"]))
-    return counts
+        env = str(r["env"])
+        out[env] = out.get(env, PairCounts()).add(
+            int(r["champion_pass"]), int(r["challenger_pass"])
+        )
+    return out
+
+
+def _total_counts(per_env: dict[str, PairCounts]) -> PairCounts:
+    total = PairCounts()
+    for c in per_env.values():
+        total = PairCounts(
+            challenger_only=total.challenger_only + c.challenger_only,
+            champion_only=total.champion_only + c.champion_only,
+            both_pass=total.both_pass + c.both_pass,
+            both_fail=total.both_fail + c.both_fail,
+        )
+    return total
+
+
+def _resolve_bounds(duel, per_env: dict[str, PairCounts]) -> tuple[float | None, float | None]:
+    """Stored l_mu/u_mu when present; else recompute live from per-env counts
+    using sample-mass weights (the production aggregator)."""
+    if duel["l_mu"] is not None and duel["u_mu"] is not None:
+        return float(duel["l_mu"]), float(duel["u_mu"])
+    try:
+        env_set = json.loads(duel["env_weights_json"]) if duel["env_weights_json"] else {}
+    except (TypeError, ValueError):
+        env_set = {}
+    if not env_set or not set(per_env) <= set(env_set):
+        return None, None
+    for e in env_set:
+        per_env.setdefault(e, PairCounts())
+    weights = discordant_weights(per_env)
+    alpha = float(duel["alpha"])
+    delta_p = float(duel["delta_p"]) if duel["delta_p"] is not None else 0.05
+    decision = decide_dethrone(
+        per_env, weights, p_star=0.5 + delta_p,
+        alpha_dethrone=alpha / 2.0, alpha_futility=alpha / 2.0,
+    )
+    return decision.L_mu, decision.U_mu
 
 
 def main() -> int:
@@ -188,7 +232,10 @@ def main() -> int:
             print(_fmt_row(header))
             print(_fmt_row(["-" * w for _, w, _ in VERDICT_COLS]))
             for d in duels[:VERDICT_QUEUE_LIMIT]:
-                print(_fmt_row(_verdict_row(d, _counts(db, int(d["id"])), now)))
+                per_env = _per_env_counts(db, int(d["id"]))
+                total = _total_counts(per_env)
+                l_mu, u_mu = _resolve_bounds(d, per_env)
+                print(_fmt_row(_verdict_row(d, total, l_mu, u_mu, now)))
 
     if samples:
         delivered = sum(1 for s in samples if s["champion_delivered"] and s["challenger_delivered"])

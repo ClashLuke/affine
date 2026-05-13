@@ -32,14 +32,31 @@ class Config:
     hotkey_name: str = "default"
     subtensor_endpoint: str = "finney"
     subtensor_fallback: str = "wss://lite.sub.latent.to:443"
-    dwell_batch: int = 512  # matched-task pairs kept in flight; saturates --max-num-seqs 1024 (2 streams per pair)
-    max_pairs_per_duel: int = 2000  # anytime-valid stopping budget; hold_inconclusive once cursor reaches this
     db_path: str = "./.affine/affine.sqlite3"
-    alpha: float = 0.05
-    delta_p: float = 0.05  # non-inferiority margin: dethrone null is mu <= 1/2 + delta_p
-    n_min_per_env: int = 1  # cold-start floor; UCB term drives steady-state revisits
-    score_lambda: float = 0.5  # sampler weighting: lambda * KL(dethrone) + (1-lambda) * uncertainty
-    provision_timeout: int = 900  # seconds to wait for a vLLM slot to become /v1/models ready
+    # IRT eval (notes/architecture.md, K=0 θ-MVP). δ_theta is on the
+    # latent skill scale (prior-SDs of θ ~ Normal(0,1)); 0.4 ≈ 0.4 SDs.
+    # The score-space rating R = logit(S) is computed for replay only;
+    # the decision tests θ_j − θ_i.
+    delta_theta: float = 0.4
+    irt_K: int = 0
+    irt_n_min_per_env: int = 1
+    irt_alpha_dethrone: float = 0.025
+    # Nominal futility spending budget; not a formal false-hold rate
+    # without an indifference margin κ_hold (deferred).
+    irt_beta_hold: float = 0.10
+    irt_look_interval_cells: int = 25
+    irt_look_max: int = 50
+    # Preflight gate on √Var(θ_i). 0.10 prior-SDs ≈ a tightly-pinned king.
+    champion_se_theta_max: float = 0.10
+    # Cold-start calibration sufficiency: refuse statistical dethrones
+    # until the calibration snapshot has at least these many distinct
+    # contributors and cells. Below the gate, only "first-crowning" /
+    # "calibration_needed" / "budget_hold_inconclusive" outcomes are valid.
+    calibration_min_miners: int = 3
+    calibration_min_cells_per_env: int = 30
+    pi_overrides: tuple[tuple[str, float], ...] = ()  # operator override; empty -> uniform
+    rho_overrides: tuple[tuple[str, float], ...] = ()  # default uniform over measurement envs
+    provision_timeout: int = 900
     dry_run: bool = False
     log_level: str = "INFO"
     model_skiplist: tuple[str, ...] = ()
@@ -51,13 +68,17 @@ class Config:
         cfg = cls(netuid=int(os.getenv("NETUID", "120")), wallet_name=os.getenv("BT_WALLET_COLD", "default"),
             hotkey_name=os.getenv("BT_WALLET_HOT", "default"), subtensor_endpoint=endpoint,
             subtensor_fallback=os.getenv("SUBTENSOR_FALLBACK", "wss://lite.sub.latent.to:443"),
-            dwell_batch=int(os.getenv("AFFINE_DWELL_BATCH", "512")),
-            max_pairs_per_duel=int(os.getenv("AFFINE_MAX_PAIRS_PER_DUEL", "2000")),
             db_path=os.getenv("AFFINE_DB_PATH", "./.affine/affine.sqlite3"),
-            alpha=float(os.getenv("AFFINE_ALPHA", "0.05")),
-            delta_p=float(os.getenv("AFFINE_DELTA_P", "0.05")),
-            n_min_per_env=int(os.getenv("AFFINE_N_MIN_PER_ENV", "1")),
-            score_lambda=float(os.getenv("AFFINE_SCORE_LAMBDA", "0.5")),
+            delta_theta=float(os.getenv("AFFINE_DELTA_THETA", "0.4")),
+            irt_K=int(os.getenv("AFFINE_IRT_K", "0")),
+            irt_n_min_per_env=int(os.getenv("AFFINE_IRT_N_MIN_PER_ENV", "1")),
+            irt_alpha_dethrone=float(os.getenv("AFFINE_IRT_ALPHA_DETHRONE", "0.025")),
+            irt_beta_hold=float(os.getenv("AFFINE_IRT_BETA_HOLD", "0.10")),
+            irt_look_interval_cells=int(os.getenv("AFFINE_IRT_LOOK_INTERVAL_CELLS", "25")),
+            irt_look_max=int(os.getenv("AFFINE_IRT_LOOK_MAX", "50")),
+            champion_se_theta_max=float(os.getenv("AFFINE_CHAMPION_SE_THETA_MAX", "0.10")),
+            calibration_min_miners=int(os.getenv("AFFINE_CALIBRATION_MIN_MINERS", "3")),
+            calibration_min_cells_per_env=int(os.getenv("AFFINE_CALIBRATION_MIN_CELLS_PER_ENV", "30")),
             provision_timeout=int(os.getenv("AFFINE_PROVISION_TIMEOUT", "900")), dry_run=_truthy_env("AFFINE_DRY_RUN"),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
             model_skiplist=parse_model_skiplist(os.getenv("AFFINE_MODEL_SKIPLIST", "")),
@@ -180,20 +201,28 @@ def _validate(cfg: Config) -> None:
     """Reject configs that would crash deeper in the stack with confusing errors.
     NaN/Inf passes through `<=`/`>=` (all comparisons against NaN are False), so
     we use math.isfinite explicitly."""
-    if cfg.dwell_batch <= 0:
-        raise ValueError(f"dwell_batch must be > 0, got {cfg.dwell_batch}")
-    if cfg.max_pairs_per_duel <= 0:
-        raise ValueError(f"max_pairs_per_duel must be > 0, got {cfg.max_pairs_per_duel}")
     if cfg.provision_timeout <= 0:
         raise ValueError(f"provision_timeout must be > 0, got {cfg.provision_timeout}")
-    if not (math.isfinite(cfg.alpha) and 0.0 < cfg.alpha < 1.0):
-        raise ValueError(f"alpha must be in (0, 1), got {cfg.alpha}")
-    if not (math.isfinite(cfg.delta_p) and 0.0 < cfg.delta_p < 0.5):
-        raise ValueError(f"delta_p must be in (0, 0.5), got {cfg.delta_p}")
-    if cfg.n_min_per_env < 1:
-        raise ValueError(f"n_min_per_env must be >= 1, got {cfg.n_min_per_env}")
-    if not (math.isfinite(cfg.score_lambda) and 0.0 <= cfg.score_lambda <= 1.0):
-        raise ValueError(f"score_lambda must be in [0, 1], got {cfg.score_lambda}")
+    if not (math.isfinite(cfg.delta_theta) and cfg.delta_theta > 0.0):
+        raise ValueError(f"delta_theta must be finite > 0, got {cfg.delta_theta}")
+    if cfg.irt_K not in (0, 1, 2):
+        raise ValueError(f"irt_K must be 0/1/2 (only 0 implemented), got {cfg.irt_K}")
+    if cfg.irt_n_min_per_env < 1:
+        raise ValueError(f"irt_n_min_per_env must be >= 1, got {cfg.irt_n_min_per_env}")
+    if not (math.isfinite(cfg.irt_alpha_dethrone) and 0.0 < cfg.irt_alpha_dethrone < 1.0):
+        raise ValueError(f"irt_alpha_dethrone must be in (0, 1), got {cfg.irt_alpha_dethrone}")
+    if not (math.isfinite(cfg.irt_beta_hold) and 0.0 < cfg.irt_beta_hold < 1.0):
+        raise ValueError(f"irt_beta_hold must be in (0, 1), got {cfg.irt_beta_hold}")
+    if cfg.irt_look_interval_cells <= 0:
+        raise ValueError(f"irt_look_interval_cells must be > 0, got {cfg.irt_look_interval_cells}")
+    if cfg.irt_look_max <= 0:
+        raise ValueError(f"irt_look_max must be > 0, got {cfg.irt_look_max}")
+    if not (math.isfinite(cfg.champion_se_theta_max) and cfg.champion_se_theta_max > 0.0):
+        raise ValueError(f"champion_se_theta_max must be finite > 0, got {cfg.champion_se_theta_max}")
+    if cfg.calibration_min_miners < 1:
+        raise ValueError(f"calibration_min_miners must be >= 1, got {cfg.calibration_min_miners}")
+    if cfg.calibration_min_cells_per_env < 1:
+        raise ValueError(f"calibration_min_cells_per_env must be >= 1, got {cfg.calibration_min_cells_per_env}")
     _validate_log_level(cfg.log_level)
     _validate_model_skiplist(cfg.model_skiplist)
     if not cfg.environments:
