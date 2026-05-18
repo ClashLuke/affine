@@ -133,6 +133,14 @@ def _vllm_launch_spec(*, model: str, revision: str, source: str,
         raise ValueError(f"unknown vLLM source: {source}")
     if source == "s3" and not backup_manifest_key:
         raise ValueError("backup_manifest_key is required for source='s3'")
+    # Defaults are H200-tuned (141 GB HBM3e). On smaller-VRAM GPUs (Blackwell
+    # 96 GB, H100 80 GB) the KV pool may overflow; bump gpu_memory_utilization
+    # via AFFINE_VLLM_GPU_MEM_UTIL or trim batching via AFFINE_VLLM_MAX_NUM_SEQS /
+    # AFFINE_VLLM_MAX_NUM_BATCHED_TOKENS. max_model_len is intentionally NOT
+    # parameterised: the eval must respect each miner's declared context.
+    gpu_mem = os.getenv("AFFINE_VLLM_GPU_MEM_UTIL", "0.85").strip()
+    max_seqs = os.getenv("AFFINE_VLLM_MAX_NUM_SEQS", "1024").strip()
+    max_batched = os.getenv("AFFINE_VLLM_MAX_NUM_BATCHED_TOKENS", "65536").strip()
     vllm_args = [
         "--host", "0.0.0.0",
         "--port", "8000",
@@ -147,11 +155,11 @@ def _vllm_launch_spec(*, model: str, revision: str, source: str,
         # allocations the startup profiler underestimates — FlashInfer
         # workspace (~394 MiB), per-shape kernel JIT, cudagraph slop. PR
         # #30515 documents the profiling gap.
-        "--gpu-memory-utilization", "0.85",
+        "--gpu-memory-utilization", gpu_mem,
         # Steady-state concurrency ceiling for dwell_batch=512 streams.
         # Defaults (256/8192) cap us at half the dispatch.
-        "--max-num-seqs", "1024",
-        "--max-num-batched-tokens", "65536",
+        "--max-num-seqs", max_seqs,
+        "--max-num-batched-tokens", max_batched,
     ]
     env: dict[str, str] = {
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
@@ -616,22 +624,32 @@ class LiumSlots(VllmSlots):
     # HTTP plumbing --------------------------------------------------------
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        """Lium rate-limits POST /templates and POST /rent at 5/min; one 429
-        retry with the suggested backoff is enough to absorb a single burst.
+        """Lium enforces "1 request per 5 seconds" per-account on write endpoints;
+        the 429 body carries 'Please try again in N seconds.' which we parse and
+        honor. Exponential backoff would *synchronize* concurrent retries — both
+        wake at 5s, both collide, both wait 10s, etc. Sleep the hinted window plus
+        small random jitter so concurrent provisions desynchronize on first retry.
+        Tunable via AFFINE_LIUM_RETRY_ATTEMPTS.
         Other 4xx/5xx raise."""
-        backoff = 5.0
-        for attempt in range(3):
+        import random
+        import re
+        attempts = max(1, int(os.getenv("AFFINE_LIUM_RETRY_ATTEMPTS", "10")))
+        for attempt in range(attempts):
             r = await self._http_client.request(method, path, **kwargs)
             if r.status_code == 429:
-                log.warning(f"lium 429 on {method} {path}; backing off {backoff:.0f}s (attempt {attempt+1})")
-                await asyncio.sleep(backoff)
-                backoff *= 2
+                hint_s = 5.0
+                m = re.search(r"try again in (\d+) second", r.text or "")
+                if m:
+                    hint_s = float(m.group(1))
+                hint_s = max(hint_s, 1.0) + random.uniform(0.5, 2.5)
+                log.warning(f"lium 429 on {method} {path}; sleeping {hint_s:.1f}s (attempt {attempt+1}/{attempts})")
+                await asyncio.sleep(hint_s)
                 continue
             r.raise_for_status()
             if r.status_code == 204 or not r.content:
                 return None
             return r.json()
-        raise RuntimeError(f"lium {method} {path} rate-limited after retries")
+        raise RuntimeError(f"lium {method} {path} rate-limited after {attempts} retries")
 
     async def _list(self, path: str) -> list[dict]:
         data = await self._request("GET", path)
@@ -692,12 +710,19 @@ class LiumSlots(VllmSlots):
 
     async def _pick_executor(self) -> dict:
         """Filter by `\\b{gpu_type}\\b` against `machine_name`. The word-boundary
-        regex matters: substring `H200` would match `GH200` (Grace Hopper)."""
+        regex matters: substring `H200` would match `GH200` (Grace Hopper).
+
+        Also caps gpu_count via AFFINE_LIUM_MAX_GPU_COUNT (default 1). Lium rents
+        the *entire* executor, not a sub-slice — a 4-GPU executor charges 4x the
+        per-GPU price even when we serve a single 32B model that needs 1 GPU.
+        Default to 1-GPU executors only so we never silently over-provision."""
         executors = await self._list("/executors")
         pattern = re.compile(rf"\b{re.escape(self._gpu_type)}\b")
+        max_gpus = max(1, int(os.getenv("AFFINE_LIUM_MAX_GPU_COUNT", "1")))
         candidates = [
             e for e in executors
             if int(e.get("available_gpu_count") or 0) >= 1
+            and int(e.get("gpu_count") or 0) <= max_gpus
             and pattern.search(str(e.get("machine_name", "")))
         ]
         if not candidates:
