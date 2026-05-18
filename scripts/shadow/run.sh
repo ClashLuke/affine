@@ -57,9 +57,6 @@ export NETUID="${NETUID:-120}"
 export SUBTENSOR_ENDPOINT="${SUBTENSOR_ENDPOINT:-finney}"
 export BT_WALLET_COLD="${BT_WALLET_COLD:-default}"
 export BT_WALLET_HOT="${BT_WALLET_HOT:-default}"
-if [ -f "$SHADOW_DIR/config.json" ]; then
-    export AFFINE_CONFIG_SPEC="$SHADOW_DIR/config.json"
-fi
 export AFFINE_PROVISION_TIMEOUT="${AFFINE_PROVISION_TIMEOUT:-1200}"
 unset AFFINE_LOCAL CHAMPION_URL CHALLENGER_URL
 
@@ -68,7 +65,7 @@ STDERR_LOG="$SHADOW_DIR/stderr-$TS.log"
 
 log "shadow DB:     $AFFINE_DB_PATH"
 log "shadow stderr: $STDERR_LOG"
-log "config: NETUID=$NETUID SUBTENSOR=$SUBTENSOR_ENDPOINT SPEC=${AFFINE_CONFIG_SPEC:-default} wallet=$BT_WALLET_COLD/$BT_WALLET_HOT"
+log "config: NETUID=$NETUID SUBTENSOR=$SUBTENSOR_ENDPOINT wallet=$BT_WALLET_COLD/$BT_WALLET_HOT"
 
 # --- launch ---
 # Prepend venv bin so the `targon` subprocess invoked by TargonSlots resolves

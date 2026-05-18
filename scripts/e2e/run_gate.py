@@ -17,7 +17,7 @@ RE_HEALTH = re.compile(r"slot ready after")
 RE_WEIGHTS = re.compile(r"weights set:\s*uid")
 RE_WEIGHTS_UID = re.compile(r"weights set:\s*uid\s+(\d+)")
 RE_DUEL_START = re.compile(r"duel:\s*champion\s+\S+@\S+\s+vs\s+uid(\d+)")
-RE_VERDICT = re.compile(r"verdict:\s*champion\s+holds")
+RE_VERDICT = re.compile(r"verdict:\s*(dethrone|hold|inconclusive)\s+Δ̂=([-+\d.eE]+)\s+CI=\[([-+\d.eE]+),\s*([-+\d.eE]+)\]\s+logK=([-+\d.eE]+)")
 RE_ENV_LOADED = re.compile(r"\benv:\s*([A-Za-z0-9_-]+)\s+\(")
 RE_DETHRONE = re.compile(r"DETHRONE:\s*\S+@\S+\s+->\s+uid\s+(\d+)")
 RE_QUEUE_EXHAUSTED = re.compile(r"queue exhausted")
@@ -74,7 +74,6 @@ def _validate_env() -> None:
 def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
     cmd = shlex.split(args.cmd)
     env = dict(os.environ)
-    env["AFFINE_CONFIG_SPEC"] = stage.spec
     if not args.local:
         env.pop("AFFINE_LOCAL", None)
 
@@ -113,6 +112,7 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
     duel_start_count = 0
     queue_exhausted_seen = False
     weights_uids: list[int] = []
+    duel_verdicts: list[dict] = []
 
     with log_path.open("w") as log_fp:
         while True:
@@ -159,8 +159,16 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
             if RE_DUEL_START.search(line):
                 duel_start_seen = True
                 duel_start_count += 1
-            if RE_VERDICT.search(line):
+            m_verdict = RE_VERDICT.search(line)
+            if m_verdict:
                 verdict_seen = True
+                duel_verdicts.append({
+                    "status": m_verdict.group(1),
+                    "delta_hat": float(m_verdict.group(2)),
+                    "ci_low": float(m_verdict.group(3)),
+                    "ci_hi": float(m_verdict.group(4)),
+                    "log_capital_at_zero": float(m_verdict.group(5)),
+                })
             m_env = RE_ENV_LOADED.search(line)
             if m_env:
                 envs_loaded.add(m_env.group(1))
@@ -240,6 +248,7 @@ def _run_stage(stage: StageConfig, args: argparse.Namespace) -> dict:
         "duel_start_seen": duel_start_seen,
         "duel_start_count": duel_start_count,
         "verdict_seen": verdict_seen,
+        "duel_verdicts": duel_verdicts,
         "dethrone_seen": dethrone_seen,
         "queue_exhausted_seen": queue_exhausted_seen,
         "envs_loaded": sorted(envs_loaded),

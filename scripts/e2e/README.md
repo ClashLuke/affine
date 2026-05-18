@@ -42,7 +42,7 @@ Requires: Docker, a GPU with enough VRAM for two model instances (0.28 each), `v
 The stub server returns garbage to every chat completion. Cold start picks the stub as champion (first-committed miner with `revision=stub` → port 8000). The real model (committed with `revision=real`) wins decisive paired outcomes. Expected flow:
 
 1. Cold start → stub champion (baseline model with `revision=stub`)
-2. Duel 1: stub vs real → challenger wins paired test (discordant pairs decisive)
+2. Duel 1: stub vs real → challenger wins the paired betting-CS test
 3. Dethronement → real model becomes champion, weights updated
 4. Duel 2: real vs stub → champion holds (best-possible early stop)
 5. Queue exhausted
@@ -53,7 +53,7 @@ Both servers run the same model. Paired evaluations produce mostly ties (both-pa
 
 ## Decision Model
 
-The validator uses an **exact one-sided paired binomial test** (`scipy.stats.binomtest`) on discordant pairs across 7 environments. Only pairs where both miners deliver enter the statistical test. Ties (both-pass, both-fail) don't affect the p-value. Dethrone requires: discordant >= min_discordant, challenger ahead, p-value <= alpha.
+The validator uses paired Bernoulli outcomes and an anytime-valid betting confidence sequence for the policy-weighted pass-rate contrast. Both miners see the same `(task_id, seed)` per step. Dethrone requires the lower confidence bound to exceed `AFFINE_DELTA_DETHRONE`; hold requires the upper bound to be at or below `AFFINE_DELTA_HOLD`.
 
 ## Environment Variables
 
